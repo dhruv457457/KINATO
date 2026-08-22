@@ -29,7 +29,7 @@ KEY ASSERTION FUNCTIONS:
 ================================================================================
 """
 from typing import List, Tuple, Dict, Any
-from app.models.schemas import QuoteLineItem
+from app.models.a2a import QuoteLineItem
 from app.core.security import verify_proposal_hash
 
 

@@ -1,168 +1,87 @@
 """
 ================================================================================
 FILE: app/knowledge/inventory.py
-MODULE: Module 1 - Buyer Inventory Knowledge Store
+MODULE: Module 1 - Dynamic Inventory Repository
 --------------------------------------------------------------------------------
 WHAT THIS FILE DOES:
-Provides seeded buyer inventory datasets and operational profiles for:
-  1. Cloud Kitchen ("BurgerCraft Kitchen", Indiranagar)
-     - Stock: Mozzarella Cheese (DIR = 1.0 day -> CRITICAL), Brioche Buns (CRITICAL), Fryer Oil.
-  2. Tech Startup Pantry ("DevPulse Tech Coworking", Koramangala)
-     - Stock: Arabica Dark Roast Coffee (DIR = 1.0 day -> CRITICAL), Oat Milk, Paper Cups.
-  3. Retail Packaging ("SpeedyMart Express", HSR Layout)
-     - Stock: Medium Shipping Boxes (DIR = 0.67 days -> CRITICAL), Tape Rolls, Bubble Wrap.
+Dynamic repository managing buyer operational profiles and real-time inventory.
+Loads seed data from structured JSON fixtures and maintains dynamic state.
 
-KEY FORMULAS EXERCISED:
-  - Days of Inventory Remaining: DIR = current_stock / daily_burn_rate
-  - Reorder Trigger: is_critical = True when DIR <= 1.5 days
-  - Target Reorder Quantity: Q = (target_days * daily_burn_rate) - current_stock
-
-KEY FUNCTIONS:
-  - get_buyer_context(profile_type): Returns the BuyerContext for a chosen vertical.
+CAPABILITIES:
+  1. Loads profile contexts from app/data/seeds/buyer_inventories.json.
+  2. Dynamically calculates Days of Inventory Remaining (DIR) & Critical Triggers.
+  3. Supports runtime state mutation (deducting stock upon successful order,
+     updating daily burn rates).
+  4. Querying items by critical status and category.
 ================================================================================
 """
-from typing import Dict
-from app.models.schemas import BusinessProfileType, BuyerContext, InventoryItem
+import json
+from pathlib import Path
+from typing import Dict, Optional, List
+from app.models.enums import BusinessProfileType
+from app.models.inventory import BuyerContext, InventoryItem
 
 
-BUYER_PROFILES: Dict[BusinessProfileType, BuyerContext] = {
-    # --------------------------------------------------------------------------
-    # Profile 1: Cloud Kitchen (BurgerCraft Kitchen, Indiranagar, Bangalore)
-    # --------------------------------------------------------------------------
-    BusinessProfileType.CLOUD_KITCHEN: BuyerContext(
-        business_id="buyer_kitchen_01",
-        business_name="BurgerCraft Kitchen (Indiranagar)",
-        profile_type=BusinessProfileType.CLOUD_KITCHEN,
-        daily_budget_limit=2500.0,
-        weekly_budget_limit=15000.0,
-        weekly_spent_so_far=4200.0,
-        preferred_supplier_ids=["supp_dairy_direct", "supp_metro_foods"],
-        inventory=[
-            InventoryItem(
-                sku="SKU_CHEESE_MOZZ_1KG",
-                name="Mozzarella Cheese Block (1kg)",
-                category="Dairy & Perishables",
-                current_stock=2.0,       # 2kg remaining
-                unit="kg",
-                daily_burn_rate=2.0,     # Burns 2kg/day -> DIR = 1.0 day (CRITICAL!)
-                reorder_threshold_days=1.5,
-                target_restock_days=4.0  # Target: 8kg total (Needs 6kg restock)
-            ),
-            InventoryItem(
-                sku="SKU_BURGER_BUNS_PACK",
-                name="Brioche Burger Buns (Pack of 12)",
-                category="Bakery",
-                current_stock=4.0,       # 4 packs remaining
-                unit="packs",
-                daily_burn_rate=3.0,     # Burns 3 packs/day -> DIR = 1.33 days (CRITICAL!)
-                reorder_threshold_days=1.5,
-                target_restock_days=4.0
-            ),
-            InventoryItem(
-                sku="SKU_FRYER_OIL_5L",
-                name="Refined Canola Fryer Oil (5L)",
-                category="Oils & Condiments",
-                current_stock=15.0,      # 15L remaining
-                unit="litres",
-                daily_burn_rate=2.5,     # Burns 2.5L/day -> DIR = 6.0 days (Safe)
-                reorder_threshold_days=1.5,
-                target_restock_days=5.0
-            )
-        ]
-    ),
+class InventoryRepository:
+    """
+    Dynamic Repository managing Buyer Inventory state and DIR calculations.
+    """
+    def __init__(self, seeds_path: Optional[Path] = None):
+        if seeds_path is None:
+            seeds_path = Path(__file__).parent.parent / "data" / "seeds" / "buyer_inventories.json"
+        self.seeds_path = seeds_path
+        self._profiles: Dict[BusinessProfileType, BuyerContext] = {}
+        self.reload()
 
-    # --------------------------------------------------------------------------
-    # Profile 2: Tech Startup Pantry (DevPulse Tech Coworking, Koramangala)
-    # --------------------------------------------------------------------------
-    BusinessProfileType.TECH_PANTRY: BuyerContext(
-        business_id="buyer_startup_02",
-        business_name="DevPulse Tech Coworking (Koramangala)",
-        profile_type=BusinessProfileType.TECH_PANTRY,
-        daily_budget_limit=1500.0,
-        weekly_budget_limit=8000.0,
-        weekly_spent_so_far=1800.0,
-        preferred_supplier_ids=["supp_beverage_hub", "supp_office_direct"],
-        inventory=[
-            InventoryItem(
-                sku="SKU_COFFEE_BEANS_1KG",
-                name="Arabica Dark Roast Coffee Beans (1kg)",
-                category="Beverages & Pantry",
-                current_stock=0.5,       # 0.5kg left
-                unit="kg",
-                daily_burn_rate=0.5,     # Burns 0.5kg/day -> DIR = 1.0 day (CRITICAL!)
-                reorder_threshold_days=1.5,
-                target_restock_days=5.0
-            ),
-            InventoryItem(
-                sku="SKU_OAT_MILK_1L",
-                name="Barista Oat Milk (1L)",
-                category="Beverages & Pantry",
-                current_stock=1.0,
-                unit="litres",
-                daily_burn_rate=1.0,     # DIR = 1.0 day (CRITICAL!)
-                reorder_threshold_days=1.5,
-                target_restock_days=4.0
-            ),
-            InventoryItem(
-                sku="SKU_PAPER_CUPS_100",
-                name="Compostable Coffee Cups (Pack of 100)",
-                category="Pantry Supplies",
-                current_stock=200.0,
-                unit="pcs",
-                daily_burn_rate=30.0,    # DIR = 6.6 days (Safe)
-                reorder_threshold_days=1.5,
-                target_restock_days=5.0
-            )
-        ]
-    ),
+    def reload(self) -> None:
+        """Loads or reloads inventory state from JSON seeds."""
+        if not self.seeds_path.exists():
+            raise FileNotFoundError(f"Inventory seed file not found at {self.seeds_path}")
+            
+        with open(self.seeds_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+            
+        self._profiles = {}
+        for key, context_dict in raw_data.items():
+            profile_type = BusinessProfileType(key)
+            self._profiles[profile_type] = BuyerContext.model_validate(context_dict)
 
-    # --------------------------------------------------------------------------
-    # Profile 3: Retail & Packaging Store (SpeedyMart Express, HSR Layout)
-    # --------------------------------------------------------------------------
-    BusinessProfileType.RETAIL_STORE: BuyerContext(
-        business_id="buyer_store_03",
-        business_name="SpeedyMart Express (HSR Layout)",
-        profile_type=BusinessProfileType.RETAIL_STORE,
-        daily_budget_limit=2000.0,
-        weekly_budget_limit=12000.0,
-        weekly_spent_so_far=3500.0,
-        preferred_supplier_ids=["supp_pack_pro"],
-        inventory=[
-            InventoryItem(
-                sku="SKU_CORRUGATED_BOX_M",
-                name="Medium Shipping Boxes (Pack of 50)",
-                category="Packaging Supplies",
-                current_stock=10.0,
-                unit="pcs",
-                daily_burn_rate=15.0,    # DIR = 0.67 days (CRITICAL!)
-                reorder_threshold_days=1.5,
-                target_restock_days=4.0
-            ),
-            InventoryItem(
-                sku="SKU_PACKING_TAPE_ROLL",
-                name="Heavy Duty Brown Tape (Pack of 6)",
-                category="Packaging Supplies",
-                current_stock=1.0,
-                unit="packs",
-                daily_burn_rate=1.0,     # DIR = 1.0 day (CRITICAL!)
-                reorder_threshold_days=1.5,
-                target_restock_days=4.0
-            ),
-            InventoryItem(
-                sku="SKU_BUBBLE_WRAP_50M",
-                name="Protective Bubble Wrap Roll (50m)",
-                category="Packaging Supplies",
-                current_stock=3.0,
-                unit="rolls",
-                daily_burn_rate=0.3,     # DIR = 10 days (Safe)
-                reorder_threshold_days=1.5,
-                target_restock_days=4.0
-            )
-        ]
-    )
-}
+    def get_context(self, profile_type: BusinessProfileType) -> BuyerContext:
+        """Retrieves buyer context for specified business vertical."""
+        return self._profiles.get(profile_type, self._profiles[BusinessProfileType.CLOUD_KITCHEN])
+
+    def get_critical_items(self, profile_type: BusinessProfileType) -> List[InventoryItem]:
+        """Returns all inventory items currently at or below critical DIR threshold."""
+        context = self.get_context(profile_type)
+        return [item for item in context.inventory if item.is_critical]
+
+    def deduct_stock(self, profile_type: BusinessProfileType, sku: str, quantity: float) -> bool:
+        """
+        Deducts stock on hand (simulating consumption).
+        """
+        context = self.get_context(profile_type)
+        for item in context.inventory:
+            if item.sku == sku:
+                item.current_stock = max(0.0, round(item.current_stock - quantity, 2))
+                return True
+        return False
+
+    def replenish_stock(self, profile_type: BusinessProfileType, sku: str, quantity: float) -> bool:
+        """
+        Adds stock to inventory upon verified Razorpay settlement.
+        """
+        context = self.get_context(profile_type)
+        for item in context.inventory:
+            if item.sku == sku:
+                item.current_stock = round(item.current_stock + quantity, 2)
+                return True
+        return False
+
+
+# Singleton repository instance
+inventory_repo = InventoryRepository()
 
 
 def get_buyer_context(profile_type: BusinessProfileType) -> BuyerContext:
-    """Returns the operational BuyerContext for the specified business vertical."""
-    return BUYER_PROFILES.get(profile_type, BUYER_PROFILES[BusinessProfileType.CLOUD_KITCHEN])
+    """Convenience accessor function."""
+    return inventory_repo.get_context(profile_type)

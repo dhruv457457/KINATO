@@ -4,45 +4,31 @@ FILE: app/core/security.py
 MODULE: Module 1 - Core Foundation & Cryptography
 --------------------------------------------------------------------------------
 WHAT THIS FILE DOES:
-Provides cryptographic integrity and verification mechanisms for the Kinato
-Agentic Commerce Protocol.
+Provides bank-grade cryptographic signing and verification for:
+  1. Immutable A2A Proposal Digests (HMAC-SHA256)
+  2. Razorpay Standard Payment Responses (both direct HMAC & Razorpay SDK utility)
+  3. Razorpay Incoming Webhook Signatures (X-Razorpay-Signature verification)
 
-It implements:
-  1. Proposal HMAC Digest Signing (Tamper-Proof Offer Contracts):
-     Computes HMAC-SHA256 over agreed A2A proposals (SKU, Price, Merchant, Nonce).
-     Guarantees that if a malicious client alters a price by even 1 paisa, the hash
-     breaks and the Policy Engine invalidates the transaction before Razorpay executes.
-
-  2. Razorpay Standard Checkout Signature Verification:
-     Implements official Razorpay HMAC verification:
-     Expected = HMAC-SHA256(order_id + "|" + payment_id, RAZORPAY_KEY_SECRET)
-     Guarantees mathematically that payment was authorized on Razorpay servers.
-
-  3. Razorpay Webhook Signature Verification:
-     Verifies X-Razorpay-Signature over the raw request body using WEBHOOK_SECRET.
-
-KEY FUNCTIONS:
-  - generate_proposal_hash(payload): Deterministic JSON serialization + HMAC-SHA256.
-  - verify_proposal_hash(payload, hash): Constant-time HMAC comparison.
-  - verify_razorpay_payment_signature(order_id, payment_id, signature): Razorpay auth.
-  - verify_razorpay_webhook_signature(raw_body, signature): Webhook payload auth.
+PARAMETER AUDIT:
+  - verify_razorpay_payment_signature:
+      Requires: order_id, payment_id, signature, key_secret
+      Algorithm: HMAC-SHA256(f"{order_id}|{payment_id}", key_secret) == signature
+  - verify_razorpay_webhook_signature:
+      Requires: raw_body (bytes), signature (str), webhook_secret (str)
+      Algorithm: HMAC-SHA256(raw_body_bytes, webhook_secret) == signature
 ================================================================================
 """
 import hmac
 import hashlib
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Union
 from app.core.config import settings
 
 
 def generate_proposal_hash(proposal_payload: Dict[str, Any], secret_key: str = None) -> str:
     """
-    Computes a deterministic HMAC-SHA256 hash over an immutable proposal payload.
-    
-    Why sorting keys is essential:
-      Different languages/engines may order JSON keys differently. By sorting keys
-      and removing whitespace (separators=(',', ':')), we ensure identical string
-      digests across Python, TypeScript, and database stores.
+    Computes a deterministic HMAC-SHA256 hash over an agreed proposal contract.
+    Keys are sorted and compact JSON formatting is enforced to guarantee deterministic hashes.
     """
     key = (secret_key or settings.HMAC_SECRET_KEY).encode("utf-8")
     canonical_payload = json.dumps(proposal_payload, sort_keys=True, separators=(',', ':'))
@@ -53,8 +39,9 @@ def generate_proposal_hash(proposal_payload: Dict[str, Any], secret_key: str = N
 def verify_proposal_hash(proposal_payload: Dict[str, Any], provided_hash: str, secret_key: str = None) -> bool:
     """
     Constant-time comparison to verify proposal integrity against tampering.
-    Uses hmac.compare_digest to prevent side-channel timing attacks.
     """
+    if not provided_hash:
+        return False
     expected_hash = generate_proposal_hash(proposal_payload, secret_key)
     return hmac.compare_digest(expected_hash, provided_hash)
 
@@ -67,25 +54,50 @@ def verify_razorpay_payment_signature(
 ) -> bool:
     """
     Verifies Razorpay standard checkout payment response signature.
-    Mathematical Formula:
-      Expected Signature = HMAC-SHA256(order_id + "|" + payment_id, RAZORPAY_KEY_SECRET)
+    Official Algorithm:
+      HMAC-SHA256(f"{order_id}|{payment_id}", KEY_SECRET)
     """
+    if not order_id or not payment_id or not signature:
+        return False
+        
     key = (secret_key or settings.RAZORPAY_KEY_SECRET).encode("utf-8")
     msg = f"{order_id}|{payment_id}".encode("utf-8")
     expected_signature = hmac.new(key, msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected_signature, signature)
 
 
+def verify_razorpay_payment_dict(
+    payment_response: Dict[str, str],
+    secret_key: str = None
+) -> bool:
+    """
+    Helper accepting Razorpay checkout dictionary directly:
+    {
+      "razorpay_order_id": "order_...",
+      "razorpay_payment_id": "pay_...",
+      "razorpay_signature": "..."
+    }
+    """
+    order_id = payment_response.get("razorpay_order_id", "")
+    payment_id = payment_response.get("razorpay_payment_id", "")
+    signature = payment_response.get("razorpay_signature", "")
+    return verify_razorpay_payment_signature(order_id, payment_id, signature, secret_key)
+
+
 def verify_razorpay_webhook_signature(
-    raw_body: bytes,
+    raw_body: Union[bytes, str],
     signature: str,
     secret_key: str = None
 ) -> bool:
     """
-    Verifies incoming Razorpay webhook signature from 'X-Razorpay-Signature' header.
-    Mathematical Formula:
-      Expected Signature = HMAC-SHA256(raw_request_body_bytes, RAZORPAY_WEBHOOK_SECRET)
+    Verifies incoming Razorpay webhook signature (X-Razorpay-Signature header).
+    Official Algorithm:
+      HMAC-SHA256(raw_request_body_bytes, WEBHOOK_SECRET)
     """
+    if not signature or not raw_body:
+        return False
+        
+    body_bytes = raw_body if isinstance(raw_body, bytes) else raw_body.encode("utf-8")
     key = (secret_key or settings.RAZORPAY_WEBHOOK_SECRET).encode("utf-8")
-    expected_signature = hmac.new(key, raw_body, hashlib.sha256).hexdigest()
+    expected_signature = hmac.new(key, body_bytes, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected_signature, signature)

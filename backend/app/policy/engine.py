@@ -27,13 +27,10 @@ KEY FUNCTIONS:
 ================================================================================
 """
 from typing import Dict, Any
-from app.models.schemas import (
-    A2A_FinalOffer,
-    BuyerContext,
-    PolicyEvaluation,
-    PolicyStatus,
-    PolicyCheckResult
-)
+from app.models.enums import PolicyStatus
+from app.models.inventory import BuyerContext
+from app.models.a2a import A2A_FinalOffer
+from app.models.policy import PolicyEvaluation, PolicyCheckResult
 from app.policy.rules import (
     verify_merchant_floor_price,
     verify_buyer_cashflow_limit,
