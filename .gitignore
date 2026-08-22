@@ -1,0 +1,64 @@
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Sensitive internal guides & plans
+docs/RAZORPAY_INTEGRATION_GUIDE.md
+*INTEGRATION_GUIDE.md
+*credentials*
+*secret*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Database & Local Stores
+*.db
+*.sqlite
+*.sqlite3
+.data/
+chroma_db/
+.chroma/
+
+# Node & Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
