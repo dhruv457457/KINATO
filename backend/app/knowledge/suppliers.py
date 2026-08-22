@@ -1,57 +1,74 @@
 """
 ================================================================================
 FILE: app/knowledge/suppliers.py
-MODULE: Module 1 - Dynamic Supplier Registry & Warehouse Repository
+MODULE: Module 1 - SQLite-Backed Supplier Registry
 --------------------------------------------------------------------------------
 WHAT THIS FILE DOES:
-Dynamic repository managing the Abstracted Supplier Network and warehouse catalogs.
-Loads seed data from app/data/seeds/suppliers_catalog.json and supports
-runtime queries, FIFO batch aging lookups, and inventory reservations.
+Dynamic SQLite-backed repository managing the Abstracted Supplier Network,
+live warehouse catalogs, and FIFO batch aging lookups.
 
 CAPABILITIES:
-  1. Loads supplier profiles & product catalogs from JSON seeds.
-  2. Queries suppliers matching specific SKUs, category, and max distance.
+  1. Queries supplier catalogs and product availability directly from SQLite.
+  2. Queries suppliers matching specific SKUs, categories, and max distance.
   3. Dynamic FIFO aging calculation: identifies batches with aging_ratio >= 0.60
      eligible for dynamic bundle discounting.
-  4. Enforces real-time stock reservations upon order placement.
 ================================================================================
 """
-import json
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
+from app.db.database import get_db
+from app.db.init_db import init_db
 from app.models.enums import BusinessProfileType
 from app.models.supplier import SupplierProfile, SupplierProduct
 
 
 class SupplierRepository:
     """
-    Dynamic Repository managing Supplier Network, catalogs, and FIFO aging batches.
+    SQLite-backed Repository managing Supplier Network and warehouse catalogs.
     """
-    def __init__(self, seeds_path: Optional[Path] = None):
-        if seeds_path is None:
-            seeds_path = Path(__file__).parent.parent / "data" / "seeds" / "suppliers_catalog.json"
-        self.seeds_path = seeds_path
-        self._suppliers: Dict[BusinessProfileType, List[SupplierProfile]] = {}
-        self.reload()
-
-    def reload(self) -> None:
-        """Loads or reloads supplier catalog state from JSON seeds."""
-        if not self.seeds_path.exists():
-            raise FileNotFoundError(f"Supplier seed file not found at {self.seeds_path}")
-            
-        with open(self.seeds_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-            
-        self._suppliers = {}
-        for key, supplier_list in raw_data.items():
-            profile_type = BusinessProfileType(key)
-            self._suppliers[profile_type] = [
-                SupplierProfile.model_validate(supp) for supp in supplier_list
-            ]
+    def __init__(self):
+        init_db()
 
     def get_suppliers(self, profile_type: BusinessProfileType) -> List[SupplierProfile]:
-        """Returns all registered suppliers for a given business profile."""
-        return self._suppliers.get(profile_type, [])
+        """Returns all registered suppliers for a given business profile from SQLite."""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT supplier_id, supplier_name, profile_type, trust_score, distance_km,
+                       delivery_sla_hours, is_razorpay_verified, sku, product_name,
+                       category, unit, cost_price, list_price, minimum_margin_pct,
+                       available_stock, batch_age_days, shelf_life_days
+                FROM supplier_catalog
+                WHERE profile_type = ?
+            """, (profile_type.value,))
+            rows = cursor.fetchall()
+
+            suppliers_dict = {}
+            for r in rows:
+                sid = r["supplier_id"]
+                if sid not in suppliers_dict:
+                    suppliers_dict[sid] = {
+                        "supplier_id": sid,
+                        "name": r["supplier_name"],
+                        "trust_score": r["trust_score"],
+                        "distance_km": r["distance_km"],
+                        "delivery_sla_hours": r["delivery_sla_hours"],
+                        "is_razorpay_verified": bool(r["is_razorpay_verified"]),
+                        "catalog": []
+                    }
+                suppliers_dict[sid]["catalog"].append(SupplierProduct(
+                    sku=r["sku"],
+                    name=r["product_name"],
+                    category=r["category"],
+                    unit=r["unit"],
+                    cost_price=r["cost_price"],
+                    list_price=r["list_price"],
+                    minimum_margin_pct=r["minimum_margin_pct"],
+                    available_stock=r["available_stock"],
+                    batch_age_days=r["batch_age_days"],
+                    shelf_life_days=r["shelf_life_days"]
+                ))
+
+            return [SupplierProfile.model_validate(supp) for supp in suppliers_dict.values()]
 
     def get_supplier_by_id(self, profile_type: BusinessProfileType, supplier_id: str) -> Optional[SupplierProfile]:
         """Retrieves a specific supplier profile by ID."""

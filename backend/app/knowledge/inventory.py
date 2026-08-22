@@ -1,54 +1,86 @@
 """
 ================================================================================
 FILE: app/knowledge/inventory.py
-MODULE: Module 1 - Dynamic Inventory Repository
+MODULE: Module 1 - SQLite-Backed Inventory Repository
 --------------------------------------------------------------------------------
 WHAT THIS FILE DOES:
-Dynamic repository managing buyer operational profiles and real-time inventory.
-Loads seed data from structured JSON fixtures and maintains dynamic state.
+Dynamic SQLite-backed repository managing buyer operational profiles, live stock,
+and Days of Inventory Remaining (DIR) calculations.
 
 CAPABILITIES:
-  1. Loads profile contexts from app/data/seeds/buyer_inventories.json.
-  2. Dynamically calculates Days of Inventory Remaining (DIR) & Critical Triggers.
-  3. Supports runtime state mutation (deducting stock upon successful order,
-     updating daily burn rates).
-  4. Querying items by critical status and category.
+  1. Queries buyer inventory directly from SQLite database.
+  2. Dynamically calculates Days of Inventory Remaining (DIR) and Restock Urgency.
+  3. Executes atomic SQL transactions for stock deductions and replenishment.
 ================================================================================
 """
-import json
-from pathlib import Path
-from typing import Dict, Optional, List
+from typing import List, Optional
+from app.db.database import get_db
+from app.db.init_db import init_db
 from app.models.enums import BusinessProfileType
 from app.models.inventory import BuyerContext, InventoryItem
 
 
 class InventoryRepository:
     """
-    Dynamic Repository managing Buyer Inventory state and DIR calculations.
+    SQLite-backed Repository managing Buyer Inventory state and DIR calculations.
     """
-    def __init__(self, seeds_path: Optional[Path] = None):
-        if seeds_path is None:
-            seeds_path = Path(__file__).parent.parent / "data" / "seeds" / "buyer_inventories.json"
-        self.seeds_path = seeds_path
-        self._profiles: Dict[BusinessProfileType, BuyerContext] = {}
-        self.reload()
-
-    def reload(self) -> None:
-        """Loads or reloads inventory state from JSON seeds."""
-        if not self.seeds_path.exists():
-            raise FileNotFoundError(f"Inventory seed file not found at {self.seeds_path}")
-            
-        with open(self.seeds_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-            
-        self._profiles = {}
-        for key, context_dict in raw_data.items():
-            profile_type = BusinessProfileType(key)
-            self._profiles[profile_type] = BuyerContext.model_validate(context_dict)
+    def __init__(self):
+        # Ensure database tables and initial seeds exist
+        init_db()
 
     def get_context(self, profile_type: BusinessProfileType) -> BuyerContext:
-        """Retrieves buyer context for specified business vertical."""
-        return self._profiles.get(profile_type, self._profiles[BusinessProfileType.CLOUD_KITCHEN])
+        """Retrieves buyer context and live inventory directly from SQLite."""
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT business_id, business_name, profile_type, daily_budget_limit,
+                       weekly_budget_limit, weekly_spent_so_far, sku, name, category,
+                       current_stock, unit, daily_burn_rate, reorder_threshold_days,
+                       target_restock_days
+                FROM buyer_inventory
+                WHERE profile_type = ?
+            """, (profile_type.value,))
+            rows = cursor.fetchall()
+
+            if not rows:
+                # Fallback to cloud kitchen if empty
+                cursor.execute("""
+                    SELECT business_id, business_name, profile_type, daily_budget_limit,
+                           weekly_budget_limit, weekly_spent_so_far, sku, name, category,
+                           current_stock, unit, daily_burn_rate, reorder_threshold_days,
+                           target_restock_days
+                    FROM buyer_inventory
+                    WHERE profile_type = 'CLOUD_KITCHEN'
+                """)
+                rows = cursor.fetchall()
+
+            first = rows[0]
+            items = []
+            for r in rows:
+                items.append(InventoryItem(
+                    sku=r["sku"],
+                    name=r["name"],
+                    category=r["category"],
+                    current_stock=r["current_stock"],
+                    unit=r["unit"],
+                    daily_burn_rate=r["daily_burn_rate"],
+                    reorder_threshold_days=r["reorder_threshold_days"],
+                    target_restock_days=r["target_restock_days"]
+                ))
+
+            # Preferred suppliers lookup
+            preferred_ids = ["supp_dairy_direct", "supp_metro_foods"] if profile_type == BusinessProfileType.CLOUD_KITCHEN else ["supp_beverage_hub"]
+
+            return BuyerContext(
+                business_id=first["business_id"],
+                business_name=first["business_name"],
+                profile_type=BusinessProfileType(first["profile_type"]),
+                daily_budget_limit=first["daily_budget_limit"],
+                weekly_budget_limit=first["weekly_budget_limit"],
+                weekly_spent_so_far=first["weekly_spent_so_far"],
+                preferred_supplier_ids=preferred_ids,
+                inventory=items
+            )
 
     def get_critical_items(self, profile_type: BusinessProfileType) -> List[InventoryItem]:
         """Returns all inventory items currently at or below critical DIR threshold."""
@@ -57,25 +89,29 @@ class InventoryRepository:
 
     def deduct_stock(self, profile_type: BusinessProfileType, sku: str, quantity: float) -> bool:
         """
-        Deducts stock on hand (simulating consumption).
+        Deducts stock on hand in SQLite database (simulating usage/consumption).
         """
-        context = self.get_context(profile_type)
-        for item in context.inventory:
-            if item.sku == sku:
-                item.current_stock = max(0.0, round(item.current_stock - quantity, 2))
-                return True
-        return False
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE buyer_inventory
+                SET current_stock = MAX(0.0, ROUND(current_stock - ?, 2))
+                WHERE profile_type = ? AND sku = ?
+            """, (quantity, profile_type.value, sku))
+            return cursor.rowcount > 0
 
     def replenish_stock(self, profile_type: BusinessProfileType, sku: str, quantity: float) -> bool:
         """
-        Adds stock to inventory upon verified Razorpay settlement.
+        Adds stock to SQLite inventory upon verified Razorpay settlement.
         """
-        context = self.get_context(profile_type)
-        for item in context.inventory:
-            if item.sku == sku:
-                item.current_stock = round(item.current_stock + quantity, 2)
-                return True
-        return False
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE buyer_inventory
+                SET current_stock = ROUND(current_stock + ?, 2)
+                WHERE profile_type = ? AND sku = ?
+            """, (quantity, profile_type.value, sku))
+            return cursor.rowcount > 0
 
 
 # Singleton repository instance
