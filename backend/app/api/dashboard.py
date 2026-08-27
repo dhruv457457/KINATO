@@ -1,5 +1,6 @@
+import json
 import logging
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from app.gateway.event_bus import bus
@@ -7,6 +8,8 @@ from app.services.policy_engine import policy_engine
 from app.services.merchant_intelligence import merchant_intel
 from app.payments.upi_reserve_pay import upi_reserve_pay
 from app.core.auth import get_current_merchant
+from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from app.db.repositories import audit as audit_repo
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -27,71 +30,64 @@ class MandateRequest(BaseModel):
     customer_phone: str = ""
     daily_limit_inr: float = 10000.0
 
-@router.get("/dashboard/state")
-async def get_dashboard_state(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+@router.get("/dashboard/overview")
+async def get_dashboard_overview(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
     """
-    Exposes aggregated system state, hero KPIs, live recovery pipeline,
-    customer intelligence, and external AI buyer activity for the
-    authenticated merchant.
+    Real, DB-backed KPIs for this merchant only. Replaces the old
+    /dashboard/state, which read bus.get_recent_events() - an in-memory
+    log that isn't scoped per merchant and is empty after every process
+    restart (a real problem on Railway, where a redeploy restarts the
+    process). A merchant with zero activity gets real zeros/None here,
+    never a fabricated benchmark.
     """
     merchant_id = current_merchant["merchant_id"]
-
-    # TODO(event scoping): bus.get_recent_events() is still global across all
-    # merchants (see app/gateway/event_bus.py) - it hasn't been filtered by
-    # merchant_id yet. Until the ingestion work (real per-merchant events)
-    # lands, this shows the whole process's event log, not just this
-    # merchant's. Tracked, not silently hidden.
-    recent_events = bus.get_recent_events(limit=300)
-
-    # 1. Revenue Metrics
-    attributed_revenue = sum(
-        e["payload"].get("amount", 0)
-        for e in recent_events
-        if e["event_type"] == "revenue.attributed"
-    )
-
-    abandoned_value = sum(
-        e["payload"].get("amount", 0)
-        for e in recent_events
-        if e["event_type"] == "checkout.abandoned"
-    )
-
-    active_recoveries = len([e for e in recent_events if e["event_type"] == "call.started"])
-    completed_recoveries = len([e for e in recent_events if e["event_type"] == "payment.succeeded"])
-
-    revenue_at_risk = max(0.0, abandoned_value - attributed_revenue)
-    # No fabricated benchmark: with zero recoveries attempted there is no win
-    # rate to report. Return None and let callers render "-", not a made-up number.
-    win_rate = (completed_recoveries / active_recoveries * 100) if active_recoveries > 0 else None
-
-    # 2. Extract Latest Customer Intelligence
-    latest_intel = next(
-        (e["payload"] for e in reversed(recent_events) if e["event_type"] == "customer.understood"),
-        None
-    )
-
-    # 3. Extract Latest AI Commerce Rejection
-    latest_ai_rejection = next(
-        (e["payload"] for e in reversed(recent_events) if e["event_type"] == "ai_commerce.intent_rejected"),
-        None
-    )
-
-    # 4. Active Policy
-    current_policy = policy_engine.get_policy(merchant_id)
+    stats = recovery_attempts_repo.summary_stats(merchant_id)
 
     return {
-        "hero": {
-            "revenue_at_risk": revenue_at_risk,
-            "kinato_attributed_revenue": attributed_revenue,
-            "active_recoveries": active_recoveries,
-            "completed_recoveries": completed_recoveries,
-            "win_rate_percent": round(win_rate, 1) if win_rate is not None else None
-        },
-        "events": recent_events,
-        "latest_intel": latest_intel,
-        "latest_ai_rejection": latest_ai_rejection,
-        "policy": current_policy
+        "revenue_at_risk_paise": stats["revenue_at_risk_paise"],
+        "revenue_recovered_paise": stats["recovered_paise"],
+        "active_recoveries": stats["active_count"],
+        "recovered_count": stats["recovered_count"],
+        "total_attempts": stats["total_attempts"],
+        "opted_out_count": stats["opted_out_count"],
+        "call_failed_count": stats["call_failed_count"],
+        "abandoned_count": stats["abandoned_count"],
+        "recovery_rate_pct": stats["recovery_rate_pct"],
     }
+
+
+@router.get("/dashboard/recoveries")
+async def list_recoveries(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+    """Real recovery_attempts rows for this merchant, joined with checkout
+    amount and customer contact - the Recoveries table's data source."""
+    rows = recovery_attempts_repo.list_for_merchant(current_merchant["merchant_id"], limit=100)
+    return {"recoveries": rows}
+
+
+@router.get("/dashboard/recoveries/{recovery_attempt_id}")
+async def get_recovery_detail(recovery_attempt_id: str, current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+    """The full audit timeline for one recovery attempt - what backs the
+    detail drawer: every real tool call (get_cart, check_offer,
+    issue_offer, record_opt_out, ...) in order, with its real decision,
+    latency, and whether it ran degraded."""
+    attempt = recovery_attempts_repo.get_recovery_attempt(recovery_attempt_id)
+    if not attempt or attempt["merchant_id"] != current_merchant["merchant_id"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such recovery attempt.")
+
+    audit_rows = audit_repo.get_audit_trail_for_correlation(recovery_attempt_id)
+    for row in audit_rows:
+        for field in ("args", "result"):
+            try:
+                row[field] = json.loads(row[field]) if isinstance(row[field], str) else row[field]
+            except (TypeError, ValueError):
+                pass
+
+    try:
+        attempt["plan"] = json.loads(attempt["plan"]) if isinstance(attempt.get("plan"), str) else attempt.get("plan")
+    except (TypeError, ValueError):
+        pass
+
+    return {"recovery_attempt": attempt, "audit_trail": audit_rows}
 
 @router.get("/merchant/policy")
 async def get_merchant_policy(current_merchant: dict = Depends(get_current_merchant)):

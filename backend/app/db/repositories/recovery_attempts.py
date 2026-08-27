@@ -56,3 +56,69 @@ def list_active_for_checkout(checkout_id: str) -> list:
             (checkout_id,),
         )
         return cursor.fetchall()
+
+
+def list_for_merchant(merchant_id: str, limit: int = 100) -> list:
+    """Real recovery attempts for the dashboard's Recoveries table - joined
+    with checkout amount and customer name/phone so the table doesn't need
+    N+1 lookups. Replaces the old dashboard's reliance on the in-memory,
+    unscoped, restart-losing event bus log."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                ra.recovery_attempt_id, ra.checkout_id, ra.customer_id, ra.state, ra.channel,
+                ra.approved_discount_percent, ra.final_amount_paise, ra.attributed_revenue_paise,
+                ra.rzp_payment_link_id, ra.created_at, ra.updated_at,
+                c.amount_paise AS cart_amount_paise, c.currency,
+                cu.name AS customer_name, cu.phone AS customer_phone, cu.email AS customer_email
+            FROM recovery_attempts ra
+            LEFT JOIN checkouts c ON c.checkout_id = ra.checkout_id
+            LEFT JOIN customers cu ON cu.customer_id = ra.customer_id
+            WHERE ra.merchant_id = %s
+            ORDER BY ra.created_at DESC
+            LIMIT %s
+            """,
+            (merchant_id, limit),
+        )
+        return cursor.fetchall()
+
+
+def summary_stats(merchant_id: str) -> Dict[str, Any]:
+    """Real, DB-backed KPIs for the Overview page - every number here comes
+    from an actual row, not the event bus. A merchant with zero activity
+    gets real zeros/None, never a fabricated benchmark."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_attempts,
+                COUNT(*) FILTER (WHERE state = 'RECOVERED') AS recovered_count,
+                COALESCE(SUM(attributed_revenue_paise) FILTER (WHERE state = 'RECOVERED'), 0) AS recovered_paise,
+                COUNT(*) FILTER (WHERE state IN ('CALLING', 'OUTREACH_APPROVED', 'PAYMENT_LINK_SENT')) AS active_count,
+                COUNT(*) FILTER (WHERE state = 'CONSENT_REVOKED') AS opted_out_count,
+                COUNT(*) FILTER (WHERE state = 'CALL_FAILED') AS call_failed_count
+            FROM recovery_attempts
+            WHERE merchant_id = %s
+            """,
+            (merchant_id,),
+        )
+        row = dict(cursor.fetchone())
+
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(amount_paise), 0) AS at_risk_paise, COUNT(*) AS abandoned_count
+            FROM checkouts
+            WHERE merchant_id = %s AND status = 'abandoned'
+            """,
+            (merchant_id,),
+        )
+        risk_row = dict(cursor.fetchone())
+
+    total = row["total_attempts"]
+    row["recovery_rate_pct"] = round(100 * row["recovered_count"] / total, 1) if total else None
+    row["revenue_at_risk_paise"] = risk_row["at_risk_paise"]
+    row["abandoned_count"] = risk_row["abandoned_count"]
+    return row

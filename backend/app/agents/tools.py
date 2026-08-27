@@ -301,6 +301,13 @@ async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
     if not ctx.customer_id:
         return {"status": "REJECTED", "reason": "no_customer_in_context"}
     await identity_service.revoke_consent(ctx.merchant_id, ctx.customer_id, channel="voice", source="agent_tool")
+    if ctx.recovery_attempt_id:
+        # Was previously only reflected in the consents table - the
+        # recovery_attempts row itself stayed wherever it was (e.g.
+        # "CREATED"), which undercounted opt-outs on the dashboard's
+        # Overview KPIs. This is the same state issue_offer already
+        # updates on its own success; opt-out deserves the same honesty.
+        recovery_attempts_repo.update_state(ctx.recovery_attempt_id, "CONSENT_REVOKED")
     return {"status": "RECORDED"}
 
 
