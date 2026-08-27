@@ -1,3 +1,17 @@
+import logging
+
+# Must run before any other app import - several modules (notably
+# app/db/database.py) log real diagnostics (e.g. which DB engine actually
+# connected) at import time. Without a configured handler here, Python's
+# logging module silently drops every INFO-level call via its own
+# "handler of last resort" (WARNING and above only) - which is exactly
+# what made it impossible to tell, from Railway's deploy logs alone,
+# whether the app was really talking to Postgres or had silently fallen
+# back to ephemeral local SQLite. This used to live only in
+# run_backend.py's __main__ block, which a production start command
+# (`uvicorn app.main:app`, per the Procfile) never actually executes.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
