@@ -67,7 +67,17 @@ def _get_llm_client():
     return AsyncOpenAI(base_url=settings.LLM_BASE_URL, api_key=settings.OPENROUTER_API_KEY, http_client=ipv4_client())
 
 
-def _build_graph(tools: List[Tool], max_iterations: int):
+def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: List[str]):
+    """tool_calls_tracker is a plain list owned by the caller (run_agent),
+    appended to directly here rather than only through the graph's own
+    state - a real, confirmed bug: when the overall deadline_s wrapper in
+    run_agent times out mid-run, LangGraph's returned state is discarded
+    entirely, which silently threw away the record of tool calls that had
+    ALREADY executed for real (real audit_log rows, in one observed case a
+    real issue_offer that had already sent a real payment link) before the
+    final "say something back" LLM call was what actually got cut off.
+    Appending here means run_agent can report real tool activity even on
+    a timeout, instead of a misleadingly empty result."""
     tools_by_name = {t.name: t for t in tools}
 
     async def call_model(state: AgentState) -> AgentState:
@@ -136,6 +146,7 @@ def _build_graph(tools: List[Tool], max_iterations: int):
             else:
                 result = await execute_tool(tool, args, ctx)
                 state["tool_calls_made"].append(tool.name)
+                tool_calls_tracker.append(tool.name)  # survives even if the overall run later times out
             return {"tool_call_id": tc["id"], "role": "tool", "name": name, "content": json.dumps(result)}
 
         # Read-only tools run concurrently; mutating tools run strictly
@@ -200,7 +211,12 @@ async def run_agent(
         "tool_calls_made": [],
     }
 
-    graph = _build_graph(tools, max_iterations)
+    # Owned here, not just inside the graph's own state - see
+    # _build_graph's docstring for why: a timeout must not make real,
+    # already-executed tool calls (real audit rows, real money moved)
+    # disappear from the result as if they never happened.
+    tool_calls_tracker: List[str] = []
+    graph = _build_graph(tools, max_iterations, tool_calls_tracker)
 
     try:
         final_state = await asyncio.wait_for(
@@ -208,12 +224,15 @@ async def run_agent(
             timeout=deadline_s,
         )
     except asyncio.TimeoutError:
-        return AgentResult(ok=False, error="deadline_exceeded", degraded=True)
+        return AgentResult(ok=False, error="deadline_exceeded", degraded=True, tool_calls_made=list(tool_calls_tracker))
     except GraphRecursionError:
-        return AgentResult(ok=False, error="recursion_limit_reached", degraded=True)
+        return AgentResult(ok=False, error="recursion_limit_reached", degraded=True, tool_calls_made=list(tool_calls_tracker))
     except Exception as e:
         logger.error(f"Agent run raised unexpectedly: {e}", exc_info=True)
-        return AgentResult(ok=False, error=f"unexpected_error: {e.__class__.__name__}", degraded=True)
+        return AgentResult(
+            ok=False, error=f"unexpected_error: {e.__class__.__name__}", degraded=True,
+            tool_calls_made=list(tool_calls_tracker),
+        )
 
     if thread_id:
         _conversation_store[thread_id] = final_state["messages"]

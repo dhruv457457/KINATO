@@ -1,0 +1,120 @@
+{
+  "generated_at": "2026-08-27T15:48:33.176886+00:00",
+  "merchant_id": "mch_ff989accd2c9",
+  "batch_size": 6,
+  "recovered_count": 2,
+  "recovery_rate_pct": 33.3,
+  "total_cart_value_at_risk_inr": 29594.0,
+  "total_recovered_inr": 11878.130000000001,
+  "opted_out_count": 1,
+  "denied_count": 2,
+  "degraded_count": 0,
+  "results": [
+    {
+      "scenario": "Straightforward recovery",
+      "customer": "Asha",
+      "checkout_id": "chk_c2b64db90c50",
+      "recovery_attempt_id": "rec_3315522dcc19",
+      "cart_amount_inr": 1499.0,
+      "outcome": "NO_OFFER",
+      "recovered_amount_inr": null,
+      "approved_percent": null,
+      "agent_degraded": false,
+      "tool_calls": [
+        "get_cart",
+        "get_policy_limits",
+        "check_offer",
+        "issue_offer",
+        "get_cart",
+        "get_policy_limits",
+        "check_offer"
+      ],
+      "audit_rows": 7
+    },
+    {
+      "scenario": "Asks for more than policy allows, still recovers at the capped rate",
+      "customer": "Rohan",
+      "checkout_id": "chk_1d12d4c50535",
+      "recovery_attempt_id": "rec_dc235ad2b117",
+      "cart_amount_inr": 3499.0,
+      "outcome": "RECOVERED",
+      "recovered_amount_inr": 3149.1,
+      "approved_percent": 10.0,
+      "agent_degraded": false,
+      "tool_calls": [
+        "get_policy_limits",
+        "check_offer",
+        "issue_offer"
+      ],
+      "audit_rows": 3
+    },
+    {
+      "scenario": "Opt-out mid-conversation",
+      "customer": "Meera",
+      "checkout_id": "chk_3cb6f4416bd5",
+      "recovery_attempt_id": "rec_1291bdc63f65",
+      "cart_amount_inr": 4999.0,
+      "outcome": "OPTED_OUT",
+      "recovered_amount_inr": null,
+      "approved_percent": null,
+      "agent_degraded": false,
+      "tool_calls": [
+        "record_opt_out"
+      ],
+      "audit_rows": 1
+    },
+    {
+      "scenario": "Price-excluded product",
+      "customer": "Karan",
+      "checkout_id": "chk_a7f6969cc301",
+      "recovery_attempt_id": "rec_3c79e83d32e4",
+      "cart_amount_inr": 9999.0,
+      "outcome": "DENIED",
+      "recovered_amount_inr": null,
+      "approved_percent": null,
+      "agent_degraded": false,
+      "tool_calls": [
+        "check_offer",
+        "check_offer"
+      ],
+      "audit_rows": 2
+    },
+    {
+      "scenario": "Low-margin cart, minimal room",
+      "customer": "Priya",
+      "checkout_id": "chk_1c56311b99be",
+      "recovery_attempt_id": "rec_feb0c60bb6b0",
+      "cart_amount_inr": 599.0,
+      "outcome": "DENIED",
+      "recovered_amount_inr": null,
+      "approved_percent": null,
+      "agent_degraded": false,
+      "tool_calls": [
+        "get_cart",
+        "get_policy_limits",
+        "check_offer",
+        "check_offer",
+        "check_offer"
+      ],
+      "audit_rows": 5
+    },
+    {
+      "scenario": "Straightforward recovery, higher ticket",
+      "customer": "Vikram",
+      "checkout_id": "chk_a335be7ff8c7",
+      "recovery_attempt_id": "rec_af708461074d",
+      "cart_amount_inr": 8999.0,
+      "outcome": "RECOVERED",
+      "recovered_amount_inr": 8729.03,
+      "approved_percent": 3.0,
+      "agent_degraded": false,
+      "tool_calls": [
+        "get_cart",
+        "get_policy_limits",
+        "check_offer",
+        "issue_offer"
+      ],
+      "audit_rows": 4
+    }
+  ]
+}

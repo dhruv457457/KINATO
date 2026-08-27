@@ -257,7 +257,23 @@ async def twilio_voice_respond(request: Request):
         deadline_s=VOICE_DEADLINE_S,
     )
 
-    if not result.ok or result.degraded or not (result.output or {}).get("content"):
+    # Checked BEFORE the degraded/no-content fallback, deliberately: a
+    # timeout or dropped final response can still follow real, already-
+    # executed tool calls (see app/agents/runtime.py's tool_calls_tracker -
+    # a confirmed live bug where a real issue_offer had already sent a
+    # real payment link, but the generic "technical difficulty" message
+    # played anyway because the wrapping result looked degraded). The
+    # customer must never be told "we'll follow up" when something real
+    # already happened this turn.
+    if "issue_offer" in result.tool_calls_made:
+        reply_text = result.output.get("content") if (result.output or {}).get("content") else (
+            "Great news - I've sent that offer to your email, you should see it any moment."
+        )
+    elif "record_opt_out" in result.tool_calls_made:
+        reply_text = result.output.get("content") if (result.output or {}).get("content") else (
+            "Understood, I won't contact you about this again. Take care."
+        )
+    elif not result.ok or result.degraded or not (result.output or {}).get("content"):
         # Never fabricate a scripted line here - a short, honest, generic
         # reply is what "degraded" means for a live call.
         reply_text = "I hear you - let me have someone from our team follow up with you by email on this."
