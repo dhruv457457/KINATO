@@ -16,6 +16,7 @@ class BusinessProfileType(str, Enum):
     CLOUD_KITCHEN = "CLOUD_KITCHEN"
     TECH_PANTRY = "TECH_PANTRY"
     RETAIL_STORE = "RETAIL_STORE"
+    CUSTOM = "CUSTOM"
 
 
 class ExecutionMode(str, Enum):

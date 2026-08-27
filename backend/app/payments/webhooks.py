@@ -1,139 +1,148 @@
 """
-================================================================================
-FILE: app/payments/webhooks.py
-MODULE: Module 3 - Razorpay Webhook Handler & Reconciliation
---------------------------------------------------------------------------------
-WHAT THIS FILE DOES:
-Receives, verifies, and reconciles asynchronous webhooks from Razorpay:
-  1. Cryptographic HMAC Verification:
-     Validates `X-Razorpay-Signature` over the raw payload bytes against `RAZORPAY_WEBHOOK_SECRET`.
-  2. Idempotent Event Processing:
-     Guarantees that replayed webhooks never trigger duplicate stock updates.
-  3. Inventory Auto-Replenishment:
-     Upon `payment.captured`, automatically updates SQLite buyer inventory.
-  4. Cryptographic Proof Receipt Generation:
-     Mints and stores an immutable `ProofReceipt` record for auditability.
-================================================================================
+Razorpay webhook receiver - path-scoped per merchant
+(POST /webhooks/razorpay/{merchant_id}) because the webhook secret used to
+verify the signature must be resolved for that specific merchant *before*
+verification can happen at all; a single global secret can't work once
+payments are genuinely multi-tenant.
+
+`payment.failed` is the PRIMARY recovery trigger (not `checkout.abandoned`):
+it carries the customer's real email/contact directly from Razorpay, needs
+no timer, and requires ZERO code on the merchant's site - a merchant who
+never touches static/sdk/kinato.js or @kinato/react still gets real recovery
+the moment Razorpay tells us a payment failed. `order.created` remains a
+secondary signal that feeds the sweeper's timer-based path (for the
+"customer just walked away, no failure yet" case).
+
+Money state is never decided here - this only relays an already-
+authoritative Razorpay event onto the bus.
 """
 import json
+import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Dict, Any, Tuple
+from fastapi import APIRouter, Request, HTTPException
+
 from app.core.security import verify_razorpay_webhook_signature
-from app.payments.state_machine import state_machine, TransactionState
-from app.knowledge.inventory import inventory_repo
-from app.models.enums import BusinessProfileType
-from app.models.payment import ProofReceipt
-from app.models.a2a import QuoteLineItem
-from app.db.database import get_db
+from app.core.crypto import decrypt_secret
+from app.db.repositories.merchants import get_merchant, MerchantNotFoundError
+from app.db.repositories import checkouts as checkouts_repo
+from app.db.repositories import customers as customers_repo
+from app.gateway.event_bus import bus
+
+logger = logging.getLogger(__name__)
+payments_router = APIRouter()
 
 
-class RazorpayWebhookHandler:
-    """
-    Handles and verifies incoming webhooks from Razorpay payment servers.
-    """
-    @classmethod
-    def process_webhook(
-        cls,
-        raw_body: bytes,
-        signature_header: str
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        # 1. Verify HMAC Signature
-        if not verify_razorpay_webhook_signature(raw_body, signature_header):
-            return False, "Invalid X-Razorpay-Signature header. Webhook rejected.", {}
+@payments_router.post("/webhooks/razorpay/{merchant_id}")
+async def razorpay_webhook(merchant_id: str, request: Request):
+    try:
+        merchant = get_merchant(merchant_id)
+    except MerchantNotFoundError:
+        raise HTTPException(status_code=404, detail="Unknown merchant.")
 
-        # 2. Parse Event JSON
-        try:
-            event_data = json.loads(raw_body.decode("utf-8"))
-        except Exception as e:
-            return False, f"Malformed JSON in webhook body: {str(e)}", {}
+    webhook_secret = decrypt_secret(merchant.get("rzp_webhook_secret_enc") or "")
+    if not webhook_secret:
+        raise HTTPException(status_code=400, detail="This merchant has not configured a Razorpay webhook secret yet.")
 
-        event_name = event_data.get("event", "")
-        payload = event_data.get("payload", {})
-        payment_entity = payload.get("payment", {}).get("entity", {})
+    raw_body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not verify_razorpay_webhook_signature(raw_body, signature, webhook_secret):
+        logger.warning(f"Rejected Razorpay webhook for merchant {merchant_id}: invalid signature.")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
-        payment_id = payment_entity.get("id", "")
-        order_id = payment_entity.get("order_id", "")
+    event_data = json.loads(raw_body)
+    event_name = event_data.get("event", "")
+    payload = event_data.get("payload", {})
+    payment_entity = payload.get("payment", {}).get("entity", {})
+    order_entity = payload.get("order", {}).get("entity", {})
+    notes = payment_entity.get("notes") or order_entity.get("notes") or {}
+
+    checkout_id = notes.get("checkout_id")
+    recovery_attempt_id = notes.get("recovery_attempt_id")
+    correlation_id = checkout_id or payment_entity.get("order_id") or order_entity.get("id") or "unknown"
+
+    # --- PRIMARY: payment.failed - zero-code recovery trigger ---
+    if event_name == "payment.failed":
+        email = payment_entity.get("email", "")
+        contact = payment_entity.get("contact", "")
         amount_paise = payment_entity.get("amount", 0)
-        notes = payment_entity.get("notes", {})
-        proposal_id = notes.get("proposal_id", "")
-        profile_type_str = notes.get("profile_type", "CLOUD_KITCHEN")
 
-        # ----------------------------------------------------------------------
-        # Event: payment.captured / order.paid
-        # ----------------------------------------------------------------------
-        if event_name in ["payment.captured", "order.paid"]:
-            # Transition state machine
-            try:
-                state_machine.transition(order_id, TransactionState.SUCCESS, payment_id=payment_id)
-            except Exception:
-                pass
+        customer = None
+        if email or contact:
+            customer = customers_repo.upsert_by_contact(merchant_id, email=email, phone=contact)
 
-            # Auto-replenish stock in SQLite
-            receipt_id = f"rcpt_{uuid.uuid4().hex[:8]}"
-            profile_type = BusinessProfileType(profile_type_str) if profile_type_str in BusinessProfileType.__members__ else BusinessProfileType.CLOUD_KITCHEN
+        if not checkout_id:
+            # No prior SDK/API integration ever tracked this checkout (the
+            # zero-code path) - create the row now from the webhook itself,
+            # so it's a real row the same as any other, not a special case.
+            checkout_id = f"chk_wh_{payment_entity.get('id', uuid.uuid4().hex[:8])}"
+            checkouts_repo.create_checkout(
+                merchant_id, amount_paise=amount_paise,
+                customer_id=customer["customer_id"] if customer else None,
+                source="razorpay_webhook", checkout_id=checkout_id,
+            )
 
-            # Query proposal items from SQLite
-            items_list = []
-            with get_db() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,))
-                prop_row = cursor.fetchone()
+        if not customer:
+            logger.info(f"payment.failed for {checkout_id} carried no contactable customer - recovery blocked.")
+            await bus.publish(
+                event_type="recovery.blocked",
+                payload={"checkout_id": checkout_id, "reason": "no_contact"},
+                correlation_id=correlation_id, merchant_id=merchant_id,
+            )
+            return {"status": "ok", "event": event_name}
 
-                if prop_row:
-                    items_raw = json.loads(prop_row["items_json"])
-                    for it in items_raw:
-                        item_obj = QuoteLineItem.model_validate(it)
-                        items_list.append(item_obj)
-                        # Replenish stock in buyer inventory
-                        inventory_repo.replenish_stock(profile_type, item_obj.sku, item_obj.quantity)
+        await bus.publish(
+            event_type="checkout.payment_failed",
+            payload={
+                "checkout_id": checkout_id,
+                "customer_id": customer["customer_id"],
+                "amount": amount_paise / 100.0,
+                "amount_paise": amount_paise,
+                "currency": payment_entity.get("currency", "INR"),
+                "error_reason": payment_entity.get("error_reason"),
+                "recovery_attempt_id": recovery_attempt_id,
+            },
+            correlation_id=correlation_id,
+            merchant_id=merchant_id,
+            idempotency_key=f"webhook_{payment_entity.get('id', correlation_id)}",
+        )
+        return {"status": "ok", "event": event_name}
 
-                # Store Proof of Intent & Settlement Receipt
-                receipt = ProofReceipt(
-                    receipt_id=receipt_id,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    business_name=notes.get("business_name", "BurgerCraft Kitchen"),
-                    supplier_name=notes.get("supplier_name", "DairyDirect Wholesalers"),
-                    items=items_list,
-                    total_amount_inr=round(amount_paise / 100.0, 2),
-                    payment_method=payment_entity.get("method", "upi"),
-                    razorpay_order_id=order_id,
-                    razorpay_payment_id=payment_id,
-                    policy_hash=notes.get("proposal_hash", ""),
-                    signature_verified=True,
-                    status="SUCCESS"
-                )
+    # --- SECONDARY: order.created - feeds the sweeper's timer path ---
+    if event_name == "order.created":
+        order_id = order_entity.get("id")
+        if order_id and not checkouts_repo.get_checkout(checkout_id or ""):
+            checkouts_repo.create_checkout(
+                merchant_id, amount_paise=order_entity.get("amount", 0),
+                source="razorpay_webhook", checkout_id=checkout_id or f"chk_wh_{order_id}",
+            )
+        return {"status": "ok", "event": event_name}
 
-                cursor.execute("""
-                    INSERT OR REPLACE INTO proof_receipts (
-                        receipt_id, proposal_id, timestamp, business_name, supplier_name,
-                        items_json, total_amount_inr, payment_method, razorpay_order_id,
-                        razorpay_payment_id, policy_hash, signature_verified, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'SUCCESS')
-                """, (
-                    receipt.receipt_id, proposal_id, receipt.timestamp, receipt.business_name,
-                    receipt.supplier_name, json.dumps([i.model_dump() for i in items_list]),
-                    receipt.total_amount_inr, receipt.payment_method, order_id, payment_id,
-                    receipt.policy_hash
-                ))
+    # --- payment succeeded, from any of Razorpay's several event names for it ---
+    if event_name in ("payment.captured", "payment.authorized", "order.paid", "payment_link.paid"):
+        await bus.publish(
+            event_type="payment.succeeded",
+            payload={
+                "amount": payment_entity.get("amount", 0),
+                "payment_id": payment_entity.get("id"),
+                "order_id": payment_entity.get("order_id"),
+                "checkout_id": checkout_id,
+                "recovery_attempt_id": recovery_attempt_id,
+                "notes": notes,
+            },
+            correlation_id=correlation_id,
+            merchant_id=merchant_id,
+            idempotency_key=f"webhook_{payment_entity.get('id', correlation_id)}",
+        )
+        return {"status": "ok", "event": event_name}
 
-            return True, f"Webhook processed: {event_name} - Receipt {receipt_id} minted.", {
-                "receipt_id": receipt_id,
-                "order_id": order_id,
-                "payment_id": payment_id
-            }
+    # --- rail health - suppresses outreach while Razorpay itself is degraded ---
+    if event_name in ("payment.downtime.started", "payment.downtime.resolved"):
+        await bus.publish(
+            event_type="rail.degraded",
+            payload={"status": "down" if event_name.endswith("started") else "resolved"},
+            correlation_id=merchant_id,
+            merchant_id=merchant_id,
+        )
+        return {"status": "ok", "event": event_name}
 
-        # ----------------------------------------------------------------------
-        # Event: payment.failed
-        # ----------------------------------------------------------------------
-        elif event_name == "payment.failed":
-            try:
-                state_machine.transition(order_id, TransactionState.FAILED, payment_id=payment_id)
-            except Exception:
-                pass
-            return True, "Webhook processed: payment.failed marked in state machine.", {"order_id": order_id}
-
-        return True, f"Webhook received: {event_name} (No action needed).", {}
-
-
-webhook_handler = RazorpayWebhookHandler()
+    return {"status": "ignored", "event": event_name}

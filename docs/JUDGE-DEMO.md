@@ -1,30 +1,31 @@
-# Kinato Judge Demo & Verification Guide
+# Kinato 2.0: Judge Demo & Verification Guide
 
-Welcome to **Kinato** — Autonomous B2B Micro-Procurement & Agent-to-Agent Commerce Protocol on Razorpay Rails.
+> **Razorpay AI Buildathon 2026 — Track 01: AI Growth & Agentic Commerce**  
+> *"Grow the merchant's revenue, and make them sellable to AI buyers"*
 
 ---
 
-## 🚀 Quick Start (3 Steps, 60 Seconds)
+## 🚀 60-Second Quick Start
 
-### Step 1: Start the FastAPI Backend
+### 1. Start FastAPI Backend
 ```bash
 cd backend
 python -m uvicorn app.main:app --port 8000 --reload
 ```
-* Backend starts at: `http://localhost:8000`
-* Agent-Readable Catalog manifest: `http://localhost:8000/.well-known/agent-catalog.json`
-* Swagger API Docs: `http://localhost:8000/docs`
+* **Backend API**: `http://localhost:8000`
+* **Agent-Readable Manifest**: `http://localhost:8000/.well-known/agent-catalog.json`
+* **FastMCP Tool Endpoint**: `http://localhost:8000/mcp`
+* **Swagger Docs**: `http://localhost:8000/docs`
 
-### Step 2: Run the Automated Safety & Resilience Test Suite
+### 2. Run Automated Safety & Resilience Invariant Suite
 ```bash
 python tests/run_tests.py
 ```
-* Verifies Floor Price Protection, Cashflow Limits, HMAC Tamper Detection, and Razorpay Idempotency.
+* Runs 9 automated tests validating Floor Price Protection, Cashflow Limits, HMAC Tamper Detection, Razorpay Idempotency, AI Upsell Margins, FIFO Yield Markdown, and all 5 Chaos Invariants.
 
-### Step 3: Start the Next.js Frontend Dashboard
+### 3. Start Next.js Frontend Command Center
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 * Open `http://localhost:3000` in your browser.
@@ -33,36 +34,36 @@ npm run dev
 
 ## 🎬 5-Minute Pitch Video Script & Walkthrough
 
-### 0:00 - 0:30 ➔ The Problem (Hook)
-* *"Indian cloud kitchens, cafes, and retail stores lose over ₹15,000/month to manual procurement delays and perishable waste. Kinato transforms static Razorpay merchants into autonomous, agent-transactable entities that negotiate restocks in real-time."*
+### 0:00 - 0:45 ➔ The Hook & The "Why Now"
+* *"Commerce is shifting from human clicks to autonomous AI buyers. But today, merchants have no way to sell to AI agents, and they lose 20% of revenue to perishable waste and unoptimized pricing. Kinato is the dual-sided Agentic Commerce Protocol on Razorpay rails that turns any merchant into an autonomous revenue engine."*
 
-### 0:30 - 1:00 ➔ The Architecture (Visual Diagram)
-* Show the 4-Pillar Architecture in `README.md`:
-  1. Agent-Readable Catalog (`/.well-known/agent-catalog.json`)
-  2. Multi-Supplier LangGraph Reverse Bidding
-  3. Deterministic Policy Gate & Floor Price Guard
-  4. Razorpay Test Rails & Proof of Intent Ledger
+### 0:45 - 1:45 ➔ Merchant Revenue Engine (Pillar 1)
+1. Open **Merchant Growth Portal** (`http://localhost:3000/merchant`).
+2. Show **Dynamic Yield & FIFO Markdowns**: An aging batch of cheese block (60% shelf life used) is automatically priced with a dynamic markdown ($P \ge CP \times 1.15$) to prevent write-offs.
+3. Show **AI Upsell Matrix**: When an AI buyer requests Cheese, the merchant's AI automatically bundles Brioche Buns & Chipotle Sauce at a 12% bundle discount, lifting Average Order Value (AOV) by +35%.
+4. Show **1-Click Campaign Orchestrator**: Click *"Launch AI Campaign"* to broadcast promotional flash deals across the agent network.
 
-### 1:00 - 3:00 ➔ Live Interactive Demo (3 Presets)
-* **Demo 1 (Success + FIFO Aging Bundle Deal):**
-  - Select 🍔 **Cloud Kitchen** vertical.
-  - Click **"Auto-Restock All"**.
-  - Watch the live A2A bidding stream: Supplier A and B submit quotes. Metro Foodservice Hub bundles an aging chipotle sauce at -₹160 discount to win the bid.
-  - Click **"Approve & Pay with Razorpay"** $\rightarrow$ Razorpay standard checkout opens $\rightarrow$ Enter test UPI/card $\rightarrow$ Confetti celebration!
-* **Demo 2 (Floor Price Refusal - Margin Shield):**
-  - Click **Scenario 2** card.
-  - Show that even if an AI suggests a deep discount, the Deterministic Policy Gate **BLOCKS** the transaction because $SP < CP \times 1.15$, protecting merchant gross margins.
-* **Demo 3 (External AI Buyer via FastMCP):**
-  - Show external AI agents (Claude Code / Cursor) connecting to `/mcp` to autonomously inspect inventory and trigger restocks.
+### 1:45 - 3:00 ➔ Autonomous Buyer Restock & Razorpay Settlement (Pillars 2 & 4)
+1. Open **Buyer Workspace** (`http://localhost:3000/dashboard`).
+2. Type in chat: *"Restock Mozzarella Cheese and burger bakery staples"*.
+3. Watch the real-time **Multi-Supplier Bidding War**: Supplier A and Supplier B compete. Metro Foodservice Hub bundles aging sauce to win the auction.
+4. Show **Razorpay Rails**:
+   * Click **"Approve & Pay"** $\rightarrow$ Razorpay Standard Checkout popup opens $\rightarrow$ Enter test UPI (`success@razorpay`) $\rightarrow$ Payment confirmed and settled!
+   * Click **"Generate Shareable Payment Link / QR"** $\rightarrow$ Razorpay Payment Link generated with instant QR code for asynchronous mobile checkout.
+   * Switch mode to **"AutoPay Mandate"** $\rightarrow$ Zero-click autonomous procurement under pre-authorized daily budget.
 
-### 3:00 - 4:00 ➔ Deep Engineering Rigor
-* Open `FINDINGS.md` and show:
-  1. HMAC-SHA256 proposal signing & constant-time verification.
-  2. Razorpay Idempotency Journal (`kinato_{proposal_id}_{supplier_id}`).
-  3. `UNCERTAIN` State Active Reconciliation.
+### 3:00 - 4:00 ➔ "The Bar" & Chaos Failure Injection (Pillar 3)
+1. Open **Chaos Sandbox** (`http://localhost:3000/sandbox`).
+2. Click **"Run All 5 Invariant Tests"**:
+   * **Under-Cost Sale Attack** $\rightarrow$ Intercepted by Deterministic Policy Gate ($P < CP \times 1.15 \rightarrow \text{BLOCKED}$).
+   * **HMAC Signature Tampering** $\rightarrow$ Tampered payload rejected via constant-time digest comparison.
+   * **Webhook Drop Recovery** $\rightarrow$ Active reconciliation worker resolves `UNCERTAIN` state via Razorpay API.
+   * **Cashflow Ceiling Breach** $\rightarrow$ Order blocked with remedial adjustment calculation.
+   * **Double-Charge Deduplication** $\rightarrow$ Idempotency Journal returns cached order in 0.5ms with 0 duplicate orders.
 
-### 4:00 - 5:00 ➔ Value for Razorpay
-* *"Kinato turns Razorpay into the settlement layer for the global Agent-to-Agent commerce protocol race (UAP, ACP, AP2). Every merchant on Razorpay becomes transactable by AI buyers end to end."*
+### 4:00 - 5:00 ➔ External AI Interoperability & Strategic Value for Razorpay
+* Open `skills/kinato-commerce/SKILL.md` and `/.well-known/agent-catalog.json`.
+* *"Any external agent (Claude Code, Cursor, Perplexity) can plug into Kinato via MCP or Agent Skills. Kinato makes Razorpay the indispensable financial settlement layer for the global agent economy."*
 
 ---
 

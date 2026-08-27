@@ -1,65 +1,54 @@
 """
-================================================================================
-FILE: app/agents/state.py
-MODULE: Module 2 - LangGraph Agent State
---------------------------------------------------------------------------------
-WHAT THIS FILE DOES:
-Defines the typed state passed across all nodes in the LangGraph Multi-Agent
-StateGraph workflow.
-
-IT TRACKS:
-  1. Business operational context & inventory.
-  2. Active A2A-RFQ and list of critical restock items.
-  3. Competing Supplier Quotes received during broadcast.
-  4. 5-Factor ranked quotes and selected winning quote.
-  5. 1-round bounded counter-offer and dynamic concession result.
-  6. Final cryptographically signed A2A proposal.
-  7. Deterministic policy evaluation result.
-  8. Step-by-step trace log for live UI streaming.
-================================================================================
+Shared state contract for every agent's bounded reasoning loop
+(see runtime.py). One AgentContext is built by the *caller* (never the
+model) per invocation and carries every identity/money-adjacent field a
+tool needs - merchant_id, customer_id, checkout_id. Tool schemas exposed to
+the LLM are forbidden from declaring any of these as arguments (enforced in
+audit.py); a tool function instead receives ctx as a plain Python parameter
+that never passes through the model's JSON tool-call arguments at all.
 """
-from typing import TypedDict, List, Optional, Dict, Any
-from app.models.enums import BusinessProfileType, ExecutionMode
-from app.models.inventory import BuyerContext, InventoryItem
-from app.models.a2a import A2A_RFQ, A2A_Quote, A2A_CounterOffer, A2A_FinalOffer
-from app.models.policy import PolicyEvaluation
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, TypedDict
 
 
-class TraceStep(TypedDict):
-    """Represents a single step in the agent reasoning and negotiation timeline."""
-    step_name: str
-    actor: str  # "BuyerAgent" | "SupplierAgent" | "PolicyEngine" | "System"
-    status: str  # "IN_PROGRESS" | "COMPLETED" | "BLOCKED"
-    message: str
-    timestamp: str
-    data: Optional[Dict[str, Any]]
+@dataclass(frozen=True)
+class AgentContext:
+    merchant_id: str
+    correlation_id: str
+    customer_id: Optional[str] = None
+    checkout_id: Optional[str] = None
+    recovery_attempt_id: Optional[str] = None
+    # False whenever the agent is degraded (see runtime.py) - a heuristic
+    # path can observe and recommend, but structurally cannot call a
+    # mutating tool. This is enforced in audit.py's execute_tool gate, not
+    # just documented here.
+    allow_mutations: bool = True
+    degraded: bool = False
+    # "llm" | "heuristic" - carried onto every audit_log row and the
+    # agent.tool_called event so the dashboard never shows a heuristic
+    # guess dressed up as a model decision (see the honesty-pass note in
+    # the rebuild plan about confidence numbers on fallback paths).
+    source: str = "llm"
 
 
 class AgentState(TypedDict):
-    """The central state schema for the LangGraph Agentic Commerce pipeline."""
-    # 1. Inputs
-    profile_type: BusinessProfileType
-    execution_mode: ExecutionMode
-    buyer_context: Optional[BuyerContext]
-    custom_query: Optional[str]
+    messages: List[Dict[str, Any]]
+    iterations: int
+    ctx: AgentContext
+    final: Optional[Dict[str, Any]]
+    tool_calls_made: List[str]
 
-    # 2. Inventory & RFQ
-    critical_items: List[InventoryItem]
-    active_rfq: Optional[A2A_RFQ]
 
-    # 3. Multi-Supplier Bidding
-    supplier_quotes: List[A2A_Quote]
-    ranked_quotes: List[A2A_Quote]
-    winning_quote: Optional[A2A_Quote]
+@dataclass
+class AgentResult:
+    """What runtime.run_agent() returns. The graph invocation itself never
+    raises - a timeout, a recursion-limit halt, or an unexpected exception
+    all become `ok=False` with a reason, never an uncaught exception
+    propagating into a voice call or webhook handler."""
 
-    # 4. Negotiation & Concession
-    counter_offer: Optional[A2A_CounterOffer]
-    final_offer: Optional[A2A_FinalOffer]
-
-    # 5. Deterministic Policy Gate
-    policy_evaluation: Optional[PolicyEvaluation]
-
-    # 6. Observability & Telemetry
-    trace_steps: List[TraceStep]
-    is_fallback_mode: bool
-    error: Optional[str]
+    ok: bool
+    output: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    degraded: bool = False
+    iterations: int = 0
+    tool_calls_made: List[str] = field(default_factory=list)

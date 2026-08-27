@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700;800&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -8,50 +10,146 @@
 }
 
 body {
-  background-color: #08090C;
-  color: #F3F4F6;
+  background-color: #FDFCF7;
+  color: #1B1A17;
   font-family: var(--font-geist-sans);
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Calm Glassmorphism utility classes */
-.glass-panel {
-  background: rgba(18, 20, 26, 0.75);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.06), 0 8px 32px 0 rgba(0, 0, 0, 0.4);
-}
-
+/* Base card styling matching the soft organic feel */
 .glass-card {
-  background: rgba(24, 26, 32, 0.65);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  background: #FFFFFF;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.03);
+  border-radius: 16px;
+  transition: all 0.3s ease;
 }
 
 .glass-card:hover {
-  background: rgba(30, 33, 42, 0.85);
-  border-color: rgba(255, 255, 255, 0.14);
-  box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.06);
+  transform: translateY(-2px);
 }
 
-/* Custom modern scrollbars */
+/* Custom scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
-
 ::-webkit-scrollbar-track {
-  background: #0D0F14;
+  background: transparent;
 }
-
 ::-webkit-scrollbar-thumb {
-  background: #272A34;
+  background: #EAE6D5;
   border-radius: 3px;
 }
-
 ::-webkit-scrollbar-thumb:hover {
-  background: #3F4454;
+  background: #D5D0BC;
 }
+
+/* Minimal input reset for chat interface */
+.chat-input {
+  background: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  resize: none;
+}
+
+/* ---------------------------------------------------------------------
+ * Onboarding funnel — Vignelli/Swiss discipline adapted to the app's own
+ * cream/charcoal tokens: straight edges, no shadow, single hairline rules,
+ * a numbered left rail instead of a progress bar. Scoped under `.onb-`
+ * so it never collides with the rounded/glass-card language used
+ * elsewhere in the app.
+ * --------------------------------------------------------------------- */
+.onb-field label {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8A8678;
+  margin-bottom: 9px;
+}
+.onb-field input,
+.onb-field textarea {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid #D5D0BC;
+  background: transparent;
+  padding: 9px 1px;
+  font-size: 16px;
+  font-family: var(--font-geist-sans);
+  color: #1B1A17;
+  border-radius: 0;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.onb-field input::placeholder { color: #D5D0BC; }
+.onb-field input:hover { border-bottom-color: #44433C; }
+.onb-field input:focus { border-bottom: 1px solid #1B1A17; }
+.onb-field input:disabled { color: #8A8678; cursor: not-allowed; }
+.onb-field.error input { border-bottom-color: #A3372A; }
+.onb-field .hint { font-size: 12px; color: #8A8678; margin-top: 8px; line-height: 1.5; }
+.onb-field .error-text { font-size: 12px; color: #A3372A; margin-top: 8px; }
+
+.onb-btn-primary {
+  background: #1B1A17; color: #FDFCF7; border: 1px solid #1B1A17;
+  border-radius: 0; padding: 13px 26px; font-size: 12.5px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+.onb-btn-primary:hover:not(:disabled) { background: #44433C; border-color: #44433C; }
+.onb-btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.onb-btn-secondary {
+  background: transparent; color: #1B1A17; border: 1px solid #D5D0BC;
+  border-radius: 0; padding: 13px 26px; font-size: 12.5px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.onb-btn-secondary:hover { border-color: #1B1A17; }
+
+.onb-btn-ghost {
+  background: transparent; border: none; color: #8A8678; font-size: 12.5px;
+  font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  cursor: pointer; padding: 13px 6px;
+}
+.onb-btn-ghost:hover { color: #1B1A17; }
+
+.onb-status-line {
+  display: flex; align-items: center; gap: 10px; font-size: 13px; color: #8A8678;
+  border: 1px solid #D5D0BC; padding: 13px 15px; transition: border-color 0.2s ease, color 0.2s ease;
+}
+.onb-status-dot { width: 6px; height: 6px; background: #8A8678; flex-shrink: 0; border-radius: 50%; }
+.onb-status-line.pending .onb-status-dot { animation: onbBlink 1.4s ease-in-out infinite; }
+@keyframes onbBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.onb-status-line.ok { color: #1F6B3C; border-color: #1F6B3C; }
+.onb-status-line.ok .onb-status-dot { background: #1F6B3C; }
+.onb-status-line.err { color: #A3372A; border-color: #A3372A; }
+.onb-status-line.err .onb-status-dot { background: #A3372A; }
+
+.onb-code-block {
+  background: #1B1A17; color: #F5F3E9; font-family: var(--font-geist-mono);
+  font-size: 12.5px; padding: 18px 20px; line-height: 1.7; overflow-x: auto; white-space: pre;
+}
+.onb-copy-btn {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; background: transparent;
+  border: 1px solid #D5D0BC; padding: 8px 14px; font-size: 11.5px; font-weight: 600;
+  letter-spacing: 0.03em; text-transform: uppercase; cursor: pointer; color: #44433C;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.onb-copy-btn:hover { border-color: #1B1A17; }
+.onb-copy-btn.copied { color: #1F6B3C; border-color: #1F6B3C; }
+
+.onb-tab { padding: 11px 0; margin-right: 30px; font-size: 12.5px; font-weight: 600; color: #8A8678;
+  border-bottom: 2px solid transparent; cursor: pointer; transition: color 0.15s ease; background: none; border-top: none; border-left: none; border-right: none; }
+.onb-tab:hover { color: #44433C; }
+.onb-tab.active { color: #1B1A17; border-bottom-color: #1B1A17; }
+
+.onb-dropzone {
+  border: 1px dashed #D5D0BC; padding: 44px 20px; text-align: center; color: #8A8678;
+  font-size: 13px; cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease;
+}
+.onb-dropzone:hover, .onb-dropzone.drag { border-color: #44433C; background: #F5F3E9; }

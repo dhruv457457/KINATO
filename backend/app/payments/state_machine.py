@@ -34,7 +34,7 @@ class TransactionState(str, Enum):
 
 VALID_TRANSITIONS: Dict[TransactionState, Set[TransactionState]] = {
     TransactionState.CREATED: {TransactionState.OFFER_READY, TransactionState.FAILED},
-    TransactionState.OFFER_READY: {TransactionState.AWAITING_APPROVAL, TransactionState.APPROVED, TransactionState.EXPIRED},
+    TransactionState.OFFER_READY: {TransactionState.AWAITING_APPROVAL, TransactionState.APPROVED, TransactionState.EXPIRED, TransactionState.SUCCESS},
     TransactionState.AWAITING_APPROVAL: {TransactionState.APPROVED, TransactionState.FAILED, TransactionState.EXPIRED},
     TransactionState.APPROVED: {TransactionState.PAYMENT_SUBMITTED, TransactionState.FAILED},
     TransactionState.PAYMENT_SUBMITTED: {TransactionState.SUCCESS, TransactionState.FAILED, TransactionState.UNCERTAIN},
@@ -57,7 +57,7 @@ class TransactionStateMachine:
     ) -> bool:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT state FROM orders WHERE order_id = ? OR razorpay_order_id = ?", (order_id, order_id))
+            cursor.execute("SELECT state FROM orders WHERE order_id = %s OR razorpay_order_id = %s", (order_id, order_id))
             row = cursor.fetchone()
 
             if not row:
@@ -75,14 +75,14 @@ class TransactionStateMachine:
             if payment_id:
                 cursor.execute("""
                     UPDATE orders
-                    SET state = ?, razorpay_payment_id = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE order_id = ? OR razorpay_order_id = ?
+                    SET state = %s, razorpay_payment_id = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = %s OR razorpay_order_id = %s
                 """, (new_state.value, payment_id, order_id, order_id))
             else:
                 cursor.execute("""
                     UPDATE orders
-                    SET state = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE order_id = ? OR razorpay_order_id = ?
+                    SET state = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = %s OR razorpay_order_id = %s
                 """, (new_state.value, order_id, order_id))
 
             return cursor.rowcount > 0
@@ -91,7 +91,7 @@ class TransactionStateMachine:
     def get_order_state(order_id: str) -> TransactionState:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT state FROM orders WHERE order_id = ? OR razorpay_order_id = ?", (order_id, order_id))
+            cursor.execute("SELECT state FROM orders WHERE order_id = %s OR razorpay_order_id = %s", (order_id, order_id))
             row = cursor.fetchone()
             if row:
                 return TransactionState(row["state"])

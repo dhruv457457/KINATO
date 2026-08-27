@@ -62,3 +62,11 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code harness (not part of the product)
+.claude/
+skills/
+skills-lock.json
+---
+# Generated at runtime, not source
+backend/static/audio/*.mp3

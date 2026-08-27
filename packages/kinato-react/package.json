@@ -1,0 +1,22 @@
+{
+  "name": "@kinato/react",
+  "version": "1.0.0",
+  "description": "React/Next.js SDK for Kinato - real-time checkout tracking for AI-powered revenue recovery.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup src/index.tsx --format cjs,esm --dts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=17.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}
