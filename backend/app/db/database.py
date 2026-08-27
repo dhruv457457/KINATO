@@ -50,22 +50,64 @@ SQLITE_PATH = Path(__file__).parent.parent / "data" / "kinato_local.db"
 T = TypeVar("T")
 
 
+def _resolve_ipv4_hostaddr(database_url: str):
+    """Diagnosed live on Railway: the container tried to reach Supabase over
+    IPv6 ("Network is unreachable") despite IPv4 also being available -
+    Railway's default egress doesn't route IPv6 unless explicitly enabled.
+    Resolving the DSN's own hostname to an IPv4 address and passing it as
+    libpq's `hostaddr` forces the TCP connection over IPv4 while `host`
+    still does its normal job (SSL server-name verification) - this is the
+    same "don't trust the OS to pick a working address family" fix already
+    applied to the outbound HTTP clients (see app/core/net.py), just for
+    psycopg2. Returns None (not a hard failure) if the URL has no
+    resolvable hostname or resolution fails - callers fall back to
+    unqualified DNS resolution, which is what happened before this fix."""
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(database_url).hostname
+        if not host:
+            return None
+        return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    except Exception as e:
+        logger.warning(f"Could not resolve an IPv4 address for the database host ({e}) - using default DNS resolution.")
+        return None
+
+
 def init_pool():
     global db_pool, USE_SQLITE
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if PSYCOPG2_AVAILABLE and settings.DATABASE_URL and not settings.DATABASE_URL.startswith("sqlite"):
+        ipv4_addr = _resolve_ipv4_hostaddr(settings.DATABASE_URL)
+        pool_kwargs = {"hostaddr": ipv4_addr} if ipv4_addr else {}
         try:
             db_pool = psycopg2.pool.ThreadedConnectionPool(
-                1, 20, dsn=settings.DATABASE_URL, connect_timeout=4
+                1, 20, dsn=settings.DATABASE_URL, connect_timeout=4, **pool_kwargs
             )
             # Test connection
             conn = db_pool.getconn()
             db_pool.putconn(conn)
             USE_SQLITE = False
-            logger.info("Connected to PostgreSQL database pool.")
+            logger.info(f"Connected to PostgreSQL database pool (hostaddr={ipv4_addr or 'default DNS'}).")
             return
         except Exception as e:
+            if ipv4_addr:
+                # The forced-IPv4 attempt itself failed - try once more with
+                # plain DNS resolution before giving up, in case the IPv4
+                # forcing was itself the problem (e.g. a host that's
+                # genuinely IPv6-only).
+                logger.warning(f"PostgreSQL connection via forced IPv4 failed ({e}); retrying with default DNS resolution.")
+                try:
+                    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=settings.DATABASE_URL, connect_timeout=4)
+                    conn = db_pool.getconn()
+                    db_pool.putconn(conn)
+                    USE_SQLITE = False
+                    logger.info("Connected to PostgreSQL database pool (default DNS resolution).")
+                    return
+                except Exception as e2:
+                    e = e2
             logger.warning(f"PostgreSQL connection failed ({e}). Falling back to local SQLite.")
             db_pool = None
             USE_SQLITE = True
