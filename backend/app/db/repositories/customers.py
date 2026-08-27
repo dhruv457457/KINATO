@@ -78,3 +78,28 @@ def get_customer(customer_id: str) -> Optional[Dict[str, Any]]:
         cursor.execute("SELECT * FROM customers WHERE customer_id = %s", (customer_id,))
         row = cursor.fetchone()
     return dict(row) if row else None
+
+
+def list_for_merchant(merchant_id: str, limit: int = 200) -> list:
+    """Real customers for the dashboard's Customers page, with each one's
+    current voice-channel consent status - a correlated subquery picking
+    the latest consents row (portable across Postgres/SQLite, unlike
+    DISTINCT ON), matching the same "latest row wins" rule
+    consents.check_consent() itself uses."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                cu.*,
+                (SELECT status FROM consents
+                 WHERE customer_id = cu.customer_id AND channel = 'voice'
+                 ORDER BY created_at DESC LIMIT 1) AS voice_consent_status
+            FROM customers cu
+            WHERE cu.merchant_id = %s
+            ORDER BY cu.created_at DESC
+            LIMIT %s
+            """,
+            (merchant_id, limit),
+        )
+        return cursor.fetchall()

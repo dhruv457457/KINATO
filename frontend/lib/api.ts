@@ -108,6 +108,7 @@ export interface RecoveryRow {
 
 export interface AuditRow {
   audit_id: string;
+  correlation_id?: string;
   actor: string;
   action: string;
   decision: string | null;
@@ -128,6 +129,27 @@ export function getRecoveries(): Promise<{ recoveries: RecoveryRow[] }> {
 
 export function getRecoveryDetail(id: string): Promise<{ recovery_attempt: any; audit_trail: AuditRow[] }> {
   return apiFetch(`/api/dashboard/recoveries/${id}`);
+}
+
+export function getActivity(): Promise<{ activity: AuditRow[] }> {
+  return apiFetch("/api/dashboard/activity");
+}
+
+export interface CustomerRow {
+  customer_id: string;
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  created_at: string;
+  voice_consent_status: "granted" | "revoked" | null;
+}
+
+export function getCustomers(): Promise<{ customers: CustomerRow[] }> {
+  return apiFetch("/api/dashboard/customers");
+}
+
+export function revokeCustomerConsent(customerId: string): Promise<{ status: string }> {
+  return apiFetch(`/api/dashboard/customers/${customerId}/revoke-consent`, { method: "POST" });
 }
 
 /** paise -> "₹1,234.56" */

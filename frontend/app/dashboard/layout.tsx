@@ -7,11 +7,11 @@ import { getCurrentMerchant, Merchant, stepPath } from "@/lib/api";
 const NAV_ITEMS: { label: string; path: string; enabled: boolean }[] = [
   { label: "Overview", path: "/dashboard", enabled: true },
   { label: "Recoveries", path: "/dashboard/recoveries", enabled: true },
-  { label: "Customers", path: "/dashboard/customers", enabled: false },
+  { label: "Customers", path: "/dashboard/customers", enabled: true },
   { label: "Catalog", path: "/dashboard/catalog", enabled: false },
   { label: "AI Commerce", path: "/dashboard/ai-commerce", enabled: false },
-  { label: "Policies", path: "/dashboard/policies", enabled: false },
-  { label: "Activity", path: "/dashboard/activity", enabled: false },
+  { label: "Policies", path: "/dashboard/policies", enabled: true },
+  { label: "Activity", path: "/dashboard/activity", enabled: true },
   { label: "Settings", path: "/dashboard/settings", enabled: false },
 ];
 

@@ -10,6 +10,8 @@ from app.payments.upi_reserve_pay import upi_reserve_pay
 from app.core.auth import get_current_merchant
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import audit as audit_repo
+from app.db.repositories import customers as customers_repo
+from app.services.identity_service import identity_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -88,6 +90,44 @@ async def get_recovery_detail(recovery_attempt_id: str, current_merchant: dict =
         pass
 
     return {"recovery_attempt": attempt, "audit_trail": audit_rows}
+
+
+@router.get("/dashboard/activity")
+async def get_activity(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+    """Every real tool call across every recovery attempt for this
+    merchant, most recent first - the same audit_log rows the Recoveries
+    drawer shows per-attempt, just unfiltered and chronological. This is
+    what makes every money decision the AI ever made queryable, not just
+    the ones a merchant happens to click into."""
+    rows = audit_repo.recent_audit(current_merchant["merchant_id"], limit=200)
+    for row in rows:
+        for field in ("args", "result"):
+            try:
+                row[field] = json.loads(row[field]) if isinstance(row[field], str) else row[field]
+            except (TypeError, ValueError):
+                pass
+    return {"activity": rows}
+
+
+@router.get("/dashboard/customers")
+async def list_customers(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+    """Real customers for this merchant, each with their real, current
+    voice-channel consent status."""
+    rows = customers_repo.list_for_merchant(current_merchant["merchant_id"])
+    return {"customers": rows}
+
+
+@router.post("/dashboard/customers/{customer_id}/revoke-consent")
+async def revoke_customer_consent(customer_id: str, current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+    """A merchant-initiated opt-out on a customer's behalf (e.g. a support
+    request that didn't come through a live call). Uses the same
+    append-only revoke_consent() path as the AI's own record_opt_out tool
+    - one real mechanism, two ways to trigger it."""
+    customer = customers_repo.get_customer(customer_id)
+    if not customer or customer["merchant_id"] != current_merchant["merchant_id"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such customer.")
+    await identity_service.revoke_consent(current_merchant["merchant_id"], customer_id, channel="voice", source="dashboard_manual")
+    return {"status": "revoked"}
 
 @router.get("/merchant/policy")
 async def get_merchant_policy(current_merchant: dict = Depends(get_current_merchant)):
