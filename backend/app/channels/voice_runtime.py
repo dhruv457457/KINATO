@@ -62,8 +62,17 @@ from app.db.repositories import customers as customers_repo
 logger = logging.getLogger(__name__)
 voice_router = APIRouter()
 
-VOICE_MAX_ITERATIONS = 2
-VOICE_DEADLINE_S = 4.0
+
+# Confirmed live on Railway: get_cart and get_policy_limits each ran in
+# ~750ms with real, fast tool latency - the earlier max_iterations=2 was
+# too tight for a full negotiation (cart -> policy -> check_offer is 3
+# sequential steps when the model doesn't batch them, which it often
+# doesn't), cutting the turn off before it could ever reach check_offer.
+# Twilio's own webhook-response deadline is ~15s; this leaves headroom
+# for both the reasoning budget and voice_block()'s own ELEVENLABS_BUDGET_S
+# (4s) afterward, with margin to spare.
+VOICE_MAX_ITERATIONS = 4
+VOICE_DEADLINE_S = 8.0
 
 if not (settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN):
     logger.warning("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set - voice calling is disabled until backend/.env is configured.")
