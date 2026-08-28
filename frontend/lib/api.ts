@@ -173,6 +173,28 @@ export function getCatalog(): Promise<{ products: ProductRow[] }> {
   return apiFetch("/api/dashboard/catalog");
 }
 
+/** The webhook URL to paste into Razorpay. Comes from the SERVER, not
+ *  assembled here — a browser talking to localhost would otherwise show a
+ *  localhost URL that Razorpay can never reach. */
+export function getWebhookUrl(): Promise<{ url: string; public_base_configured: boolean }> {
+  return apiFetch("/api/merchant/webhook-url");
+}
+
+/** Upload/replace catalog rows from a CSV. Same endpoint onboarding uses —
+ *  re-uploading is an upsert by sku, so it doubles as "update my prices". */
+export async function uploadCatalogCsv(file: File): Promise<{ imported: number; skipped: string[] }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${API_URL}/api/merchant/onboarding/catalog`, {
+    method: "POST",
+    credentials: "include",
+    body: form, // no Content-Type: the browser must set the multipart boundary
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new ApiError(data?.detail || `Upload failed (${res.status})`, res.status);
+  return data;
+}
+
 export function setProductVisibility(productId: string, visible: boolean): Promise<{ product: ProductRow }> {
   return apiFetch(`/api/dashboard/catalog/${productId}/visibility`, {
     method: "POST",

@@ -2,12 +2,11 @@
 
 import { useEffect, useState } from "react";
 import {
-  API_URL,
-  getCurrentMerchant,
   getApiKeys,
   createApiKey,
   revokeApiKey,
   getRazorpayStatus,
+  getWebhookUrl,
   saveWebhookSecret,
   getAllowedOrigins,
   setAllowedOrigins,
@@ -64,7 +63,8 @@ function CopyField({ value, mono = true }: { value: string; mono?: boolean }) {
 }
 
 export default function SettingsPage() {
-  const [merchantId, setMerchantId] = useState<string | null>(null);
+  const [webhookUrl, setWebhookUrl] = useState<string>("");
+  const [publicBaseOk, setPublicBaseOk] = useState<boolean | null>(null);
   const [keys, setKeys] = useState<ApiKeyRow[] | null>(null);
   const [rzpConnected, setRzpConnected] = useState<boolean | null>(null);
   const [webhookSecretSet, setWebhookSecretSet] = useState<boolean | null>(null);
@@ -78,7 +78,12 @@ export default function SettingsPage() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    getCurrentMerchant().then((m) => setMerchantId(m?.merchant_id || null));
+    getWebhookUrl()
+      .then((d) => {
+        setWebhookUrl(d.url);
+        setPublicBaseOk(d.public_base_configured);
+      })
+      .catch(() => setPublicBaseOk(false));
     getApiKeys().then((d) => setKeys(d.keys)).catch(() => setError("Could not load API keys."));
     getRazorpayStatus()
       .then((d) => {
@@ -151,7 +156,6 @@ export default function SettingsPage() {
     }
   }
 
-  const webhookUrl = merchantId ? `${API_URL}/webhooks/razorpay/${merchantId}` : "";
 
   return (
     <>
@@ -181,6 +185,13 @@ export default function SettingsPage() {
             integration — a failed payment reaches Kinato without you touching your storefront.
           </p>
           <CopyField value={webhookUrl} />
+          {publicBaseOk === false && (
+            <p className="text-[12px] mt-2 leading-relaxed" style={{ color: NEGATIVE }}>
+              This deployment has no public base URL configured, so there is no address Razorpay could reach.
+              Set <code>NGROK_URL</code> to this server&apos;s public URL (your Railway URL, or a tunnel) and
+              reload.
+            </p>
+          )}
 
           <div className="mt-6">
             <div className="flex items-center justify-between mb-2">

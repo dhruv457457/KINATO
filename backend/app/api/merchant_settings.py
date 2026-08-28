@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 from app.core.auth import get_current_merchant
+from app.core.config import settings
 from app.core.crypto import encrypt_secret, EncryptionNotConfiguredError
 from app.db.repositories import merchants as merchants_repo
 from app.db.repositories import api_keys as api_keys_repo
@@ -68,6 +69,25 @@ async def connect_razorpay(payload: ConnectRazorpayRequest, current_merchant: di
     invalidate_cache(current_merchant["merchant_id"])
     merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "integrate")
     return {"status": "connected", "message": message}
+
+
+@merchant_router.get("/webhook-url")
+async def webhook_url(current_merchant: dict = Depends(get_current_merchant)):
+    """The webhook URL a merchant should paste into Razorpay.
+
+    This has to come from the SERVER, not be assembled by the browser from
+    whatever API host it happens to be talking to. A merchant running the
+    dashboard locally would otherwise be shown
+    http://localhost:8000/webhooks/... - a URL Razorpay can never reach, and
+    which fails as silence rather than as an error. settings.NGROK_URL is
+    this deployment's own public base (Railway URL or tunnel); when it isn't
+    configured we say so instead of handing back something unusable.
+    """
+    public_base = (settings.NGROK_URL or "").rstrip("/")
+    return {
+        "url": f"{public_base}/webhooks/razorpay/{current_merchant['merchant_id']}" if public_base else "",
+        "public_base_configured": bool(public_base),
+    }
 
 
 @merchant_router.get("/razorpay/status")
@@ -248,13 +268,20 @@ async def upload_catalog(
             detail="No valid rows found - every row was missing a sku, name, or valid price.",
         )
 
-    merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "policy")
+    # Only advance the funnel if the merchant is still IN it. This same
+    # endpoint backs the dashboard's Catalog re-upload, and an already-
+    # onboarded merchant updating their prices must not be thrown back to
+    # step 05 - the funnel guard would then eject them from the dashboard
+    # entirely.
+    if current_merchant.get("onboarding_step") == "catalog":
+        merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "policy")
     return {"imported": len(imported), "skipped": skipped, "product_ids": imported}
 
 
 @merchant_router.post("/onboarding/catalog/skip")
 async def skip_catalog(current_merchant: dict = Depends(get_current_merchant)):
-    merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "policy")
+    if current_merchant.get("onboarding_step") == "catalog":
+        merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "policy")
     return {"onboarding_step": "policy"}
 
 

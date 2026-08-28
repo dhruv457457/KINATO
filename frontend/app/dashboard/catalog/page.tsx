@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getCatalog, setProductVisibility, formatInr, ProductRow } from "@/lib/api";
+import { getCatalog, setProductVisibility, uploadCatalogCsv, formatInr, ProductRow } from "@/lib/api";
 import {
   PageHeader,
   PageBody,
@@ -24,12 +24,37 @@ export default function CatalogPage() {
   const [rows, setRows] = useState<ProductRow[] | null>(null);
   const [error, setError] = useState("");
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState<string>("");
 
   useEffect(() => {
+    load();
+  }, []);
+
+  function load() {
     getCatalog()
       .then((d) => setRows(d.products))
       .catch(() => setError("Could not load your catalog right now."));
-  }, []);
+  }
+
+  async function handleUpload(file: File) {
+    setUploading(true);
+    setError("");
+    setUploadResult("");
+    try {
+      const res = await uploadCatalogCsv(file);
+      // Re-uploading is an upsert by sku, so this doubles as "update my prices".
+      setUploadResult(
+        `Imported ${res.imported} product${res.imported === 1 ? "" : "s"}` +
+          (res.skipped?.length ? ` · skipped ${res.skipped.length} (missing sku, name, or price)` : "")
+      );
+      load();
+    } catch (e: any) {
+      setError(e?.message || "Could not import that CSV.");
+    } finally {
+      setUploading(false);
+    }
+  }
 
   async function handleToggle(productId: string, next: boolean) {
     setTogglingId(productId);
@@ -47,9 +72,33 @@ export default function CatalogPage() {
 
   return (
     <>
-      <PageHeader eyebrow="Catalog" title="What Kinato knows you sell" />
+      <PageHeader
+        eyebrow="Catalog"
+        title="What Kinato knows you sell"
+        actions={
+          <label className="onb-btn-secondary shrink-0" style={{ cursor: uploading ? "wait" : "pointer" }}>
+            {uploading ? "Importing…" : "Upload CSV"}
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              disabled={uploading}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleUpload(f);
+                e.target.value = ""; // allow re-uploading the same filename
+              }}
+            />
+          </label>
+        }
+      />
 
       <PageBody>
+        {uploadResult && (
+          <p className="text-sm mb-4 anim-fade" style={{ color: "#1F6B3C" }}>
+            {uploadResult}
+          </p>
+        )}
         {error && <p className="text-sm mb-4 anim-fade" style={{ color: NEGATIVE }}>{error}</p>}
 
         <AsyncSection
@@ -57,8 +106,9 @@ export default function CatalogPage() {
           error={rows === null ? error : ""}
           empty={
             <EmptyState>
-              No products on file yet — upload a CSV from onboarding, or a product appears here the moment a
-              recovery attempt reads it off a real checkout&apos;s line items.
+              No products on file yet. Use <strong>Upload CSV</strong> above — columns
+              <code> sku, name, price</code> (required) plus <code>cogs, inventory</code>. COGS is what makes the
+              margin floor real when the AI negotiates a discount.
             </EmptyState>
           }
         >
