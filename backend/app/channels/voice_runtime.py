@@ -84,9 +84,19 @@ voice_router = APIRouter()
 # equally bad: exceeding Twilio's deadline kills the call outright, while
 # exhausting the reasoning budget just degrades that one turn and the
 # conversation continues. Always lose the reasoning, never the call.
-# Worst case is now ~6s + ~2s = 8s, leaving real headroom.
+# Revised again after a live call: 6s proved too tight because each DB-backed
+# tool costs ~2-2.8s from Railway to Supabase (see policies.py's cache note).
+# A turn that called get_cart then get_policy_limits burned the whole budget
+# and degraded at the exact moment the customer asked for the checkout link.
+#
+# The durable fix was removing the redundancy - check_offer already loads the
+# cart and policy itself, so the tool descriptions and prompt now tell the
+# model to call it directly - but the budget also needs to fit a real
+# check_offer -> issue_offer sequence: ~2 tool calls plus 2-3 model round
+# trips. 9s covers that, and with voice_block capped at 2s the worst case is
+# ~11s, still inside Twilio's ~15s deadline.
 VOICE_MAX_ITERATIONS = 4
-VOICE_DEADLINE_S = 6.0
+VOICE_DEADLINE_S = 9.0
 
 if not (settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN):
     logger.warning("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set - voice calling is disabled until backend/.env is configured.")
@@ -121,8 +131,10 @@ didn't finish checking out.
 3. Ask, openly, what stopped them. Do not guess the reason and do not lead with a discount - the real \
 barrier might be shipping, size, timing, or trust, and offering money to someone who was worried about \
 delivery just wastes margin.
-4. Respond to the barrier they actually name. ONLY if price is genuinely the issue, call get_policy_limits \
-and then check_offer, and propose exactly what check_offer approved.
+4. Respond to the barrier they actually name. ONLY if price is genuinely the issue, call check_offer \
+DIRECTLY and propose exactly what it approved. check_offer already loads the real cart and the real policy \
+itself - calling get_cart or get_policy_limits first is wasted time on a live call and can run the turn out \
+of budget before any offer is made.
 5. Ask them plainly whether they would like you to send it. Accept a clear yes or a clear no.
 
 Sound like a real person on a real phone: natural phrasing, brief warm acknowledgements, no script reading. \

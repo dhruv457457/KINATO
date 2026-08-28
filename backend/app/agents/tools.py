@@ -101,7 +101,11 @@ async def _get_cart(ctx: AgentContext) -> Dict[str, Any]:
 
 get_cart = Tool(
     name="get_cart",
-    description="Look up the real cart for the current checkout - amount, currency, and cost basis.",
+    description=(
+        "Look up the real cart for the current checkout - amount, currency, and cost basis. "
+        "Only needed if the customer asks what is in their cart. Do NOT call this before "
+        "check_offer: check_offer loads the cart itself."
+    ),
     parameters={},
     required=[],
     fn=_get_cart,
@@ -121,7 +125,11 @@ async def _get_policy_limits(ctx: AgentContext) -> Dict[str, Any]:
 
 get_policy_limits = Tool(
     name="get_policy_limits",
-    description="Look up this merchant's configured discount ceiling, margin floor, and offer ladder.",
+    description=(
+        "Look up this merchant's configured discount ceiling, margin floor, and offer ladder. "
+        "Rarely needed: check_offer applies these limits itself and tells you what was approved. "
+        "Do NOT call this before check_offer."
+    ),
     parameters={},
     required=[],
     fn=_get_policy_limits,
@@ -197,7 +205,9 @@ check_offer = Tool(
     description=(
         "Ask whether a discount could be approved for this customer's cart. Applies nothing - "
         "returns a decision and, if not DENY, an offer_token that must be passed to issue_offer "
-        "to actually send it. The approved percent may be lower than what you asked for."
+        "to actually send it. The approved percent may be lower than what you asked for. "
+        "This tool ALREADY loads the real cart and the real policy itself, so you do NOT need to "
+        "call get_cart or get_policy_limits first - doing so just wastes time on a live call."
     ),
     parameters={
         "requested_discount_percent": {
