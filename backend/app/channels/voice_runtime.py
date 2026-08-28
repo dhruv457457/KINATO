@@ -42,6 +42,7 @@ The discount ladder lives entirely in merchant_policies, never in a prompt.
 """
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, Optional
 from xml.sax.saxutils import escape
@@ -59,6 +60,7 @@ from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
+from app.services.discovery_agent import contains_placeholder
 
 logger = logging.getLogger(__name__)
 voice_router = APIRouter()
@@ -112,8 +114,10 @@ not deliver several steps in a single breath:
 
 1. Make sure they can hear you and confirm who you are speaking to. ("Hello - can you hear me alright? \
 Am I speaking with {customer_label}?")
-2. Say who you are and why you are calling{business_intro}. Mention that you noticed they were looking at \
-{item_description} on the site and didn't finish checking out.
+2. Say why you are calling{business_intro}. Do NOT give yourself a personal name - you have not been given \
+one, and inventing one (or emitting anything in brackets) is worse than simply not having one. Name the \
+business and move on. Mention that you noticed they were looking at {item_description} on the site and \
+didn't finish checking out.
 3. Ask, openly, what stopped them. Do not guess the reason and do not lead with a discount - the real \
 barrier might be shipping, size, timing, or trust, and offering money to someone who was worried about \
 delivery just wastes margin.
@@ -130,6 +134,25 @@ proposed. A vague "okay" or "hmm" is not agreement - ask once more to be sure.
 If they ask not to be contacted again, or clearly want to end the conversation for good, call \
 record_opt_out immediately and close politely. Do not keep selling.
 """
+
+
+_PLACEHOLDER_IDENTITY = re.compile(
+    r"(?:this is|i'm|i am|my name is)\s+(?:\[[^\]]*\]|\{[^}]*\}|<[^>]*>)\s*(?:,)?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_placeholder_identity(text: str) -> str:
+    """Removes a self-introduction built around a template slot.
+
+    "Great! This is [Your Name] from Dhruv." -> "Great! From Dhruv."
+    Losing the introduction is far better than speaking brackets aloud, and
+    the agent still names the business it is calling from.
+    """
+    cleaned = _PLACEHOLDER_IDENTITY.sub("", text)
+    cleaned = re.sub(r"\[[^\]]*\]|\{[^}]*\}|<[^>]*>", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned or "Hello - I'm calling about the order you started with us."
 
 
 def _build_system_prompt(customer_name: str, item_description: str, business_name: str = "") -> str:
@@ -335,6 +358,18 @@ async def twilio_voice_respond(request: Request):
         await _publish_escalation(call_id, session["ctx"], result.error or "agent_degraded_or_empty_reply")
     else:
         reply_text = result.output["content"]
+
+    # A reply is SPOKEN ALOUD. The opening line has been guarded against
+    # template slots since a call read "[Your Name] from [Your Company]" to a
+    # customer - but that guard only covered the opening. A live turn later
+    # said "This is [Your Name] from Dhruv", proving the guard was on the
+    # wrong layer alone. Every spoken line goes through it now.
+    if contains_placeholder(reply_text):
+        logger.warning(
+            f"[CALL {call_id}] Model reply contained a placeholder ({reply_text!r}) - "
+            "replacing it rather than reading brackets aloud."
+        )
+        reply_text = _strip_placeholder_identity(reply_text)
 
     logger.info(f"[CALL {call_id}] Agent ({'degraded' if result.degraded else 'ok'}): '{reply_text}' | tools: {result.tool_calls_made}")
 
