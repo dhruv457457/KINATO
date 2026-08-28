@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 
 from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
+from app.services import outreach_guards
 from app.services.voice_dispatch import place_outbound_call, VoiceDispatchError
 from app.services.tts import voice_block as tts_voice_block
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
@@ -115,6 +116,26 @@ class CallOrchestrator:
         if not consent_granted:
             logger.warning(f"Orchestrator halting {recovery_attempt_id}: CONSENT_REVOKED")
             recovery_attempts_repo.update_state(recovery_attempt_id, "CONSENT_REVOKED")
+            return
+
+        # Hard stops that must hold before we dial: already paid, quiet
+        # hours, call cap. Any outreach despite one of these is a RULE BREAK
+        # and is counted as such on the dashboard.
+        allowed, stop_reason = outreach_guards.check_all(merchant_id, checkout_id)
+        if not allowed:
+            logger.warning(f"Orchestrator halting {recovery_attempt_id}: STOP_{stop_reason.split()[0].upper()}")
+            recovery_attempts_repo.update_state(recovery_attempt_id, "CALL_FAILED")
+            await bus.publish(
+                event_type="recovery.blocked",
+                payload={
+                    "checkout_id": checkout_id,
+                    "recovery_attempt_id": recovery_attempt_id,
+                    "reason": stop_reason.split()[0],
+                    "detail": stop_reason,
+                },
+                correlation_id=correlation_id,
+                merchant_id=merchant_id,
+            )
             return
 
         recovery_attempts_repo.update_state(recovery_attempt_id, "OUTREACH_APPROVED", channel="voice")

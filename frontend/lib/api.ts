@@ -89,6 +89,10 @@ export interface DashboardOverview {
    *  "rail_degraded"). Money was on the table but Kinato deliberately
    *  stayed silent — this says why. */
   blocked_reasons: Record<string, number>;
+  /** Outreach that happened DESPITE a hard stop (already paid, no consent,
+   *  quiet hours, discount over ceiling). Not a metric to optimise — any
+   *  non-zero value means a guarantee the merchant relies on was broken. */
+  rule_breaks: number;
 }
 
 export interface RecoveryRow {

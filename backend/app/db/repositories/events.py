@@ -93,3 +93,23 @@ def recent_events(merchant_id: Optional[str] = None, limit: int = 300) -> List[D
         except (TypeError, ValueError):
             pass
     return rows
+
+
+# An outreach that happened DESPITE a hard stop being true. These are the
+# breaches a merchant is entitled to assume never occur: calling someone who
+# had already paid, who never consented, or outside their configured hours;
+# approving a discount above the ceiling; charging twice.
+#
+# The dashboard reports this count and it must be zero. A non-zero value is
+# not a metric to improve - it means a guarantee was broken.
+RULE_BREAK_EVENT = "policy.rule_break"
+
+
+def count_rule_breaks(merchant_id: str) -> int:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE merchant_id = %s AND event_type = %s",
+            (merchant_id, RULE_BREAK_EVENT),
+        )
+        return int(dict(cursor.fetchone())["n"])

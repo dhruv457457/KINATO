@@ -174,3 +174,23 @@ def summary_stats(merchant_id: str) -> Dict[str, Any]:
     row["revenue_at_risk_paise"] = int(at_risk) if isinstance(at_risk, Decimal) else at_risk
     row["abandoned_count"] = int(abandoned) if isinstance(abandoned, Decimal) else abandoned
     return row
+
+
+def count_calls_for_checkout(checkout_id: str) -> int:
+    """How many times this checkout has already been dialled.
+
+    Counts attempts that reached at least the dialling stage - CREATED
+    alone means the attempt was opened but consent or a guard stopped it
+    before any call, and that should not burn the customer's call budget.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS n FROM recovery_attempts
+            WHERE checkout_id = %s
+              AND state IN ('CALLING', 'PAYMENT_LINK_SENT', 'RECOVERED', 'CALL_FAILED')
+            """,
+            (checkout_id,),
+        )
+        return int(dict(cursor.fetchone())["n"])

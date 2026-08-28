@@ -61,6 +61,8 @@ from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
 from app.services.discovery_agent import contains_placeholder
+from app.services import outreach_guards
+from app.db.database import run_db_async
 
 logger = logging.getLogger(__name__)
 voice_router = APIRouter()
@@ -359,6 +361,39 @@ async def twilio_voice_respond(request: Request):
 
     session["turns"] += 1
     logger.info(f"[CALL {call_id}] Customer: '{customer_speech}'")
+
+    # Paid-while-talking. The pre-dial guard checks this once, before the
+    # phone rings - but a customer can pay from the earlier link, or on
+    # another device, at any point DURING the call. Continuing to sell to
+    # someone who has already paid is the single most damaging thing this
+    # agent could do, so it is re-checked every turn rather than once.
+    ctx = session["ctx"]
+    if ctx.checkout_id:
+        paid_ok, paid_reason = await run_db_async(outreach_guards.not_already_paid, ctx.checkout_id)
+        if not paid_ok:
+            logger.warning(f"[CALL {call_id}] STOP_ALREADY_PAID mid-call - ending without an offer.")
+            if ctx.recovery_attempt_id:
+                await run_db_async(
+                    recovery_attempts_repo.update_state, ctx.recovery_attempt_id, "RECOVERED"
+                )
+            await bus.publish(
+                event_type="recovery.blocked",
+                payload={
+                    "checkout_id": ctx.checkout_id,
+                    "recovery_attempt_id": ctx.recovery_attempt_id,
+                    "reason": "already_paid",
+                    "detail": "customer paid during the call",
+                },
+                correlation_id=ctx.correlation_id,
+                merchant_id=ctx.merchant_id,
+            )
+            return Response(
+                content=_escalation_twiml(
+                    "Ah - I can see your payment has just come through. That's all sorted, "
+                    "so I won't take any more of your time. Thank you!"
+                ),
+                media_type="text/xml",
+            )
 
     result = await agent_runtime.run_agent(
         system_prompt=_build_system_prompt(

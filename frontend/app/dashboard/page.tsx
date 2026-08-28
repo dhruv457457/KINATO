@@ -11,6 +11,7 @@ import {
   RULE,
   RULE_SOFT,
   INK_MUTED,
+  POSITIVE,
   WASH,
   NEGATIVE,
 } from "@/components/dashboard/primitives";
@@ -30,6 +31,37 @@ const BLOCKED_COPY: Record<string, { title: string; action: string }> = {
       "These failures happened during a reported Razorpay outage, so Kinato deliberately stayed quiet rather than chasing customers over a problem that wasn't theirs. No action needed.",
   },
 };
+
+/** The one number that must read zero. A rule break is outreach that
+ *  happened despite a hard stop being true — calling someone who had already
+ *  paid, who never consented, or outside their configured hours; approving a
+ *  discount above the ceiling. It is not a metric to improve. */
+function RuleBreaks({ count }: { count: number }) {
+  const clean = !count;
+  return (
+    <div
+      className="mt-10 border p-6 flex items-baseline gap-4 anim-rise"
+      style={{ borderColor: clean ? RULE : NEGATIVE }}
+    >
+      <span
+        className="font-serif font-semibold text-[32px] leading-none tabular-nums"
+        style={{ color: clean ? POSITIVE : NEGATIVE }}
+      >
+        {count}
+      </span>
+      <div>
+        <div className="text-[10.5px] font-semibold uppercase tracking-widest mb-1" style={{ color: INK_MUTED }}>
+          Rule breaks
+        </div>
+        <div className="text-[12px] leading-relaxed" style={{ color: INK_MUTED, maxWidth: "34rem" }}>
+          {clean
+            ? "No customer was contacted after paying, without consent, or outside your calling hours, and no discount exceeded your ceiling."
+            : "A hard stop was breached. This is not a number to improve — it means a guarantee you rely on did not hold. Check Activity for the offending case."}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function BlockedPanel({ reasons }: { reasons: Record<string, number> }) {
   const entries = Object.entries(reasons || {}).filter(([, n]) => n > 0);
@@ -131,6 +163,8 @@ export default function OverviewPage() {
                 />
               </div>
             </div>
+
+            <RuleBreaks count={data.rule_breaks} />
 
             <BlockedPanel reasons={data.blocked_reasons} />
 
