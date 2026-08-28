@@ -21,6 +21,7 @@ A hallucinating or prompt-injected model can still call these tools with
 whatever arguments it wants; what it cannot do is make money move by a
 different number than what the server-side token says.
 """
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -250,6 +251,18 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
     approved_percent = token["approved_percent"] or 0.0
     original_amount = token["base_amount_paise"] / 100.0
 
+    # This runs INSIDE a live phone call, where every sequential DB round
+    # trip costs ~2-2.8s from Railway to Supabase and the whole turn must
+    # finish before Twilio's ~15s deadline. The customer lookup does not
+    # depend on the payment link, so the two run concurrently instead of
+    # back to back - this is the single most latency-sensitive tool in the
+    # system, and it used to make six sequential awaits at the exact moment
+    # the customer had just said yes.
+    customer_task = (
+        asyncio.create_task(run_db_async(customers_repo.get_customer, ctx.customer_id))
+        if ctx.customer_id else None
+    )
+
     try:
         payment_result = await payment_execution.generate_recovery_checkout(
             merchant_id=ctx.merchant_id,
@@ -261,23 +274,32 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
             offer_token=offer_token,
         )
     except PaymentExecutionError as e:
+        if customer_task:
+            customer_task.cancel()
         return {"status": "REJECTED", "reason": f"payment_execution_failed: {e}"}
 
+    # Bookkeeping, not the money action - the link already exists and the
+    # customer is waiting on the line. Don't hold the call open for it.
     if ctx.recovery_attempt_id:
-        await run_db_async(
-            lambda: recovery_attempts_repo.update_state(
-                ctx.recovery_attempt_id,
-                "PAYMENT_LINK_SENT",
-                approved_discount_percent=approved_percent,
-                final_amount_paise=token["final_amount_paise"],
-                rzp_payment_link_id=payment_result["payment_link_id"],
+        asyncio.create_task(
+            run_db_async(
+                lambda: recovery_attempts_repo.update_state(
+                    ctx.recovery_attempt_id,
+                    "PAYMENT_LINK_SENT",
+                    approved_discount_percent=approved_percent,
+                    final_amount_paise=token["final_amount_paise"],
+                    rzp_payment_link_id=payment_result["payment_link_id"],
+                )
             )
         )
 
     customer_email = ""
-    if ctx.customer_id:
-        customer = await run_db_async(customers_repo.get_customer, ctx.customer_id)
-        customer_email = (customer or {}).get("email", "")
+    if customer_task:
+        try:
+            customer = await customer_task
+            customer_email = (customer or {}).get("email", "")
+        except Exception as e:
+            logger.warning(f"issue_offer: customer lookup failed ({e}); link created, email skipped.")
 
     if customer_email and channel == "email":
         await bus.publish(
