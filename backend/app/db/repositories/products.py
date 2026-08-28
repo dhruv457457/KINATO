@@ -53,7 +53,26 @@ def list_products(merchant_id: str, ai_buyer_visible_only: bool = False) -> List
     query = "SELECT * FROM products WHERE merchant_id = %s AND active = TRUE"
     if ai_buyer_visible_only:
         query += " AND visible_to_ai_buyers = TRUE"
+    query += " ORDER BY name ASC"
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(query, (merchant_id,))
         return cursor.fetchall()
+
+
+def set_ai_buyer_visibility(merchant_id: str, product_id: str, visible: bool) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE products SET visible_to_ai_buyers = %s
+            WHERE merchant_id = %s AND product_id = %s
+            """,
+            (visible, merchant_id, product_id),
+        )
+        cursor.execute(
+            "SELECT * FROM products WHERE merchant_id = %s AND product_id = %s",
+            (merchant_id, product_id),
+        )
+        row = cursor.fetchone()
+    return dict(row) if row else None

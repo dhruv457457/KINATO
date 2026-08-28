@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.agents.state import AgentContext
+from app.db.database import run_db_async
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import offer_tokens as offer_tokens_repo
 from app.db.repositories import customers as customers_repo
@@ -73,12 +74,21 @@ class Tool:
 
 # ---------------------------------------------------------------------------
 # Read-only tools - safe to run concurrently with each other.
+#
+# Every DB call below goes through run_db_async (a worker thread), NOT a
+# direct blocking psycopg2 call. This is what makes the runtime's
+# `asyncio.gather` over read-only tools real parallelism instead of
+# theatre: a plain sync call inside an `async def` still occupies the one
+# event loop thread, so gathering two of them just runs them back to back
+# AND stalls every other concurrent caller (every other live voice call,
+# every dashboard request) for the duration. With N concurrent voice calls
+# on one worker, that difference is the whole ballgame.
 # ---------------------------------------------------------------------------
 
 async def _get_cart(ctx: AgentContext) -> Dict[str, Any]:
     if not ctx.checkout_id:
         return {"error": "no_checkout_in_context"}
-    checkout = checkouts_repo.get_checkout(ctx.checkout_id)
+    checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
     if not checkout:
         return {"error": "checkout_not_found"}
     return {
@@ -100,7 +110,7 @@ get_cart = Tool(
 
 
 async def _get_policy_limits(ctx: AgentContext) -> Dict[str, Any]:
-    policy = policy_engine.get_policy(ctx.merchant_id)
+    policy = await run_db_async(policy_engine.get_policy, ctx.merchant_id)
     return {
         "max_discount_percent": policy["max_discount_percent"],
         "minimum_margin_percent": policy["minimum_margin_percent"],
@@ -129,11 +139,11 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
     if not ctx.checkout_id:
         return {"decision": "DENY", "reason": "no_checkout_in_context"}
 
-    checkout = checkouts_repo.get_checkout(ctx.checkout_id)
+    checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
     if not checkout:
         return {"decision": "DENY", "reason": "checkout_not_found"}
 
-    policy = policy_engine.get_policy(ctx.merchant_id)
+    policy = await run_db_async(policy_engine.get_policy, ctx.merchant_id)
     product_ids = []
     try:
         line_items = json.loads(checkout.get("line_items") or "[]")
@@ -158,16 +168,18 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
     base_amount_paise = checkout["amount_paise"]
     final_amount_paise = int(round(base_amount_paise * (1 - approved_percent / 100)))
 
-    token_row = offer_tokens_repo.create_offer_token(
-        merchant_id=ctx.merchant_id,
-        decision=decision["decision"],
-        reason=decision["reason"],
-        base_amount_paise=base_amount_paise,
-        final_amount_paise=final_amount_paise,
-        requested_percent=requested_discount_percent,
-        approved_percent=approved_percent,
-        checkout_id=ctx.checkout_id,
-        recovery_attempt_id=ctx.recovery_attempt_id,
+    token_row = await run_db_async(
+        lambda: offer_tokens_repo.create_offer_token(
+            merchant_id=ctx.merchant_id,
+            decision=decision["decision"],
+            reason=decision["reason"],
+            base_amount_paise=base_amount_paise,
+            final_amount_paise=final_amount_paise,
+            requested_percent=requested_discount_percent,
+            approved_percent=approved_percent,
+            checkout_id=ctx.checkout_id,
+            recovery_attempt_id=ctx.recovery_attempt_id,
+        )
     )
 
     return {
@@ -213,8 +225,11 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
     duplication that made call_orchestrator's old _process_offer_request
     and this tool two different paths to the same money-moving action."""
     try:
-        token = offer_tokens_repo.consume_offer_token(
-            offer_token, merchant_id=ctx.merchant_id, checkout_id=ctx.checkout_id
+        token = await run_db_async(
+            offer_tokens_repo.consume_offer_token,
+            offer_token,
+            merchant_id=ctx.merchant_id,
+            checkout_id=ctx.checkout_id,
         )
     except ValueError as e:
         return {"status": "REJECTED", "reason": str(e)}
@@ -233,22 +248,25 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
             recovery_attempt_id=ctx.recovery_attempt_id or "",
             original_amount=original_amount,
             approved_discount_percent=approved_percent,
+            offer_token=offer_token,
         )
     except PaymentExecutionError as e:
         return {"status": "REJECTED", "reason": f"payment_execution_failed: {e}"}
 
     if ctx.recovery_attempt_id:
-        recovery_attempts_repo.update_state(
-            ctx.recovery_attempt_id,
-            "PAYMENT_LINK_SENT",
-            approved_discount_percent=approved_percent,
-            final_amount_paise=token["final_amount_paise"],
-            rzp_payment_link_id=payment_result["payment_link_id"],
+        await run_db_async(
+            lambda: recovery_attempts_repo.update_state(
+                ctx.recovery_attempt_id,
+                "PAYMENT_LINK_SENT",
+                approved_discount_percent=approved_percent,
+                final_amount_paise=token["final_amount_paise"],
+                rzp_payment_link_id=payment_result["payment_link_id"],
+            )
         )
 
     customer_email = ""
     if ctx.customer_id:
-        customer = customers_repo.get_customer(ctx.customer_id)
+        customer = await run_db_async(customers_repo.get_customer, ctx.customer_id)
         customer_email = (customer or {}).get("email", "")
 
     if customer_email and channel == "email":
@@ -307,7 +325,7 @@ async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
         # "CREATED"), which undercounted opt-outs on the dashboard's
         # Overview KPIs. This is the same state issue_offer already
         # updates on its own success; opt-out deserves the same honesty.
-        recovery_attempts_repo.update_state(ctx.recovery_attempt_id, "CONSENT_REVOKED")
+        await run_db_async(recovery_attempts_repo.update_state, ctx.recovery_attempt_id, "CONSENT_REVOKED")
     return {"status": "RECORDED"}
 
 

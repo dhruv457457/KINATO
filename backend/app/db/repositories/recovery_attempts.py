@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Optional, Dict, Any
 from app.db.database import get_db
 from app.core.ids import new_id
@@ -117,8 +118,18 @@ def summary_stats(merchant_id: str) -> Dict[str, Any]:
         )
         risk_row = dict(cursor.fetchone())
 
+    # Postgres SUM()/COUNT() return Decimal, which FastAPI serializes as a
+    # JSON *string* ("10576500") rather than a number. Every consumer then
+    # either coerces it by luck (JS `paise / 100` happens to work on a
+    # string) or gets a type that contradicts the declared API contract.
+    # Money is integer paise in this system, so cast at the repo boundary
+    # and hand every caller a real int.
+    row = {k: (int(v) if isinstance(v, Decimal) else v) for k, v in row.items()}
+    at_risk = risk_row["at_risk_paise"]
+    abandoned = risk_row["abandoned_count"]
+
     total = row["total_attempts"]
     row["recovery_rate_pct"] = round(100 * row["recovered_count"] / total, 1) if total else None
-    row["revenue_at_risk_paise"] = risk_row["at_risk_paise"]
-    row["abandoned_count"] = risk_row["abandoned_count"]
+    row["revenue_at_risk_paise"] = int(at_risk) if isinstance(at_risk, Decimal) else at_risk
+    row["abandoned_count"] = int(abandoned) if isinstance(abandoned, Decimal) else abandoned
     return row

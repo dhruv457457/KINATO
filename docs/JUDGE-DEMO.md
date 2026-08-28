@@ -1,74 +1,161 @@
-# Kinato 2.0: Judge Demo & Verification Guide
+# Kinato — Judge Demo & Verification Guide
 
-> **Razorpay AI Buildathon 2026 — Track 01: AI Growth & Agentic Commerce**  
-> *"Grow the merchant's revenue, and make them sellable to AI buyers"*
+> **Razorpay AI Buildathon 2026 — Track 03: AI Revenue Recovery**
+> *"Don't just identify the problem. Show measured money recovered across a batch, with compliant escalation, stopping rules, and an audit trail."*
 
----
-
-## 🚀 60-Second Quick Start
-
-### 1. Start FastAPI Backend
-```bash
-cd backend
-python -m uvicorn app.main:app --port 8000 --reload
-```
-* **Backend API**: `http://localhost:8000`
-* **Agent-Readable Manifest**: `http://localhost:8000/.well-known/agent-catalog.json`
-* **FastMCP Tool Endpoint**: `http://localhost:8000/mcp`
-* **Swagger Docs**: `http://localhost:8000/docs`
-
-### 2. Run Automated Safety & Resilience Invariant Suite
-```bash
-python tests/run_tests.py
-```
-* Runs 9 automated tests validating Floor Price Protection, Cashflow Limits, HMAC Tamper Detection, Razorpay Idempotency, AI Upsell Margins, FIFO Yield Markdown, and all 5 Chaos Invariants.
-
-### 3. Start Next.js Frontend Command Center
-```bash
-cd frontend
-npm run dev
-```
-* Open `http://localhost:3000` in your browser.
+Kinato is a recovery layer that sits on top of the Razorpay account a merchant
+already has. When a payment fails or a checkout is abandoned, an AI agent calls
+or emails the customer, negotiates **within limits the merchant sets**, and — if
+and only if a deterministic policy engine approves — sends a real Razorpay
+payment link. Every money decision it makes is written to an audit trail.
 
 ---
 
-## 🎬 5-Minute Pitch Video Script & Walkthrough
+## What is real, and what is not
 
-### 0:00 - 0:45 ➔ The Hook & The "Why Now"
-* *"Commerce is shifting from human clicks to autonomous AI buyers. But today, merchants have no way to sell to AI agents, and they lose 20% of revenue to perishable waste and unoptimized pricing. Kinato is the dual-sided Agentic Commerce Protocol on Razorpay rails that turns any merchant into an autonomous revenue engine."*
+This table is the first thing to read. Everything in this repo is either real or
+labelled; nothing is staged to look better than it is.
 
-### 0:45 - 1:45 ➔ Merchant Revenue Engine (Pillar 1)
-1. Open **Merchant Growth Portal** (`http://localhost:3000/merchant`).
-2. Show **Dynamic Yield & FIFO Markdowns**: An aging batch of cheese block (60% shelf life used) is automatically priced with a dynamic markdown ($P \ge CP \times 1.15$) to prevent write-offs.
-3. Show **AI Upsell Matrix**: When an AI buyer requests Cheese, the merchant's AI automatically bundles Brioche Buns & Chipotle Sauce at a 12% bundle discount, lifting Average Order Value (AOV) by +35%.
-4. Show **1-Click Campaign Orchestrator**: Click *"Launch AI Campaign"* to broadcast promotional flash deals across the agent network.
+| Capability | Status |
+|---|---|
+| Merchant signup, login, session auth (JWT in httpOnly cookie) | **Real** |
+| Per-merchant Razorpay test credentials, validated live against Razorpay before being accepted, Fernet-encrypted at rest | **Real** |
+| `payment.failed` / `order.created` / `payment.captured` webhooks, HMAC-verified per merchant | **Real** |
+| Abandoned-checkout sweeper (DB-backed, survives restarts) | **Real** |
+| Agent runtime (LangGraph), bounded iterations + deadline, never raises into the caller | **Real** |
+| Two-phase money gate: `check_offer` computes, `issue_offer` acts only on a server-side token | **Real** |
+| Deterministic policy engine (discount ceiling, margin floor, product exclusions) | **Real** |
+| Real Razorpay Payment Links, with `offer_token` / `recovery_attempt_id` in `notes` | **Real** |
+| Outbound voice calls over Twilio (Gather + Play, turn-based) | **Real** |
+| Append-only consent ledger; "don't call me again" honoured immediately | **Real** |
+| Audit trail of every agent tool call, queryable in the dashboard | **Real** |
+| Merchant Q&A grounded strictly in that merchant's own DB rows | **Real** |
+| Batch recovery report (`scripts/run_recovery_batch.py`) | **Real pipeline, simulated customer speech** — see below |
+| AI Commerce / MCP surface for external AI buyers | **Not multi-tenant yet.** `create_purchase_intent` deliberately returns `REJECTED: catalog_not_yet_multi_tenant` rather than guessing a merchant. The dashboard marks this page "soon" instead of faking it. |
+| Speech-to-text on live calls | Twilio's built-in `Gather` transcription. Accents and noise degrade it; this is the weakest link in the live demo. |
 
-### 1:45 - 3:00 ➔ Autonomous Buyer Restock & Razorpay Settlement (Pillars 2 & 4)
-1. Open **Buyer Workspace** (`http://localhost:3000/dashboard`).
-2. Type in chat: *"Restock Mozzarella Cheese and burger bakery staples"*.
-3. Watch the real-time **Multi-Supplier Bidding War**: Supplier A and Supplier B compete. Metro Foodservice Hub bundles aging sauce to win the auction.
-4. Show **Razorpay Rails**:
-   * Click **"Approve & Pay"** $\rightarrow$ Razorpay Standard Checkout popup opens $\rightarrow$ Enter test UPI (`success@razorpay`) $\rightarrow$ Payment confirmed and settled!
-   * Click **"Generate Shareable Payment Link / QR"** $\rightarrow$ Razorpay Payment Link generated with instant QR code for asynchronous mobile checkout.
-   * Switch mode to **"AutoPay Mandate"** $\rightarrow$ Zero-click autonomous procurement under pre-authorized daily budget.
+### The batch report, stated precisely
 
-### 3:00 - 4:00 ➔ "The Bar" & Chaos Failure Injection (Pillar 3)
-1. Open **Chaos Sandbox** (`http://localhost:3000/sandbox`).
-2. Click **"Run All 5 Invariant Tests"**:
-   * **Under-Cost Sale Attack** $\rightarrow$ Intercepted by Deterministic Policy Gate ($P < CP \times 1.15 \rightarrow \text{BLOCKED}$).
-   * **HMAC Signature Tampering** $\rightarrow$ Tampered payload rejected via constant-time digest comparison.
-   * **Webhook Drop Recovery** $\rightarrow$ Active reconciliation worker resolves `UNCERTAIN` state via Razorpay API.
-   * **Cashflow Ceiling Breach** $\rightarrow$ Order blocked with remedial adjustment calculation.
-   * **Double-Charge Deduplication** $\rightarrow$ Idempotency Journal returns cached order in 0.5ms with 0 duplicate orders.
+`backend/scripts/run_recovery_batch.py` measures money recovered across a batch.
+The **pipeline is real**: real eligibility checks, the real policy engine, real
+offer tokens, real Razorpay test-mode payment links, real consent gating, real
+audit rows. What is **simulated** is the customer's side of the conversation —
+scripted utterances stand in for live speech-to-text, so the run is deterministic
+and repeatable.
 
-### 4:00 - 5:00 ➔ External AI Interoperability & Strategic Value for Razorpay
-* Open `skills/kinato-commerce/SKILL.md` and `/.well-known/agent-catalog.json`.
-* *"Any external agent (Claude Code, Cursor, Perplexity) can plug into Kinato via MCP or Agent Skills. Kinato makes Razorpay the indispensable financial settlement layer for the global agent economy."*
+It is **not** N real phone calls. It is the real machinery driven by labelled
+inputs. Live calls are real and can be demonstrated separately.
 
 ---
 
-## 🔑 Test Razorpay Sandbox Credentials
+## Run it yourself
 
-* **Key ID:** `rzp_test_TSk4KG18ZnfUX7`
-* **Test Card:** `4100 2800 0000 1007` (CVV: `123`, Expiry: `12/26`, OTP: `123456`)
-* **Test UPI:** `success@razorpay`
+### 1. Backend
+
+```bash
+cd backend && pip install -r requirements.txt
+```
+
+Copy `.env.example` to `.env` and fill in the values you have. The app boots
+without Twilio/ElevenLabs keys — those paths degrade visibly rather than
+pretending to work.
+
+```bash
+cd backend && python run_backend.py
+```
+
+* API: `http://localhost:8000`
+* Swagger: `http://localhost:8000/docs`
+
+### 2. Frontend
+
+```bash
+cd frontend && npm install && npm run dev
+```
+
+Open `http://localhost:3000`.
+
+### 3. Test suite
+
+```bash
+cd backend && python -m pytest tests/ -q
+```
+
+82 tests. They run against a real database — there are no mocked repositories.
+Test doubles are used only where a test must not place a real phone call, spend
+real money, or call a paid API.
+
+---
+
+## The 5-minute walkthrough
+
+**0:00 — Sign up and connect.** `/login` → create an account → paste Razorpay
+**test** keys. They are validated against Razorpay's live API before being
+accepted; a wrong key produces a real error, not a fake tick.
+
+**0:45 — Integrate with zero code.** The Integrate step gives you one webhook
+URL to paste into your Razorpay dashboard. No script tag, no code on your
+storefront. The screen polls for your first real event and says so when it
+arrives. If no event comes, it does not trap you — after a wait it lets you
+continue, clearly labelled *"continuing without a verified event."*
+
+**1:30 — Set the rules.** `/dashboard/policies`: discount ceiling, margin floor,
+calling hours. **The AI can never exceed these**, and that is enforced in code,
+not in the prompt.
+
+**2:15 — Trigger a real failure.** Use the Razorpay test dashboard to make a
+payment fail. The webhook lands, HMAC is verified, and because `payment.failed`
+carries the customer's real email and phone, recovery starts in seconds with no
+timer.
+
+**3:00 — Watch the agent work.** `/dashboard/recoveries` → click any row. The
+drawer is the centrepiece: every real tool call in order — `get_cart`,
+`get_policy_limits`, `check_offer`, `issue_offer` — with its real decision,
+latency, and whether it ran degraded.
+
+**4:00 — Show the limits holding.** Ask for a discount above the ceiling. The
+policy engine returns `MODIFY` and caps it. The audit trail records what was
+requested versus what was approved. Say *"don't call me again"* — consent is
+revoked immediately, as a new append-only row, and no further outreach happens.
+
+**4:30 — Ask a question.** `/dashboard/ask`: "How much revenue is at risk right
+now?" It answers from that merchant's own rows. With no data, it says so instead
+of inventing an example.
+
+---
+
+## Where the money safety actually lives
+
+**A tool call from the model is a request, never an effect.**
+
+1. The model calls `check_offer(discount_percent=40)`. This **applies nothing**.
+   It loads the real cart and the real policy, runs the deterministic engine, and
+   returns an opaque `offer_token` — plus what was actually approved (perhaps 10%).
+2. The only tool that can act is `issue_offer(offer_token=...)`.
+3. `issue_offer` reads the money terms **from the server-side token row**, never
+   from any argument the model passed.
+
+A hallucinating or prompt-injected model can only hand back an opaque string
+whose amounts were computed by code it never touched. A unit test asserts that no
+tool schema accepts `merchant_id`, `amount`, `phone`, or `email` from the model.
+
+---
+
+## Stopping rules
+
+* **Consent revoked** → recorded as a new append-only row; checked before every outreach.
+* **Razorpay rail down** → `payment.downtime.started` sets a durable per-merchant flag; no customer is called about a failure that may be Razorpay's outage, not their card.
+* **No contact details** → recovery is blocked and the reason is surfaced on the dashboard rather than silently dropped.
+* **Degraded agent** → an agent running without its LLM cannot call any mutating tool at all.
+* **Duplicate webhooks** → deduplicated against a UNIQUE constraint in the database, so a redeploy landing between Razorpay's retries cannot double-count revenue.
+
+---
+
+## Known weaknesses
+
+Listed because pretending they do not exist is worse than having them.
+
+* **Speech-to-text is the weakest link.** Twilio's `Gather` transcription struggles with accents and background noise. The agent's own reasoning is far more reliable than its ears.
+* **AI Commerce is not multi-tenant.** It refuses clearly instead of guessing a merchant.
+* **The spend-mandate layer is a Kinato-enforced daily cap on top of real Razorpay Orders** — not an NPCI/RBI UPI Autopay settlement. Real UPI Autopay needs the customer's own in-app approval, which a headless agent cannot complete. `app/payments/spend_mandate.py` says so in its own docstring.
+* **ElevenLabs is best-effort.** When it is slow or unreachable the call falls back to Twilio's neural voice, which is rendered on Twilio's infrastructure and cannot fail from our side.

@@ -161,4 +161,29 @@
     });
 
     window.Kinato = new KinatoClient();
+
+    // Auto-initialise from the script tag's own data-key attribute, so
+    //   <script src=".../sdk/kinato.js" data-key="pk_test_..."></script>
+    // is genuinely all a merchant needs. Without this the onboarding
+    // snippet was inert: the tag loaded, the key was ignored, init() was
+    // never called, and every track() silently no-op'd - the worst kind of
+    // failure, because the merchant sees no error at all. An explicit
+    // Kinato.init({apiKey}) call still works and overrides this.
+    try {
+        var tag = document.currentScript;
+        if (!tag) {
+            // currentScript is null for async/deferred loads - fall back to
+            // locating our own tag by src.
+            var scripts = document.getElementsByTagName('script');
+            for (var i = 0; i < scripts.length; i++) {
+                if ((scripts[i].src || '').indexOf('kinato.js') !== -1) { tag = scripts[i]; break; }
+            }
+        }
+        var autoKey = tag && tag.getAttribute('data-key');
+        if (autoKey && autoKey.indexOf('pk_') === 0) {
+            window.Kinato.init({ apiKey: autoKey });
+        }
+    } catch (e) {
+        /* never let auto-init break the host page */
+    }
 })(window);

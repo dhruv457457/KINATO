@@ -23,7 +23,7 @@ from fastapi import APIRouter, Request, HTTPException
 
 from app.core.security import verify_razorpay_webhook_signature
 from app.core.crypto import decrypt_secret
-from app.db.repositories.merchants import get_merchant, MerchantNotFoundError
+from app.db.repositories.merchants import get_merchant, set_rail_degraded, MerchantNotFoundError
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
 from app.gateway.event_bus import bus
@@ -135,11 +135,18 @@ async def razorpay_webhook(merchant_id: str, request: Request):
         )
         return {"status": "ok", "event": event_name}
 
-    # --- rail health - suppresses outreach while Razorpay itself is degraded ---
+    # --- rail health - a real stopping rule, not just an event nobody
+    # reads: persists durably so RecoveryEligibilityService can refuse new
+    # outreach for this merchant while Razorpay itself is degraded (never
+    # call/email a customer over a failure that might just be an outage,
+    # not a real decline). Durable rather than in-memory so it survives a
+    # Railway restart landing mid-outage.
     if event_name in ("payment.downtime.started", "payment.downtime.resolved"):
+        degraded = event_name.endswith("started")
+        set_rail_degraded(merchant_id, degraded)
         await bus.publish(
             event_type="rail.degraded",
-            payload={"status": "down" if event_name.endswith("started") else "resolved"},
+            payload={"status": "down" if degraded else "resolved"},
             correlation_id=merchant_id,
             merchant_id=merchant_id,
         )

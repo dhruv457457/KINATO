@@ -39,6 +39,10 @@ class AllowedOriginsRequest(BaseModel):
     origins: list[str]
 
 
+class WebhookSecretRequest(BaseModel):
+    webhook_secret: str = Field(..., min_length=8)
+
+
 @merchant_router.post("/razorpay/connect")
 async def connect_razorpay(payload: ConnectRazorpayRequest, current_merchant: dict = Depends(get_current_merchant)):
     if not payload.key_id.startswith("rzp_test_"):
@@ -68,7 +72,40 @@ async def connect_razorpay(payload: ConnectRazorpayRequest, current_merchant: di
 
 @merchant_router.get("/razorpay/status")
 async def razorpay_status(current_merchant: dict = Depends(get_current_merchant)):
-    return {"connected": bool(current_merchant.get("rzp_key_id_enc"))}
+    # webhook_secret_set is reported separately because a merchant can be
+    # fully "connected" (keys valid) and still receive zero events: the
+    # webhook receiver rejects anything it cannot HMAC-verify. Surfacing it
+    # turns a silent dead end into something the dashboard can point at.
+    return {
+        "connected": bool(current_merchant.get("rzp_key_id_enc")),
+        "webhook_secret_set": bool(current_merchant.get("rzp_webhook_secret_enc")),
+    }
+
+
+@merchant_router.put("/razorpay/webhook-secret")
+async def set_webhook_secret(payload: WebhookSecretRequest, current_merchant: dict = Depends(get_current_merchant)):
+    """Sets just the Razorpay webhook signing secret.
+
+    Until this is set, POST /webhooks/razorpay/{merchant_id} rejects every
+    incoming event ("has not configured a Razorpay webhook secret yet") -
+    correct, since it refuses to trust unsigned webhooks, but it means
+    recovery silently never starts. A merchant creates this secret in
+    Razorpay's own webhook dialog, which is a different screen and a
+    different moment from where they got their API keys, so it gets its own
+    endpoint rather than forcing a full reconnect.
+    """
+    if not current_merchant.get("rzp_key_id_enc"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connect your Razorpay account first, then add the webhook secret.",
+        )
+    try:
+        merchants_repo.set_webhook_secret(
+            current_merchant["merchant_id"], encrypt_secret(payload.webhook_secret.strip())
+        )
+    except EncryptionNotConfiguredError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return {"status": "saved"}
 
 
 @merchant_router.get("/api-keys")
@@ -94,6 +131,11 @@ async def revoke_api_key(key_id: str, current_merchant: dict = Depends(get_curre
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such API key on this account.")
     api_keys_repo.revoke_key(key_id)
     return {"status": "revoked"}
+
+
+@merchant_router.get("/allowed-origins")
+async def get_allowed_origins(current_merchant: dict = Depends(get_current_merchant)):
+    return {"origins": merchants_repo.get_allowed_origins(current_merchant["merchant_id"])}
 
 
 @merchant_router.post("/allowed-origins")
@@ -125,6 +167,24 @@ async def onboarding_events_check(current_merchant: dict = Depends(get_current_m
         "event_type": latest["event_type"],
         "created_at": str(latest.get("created_at", "")),
     }
+
+
+@merchant_router.post("/onboarding/integrate/skip")
+async def onboarding_integrate_skip(current_merchant: dict = Depends(get_current_merchant)):
+    """Advances past Integrate WITHOUT a verified event.
+
+    Onboarding must never dead-end. events-check above only moves the
+    merchant forward once a real webhook lands, which means a merchant who
+    hasn't taken a payment since adding the webhook (or who is setting up
+    before going live) had no way out of that step at all - the funnel's
+    own guard would bounce them straight back to it forever. This is the
+    server-side half of the Integrate screen's "continue without a verified
+    event" affordance; the webhook URL stays available in Settings, and the
+    first real event still works whenever it arrives.
+    """
+    if current_merchant.get("onboarding_step") == "integrate":
+        merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "catalog")
+    return {"onboarding_step": "catalog", "verified": False}
 
 
 @merchant_router.post("/onboarding/catalog")

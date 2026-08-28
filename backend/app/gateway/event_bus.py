@@ -28,19 +28,40 @@ class EventBus:
         self._subscribers[event_type].append(callback)
         logger.debug(f"Subscribed {callback.__name__} to {event_type}")
 
-    async def publish(self, 
-                      event_type: str, 
-                      payload: Dict[str, Any], 
+    async def publish(self,
+                      event_type: str,
+                      payload: Dict[str, Any],
                       correlation_id: str,
                       merchant_id: str,
                       idempotency_key: Optional[str] = None):
-        """Publish a fully traceable event asynchronously."""
-        
+        """Publish a fully traceable event asynchronously.
+
+        Idempotency dedup: when self.persist is True (the real app, never
+        tests), a given idempotency_key is checked and claimed against the
+        `events` table's UNIQUE constraint - the durable source of truth -
+        BEFORE subscribers run, and the whole publish is dropped on a
+        conflict. This closes a real gap the old design had: an in-memory
+        set() alone forgets every key on a process restart, and a Railway
+        redeploy landing between two Razorpay webhook retries (Razorpay
+        retries on any non-2xx or timeout) could otherwise double-fire
+        payment.succeeded and double-count recovered revenue - the exact
+        number the batch recovery report claims to measure precisely. When
+        self.persist is False (tests - see conftest.py), the in-memory set
+        is used instead, keeping the suite fast and DB-independent."""
+
+        already_persisted = False
         if idempotency_key:
-            if idempotency_key in self._processed_idempotency_keys:
-                logger.warning(f"Idempotency key {idempotency_key} already processed. Dropping event: {event_type}")
-                return
-            self._processed_idempotency_keys.add(idempotency_key)
+            if self.persist:
+                claimed = await self._claim_idempotency_key(event_type, payload, merchant_id, correlation_id, idempotency_key)
+                if not claimed:
+                    logger.warning(f"Idempotency key {idempotency_key} already processed (durable check). Dropping event: {event_type}")
+                    return
+                already_persisted = True  # _claim_idempotency_key's persist_event() already inserted this row
+            else:
+                if idempotency_key in self._processed_idempotency_keys:
+                    logger.warning(f"Idempotency key {idempotency_key} already processed. Dropping event: {event_type}")
+                    return
+                self._processed_idempotency_keys.add(idempotency_key)
 
         event = {
             "event_id": f"evt_{uuid.uuid4().hex[:12]}",
@@ -51,16 +72,36 @@ class EventBus:
             "idempotency_key": idempotency_key,
             "payload": payload
         }
-        
+
         self._event_log.append(event)
         logger.info(f"EventBus Published: {event_type} | Correlation: {correlation_id}")
 
-        if self.persist:
+        if self.persist and not already_persisted:
             asyncio.create_task(self._persist(event))
 
         if event_type in self._subscribers:
             for callback in self._subscribers[event_type]:
                 asyncio.create_task(self._safe_execute(callback, event))
+
+    async def _claim_idempotency_key(
+        self, event_type: str, payload: Dict[str, Any], merchant_id: str, correlation_id: str, idempotency_key: str
+    ) -> bool:
+        """Atomically claims idempotency_key via the events table's UNIQUE
+        constraint, ahead of subscriber dispatch. Returns True if this call
+        won the claim (first time seen), False if it was already claimed. If
+        persistence itself is unreachable, fails open (returns True) rather
+        than silently dropping every event with an idempotency_key whenever
+        the DB has a hiccup - the in-memory event log/subscribers still need
+        to run for the app to function; a DB outage is a separate, visible
+        failure mode (see database.py's own logging), not one this dedup
+        check should mask by dropping real events."""
+        try:
+            from app.db.database import run_db_async
+            from app.db.repositories.events import persist_event
+            return await run_db_async(persist_event, event_type, payload, merchant_id, correlation_id, idempotency_key)
+        except Exception as e:
+            logger.warning(f"Idempotency claim failed open for {event_type} (treating as first-seen): {e}")
+            return True
 
     async def _persist(self, event: Dict[str, Any]):
         """Fire-and-forget durable write. Deliberately swallows all errors -

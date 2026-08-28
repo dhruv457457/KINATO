@@ -1,20 +1,23 @@
 """
-================================================================================
-FILE: app/payments/upi_reserve_pay.py
-MODULE: Razorpay Agentic Payments — UPI Reserve Pay Integration
---------------------------------------------------------------------------------
-WHAT THIS FILE DOES:
-Implements Razorpay's UPI Reserve Pay API — the exact agentic payment method
-designed for AI agents to transact autonomously within pre-authorized spending limits.
+Kinato's own pre-authorized spend-mandate layer for the AI Commerce /
+autonomous-buyer surface (app/commerce/mcp_server.py's Path A).
 
-HOW IT WORKS:
-1. Merchant authorizes a daily spend limit once (via Razorpay's consent flow)
-2. The AI agent can then make purchases autonomously within that limit
-3. No human approval needed per-transaction if under the authorized cap
-4. Full audit trail on Razorpay's dashboard
+HONESTY NOTE (renamed from upi_reserve_pay.py): this file used to call
+itself "Razorpay UPI Reserve Pay" and claim "compliance with NPCI/RBI
+regulations for agentic commerce." That overstated what it does. Razorpay's
+real UPI Autopay/mandate products require the *customer's own* one-time
+in-app approval before any recurring debit can happen - a fully headless AI
+agent cannot complete that step on its own, so a real end-to-end autonomous
+UPI settlement is not something this backend can produce by itself.
 
-RAZORPAY REFERENCE: https://razorpay.com/blog/agentic-payments-the-future-of-in-app-commerce/
-================================================================================
+What this file actually is: a Kinato-enforced daily spending cap (deterministic,
+never decided by an LLM) authorized once by the merchant, checked before every
+autonomous purchase, layered on top of a REAL Razorpay Order created for
+record-keeping on each attempt. If the Razorpay API call itself fails, the
+attempt fails too - it never fabricates a success. Order creation succeeding
+is a real financial artifact (visible on the merchant's Razorpay dashboard);
+it is not the same thing as a captured/settled payment, and this module does
+not claim otherwise.
 """
 import uuid
 import logging
@@ -32,15 +35,17 @@ except ImportError:
     RAZORPAY_INSTALLED = False
 
 
-class UPIReservePayClient:
+class SpendMandateService:
     """
-    Razorpay UPI Reserve Pay client for AI-agent autonomous payments.
-    
-    UPI Reserve Pay allows:
-    - Pre-authorized spending limits (merchant sets once)
-    - Agent-triggered payments without per-transaction approval
-    - Full settlement on Razorpay's infrastructure
-    - Compliance with NPCI/RBI regulations for agentic commerce
+    Kinato's daily-spend-cap authorization for AI-buyer autonomous purchases.
+
+    - Merchant authorizes a daily cap once (create_mandate).
+    - Every autonomous purchase attempt checks the cap deterministically
+      BEFORE calling Razorpay - the LLM never decides whether spend is
+      allowed.
+    - A real Razorpay Order is created per attempt for an auditable record.
+      If that API call fails, the attempt is reported as failed - not
+      silently treated as a success.
     """
 
     def __init__(self):
@@ -67,19 +72,18 @@ class UPIReservePayClient:
         description: str = "Kinato Autonomous Restock Mandate"
     ) -> Dict[str, Any]:
         """
-        Creates a UPI Reserve Pay mandate (recurring authorization).
-        The merchant authorizes this ONCE — after which the AI agent can
-        autonomously transact within the daily_limit_inr cap.
-        
-        In TEST mode, creates a Razorpay subscription plan as a proxy for mandates.
+        Creates a Kinato-side daily-spend-cap mandate. The merchant authorizes
+        this ONCE - after which the AI agent can autonomously transact within
+        the daily_limit_inr cap, subject to the check in
+        execute_autonomous_payment. Also creates a Razorpay subscription plan
+        as a real, visible record of the authorized amount (not itself a
+        payment - Razorpay has no direct "authorize a daily cap" primitive).
         """
         amount_paise = int(daily_limit_inr * 100)
         mandate_ref = f"mnd_{uuid.uuid4().hex[:12]}"
 
         if self._client:
             try:
-                # In production: use Razorpay's UPI Mandate APIs
-                # In test mode: create a subscription plan as a proxy
                 plan = self._client.plan.create({
                     "period": "daily",
                     "interval": 1,
@@ -93,7 +97,7 @@ class UPIReservePayClient:
                 mandate_ref = plan.get("id", mandate_ref)
                 logger.info(f"Created Razorpay mandate plan {mandate_ref} for {business_id}")
             except Exception as e:
-                logger.warning(f"Razorpay mandate creation failed, using local tracking: {e}")
+                logger.warning(f"Razorpay mandate plan creation failed, tracking cap locally only: {e}")
 
         # Store mandate in DB
         with get_db() as conn:
@@ -126,7 +130,7 @@ class UPIReservePayClient:
             "business_id": business_id,
             "daily_limit_inr": daily_limit_inr,
             "status": "ACTIVE",
-            "message": f"AI agent authorized to spend up to ₹{daily_limit_inr:.0f}/day autonomously"
+            "message": f"AI agent authorized to spend up to ₹{daily_limit_inr:.0f}/day autonomously, capped by Kinato"
         }
 
     def execute_autonomous_payment(
@@ -139,23 +143,26 @@ class UPIReservePayClient:
         description: str = "Kinato AI Restock"
     ) -> Dict[str, Any]:
         """
-        Executes an autonomous payment against an existing UPI mandate.
-        The AI agent calls this — no human approval required per transaction.
-        
-        Safety: Checks the daily spending cap BEFORE executing.
-        If the cap is exceeded, the transaction is BLOCKED automatically.
+        Executes an autonomous purchase attempt against an existing mandate.
+        The AI agent calls this - no human approval required per transaction.
+
+        Safety: checks the daily spending cap BEFORE calling Razorpay at all.
+        If the cap is exceeded, the transaction is BLOCKED automatically and
+        no API call is made. If the Razorpay Order call itself fails, this
+        returns success=False with the real error - it never reports success
+        on a failed or skipped API call.
         """
         # 1. Load the mandate and check daily cap
         with get_db() as conn:
             cursor = conn.cursor()
-            
+
             # Reset daily spend counter if it's a new day
             cursor.execute("""
                 UPDATE upi_mandates
                 SET daily_spent_inr = 0, last_reset_date = CURRENT_DATE
                 WHERE mandate_id = %s AND last_reset_date < CURRENT_DATE
             """, (mandate_id,))
-            
+
             cursor.execute("""
                 SELECT daily_limit_inr, daily_spent_inr, status
                 FROM upi_mandates WHERE mandate_id = %s
@@ -178,31 +185,31 @@ class UPIReservePayClient:
                 "remaining": remaining
             }
 
-        # 2. Execute the payment via Razorpay
-        payment_id = f"pay_auto_{uuid.uuid4().hex[:12]}"
-        razorpay_order_id = f"order_auto_{uuid.uuid4().hex[:12]}"
+        # 2. Record the attempt via a real Razorpay Order. No client
+        # configured, or the API call itself failing, is a real failure -
+        # never treated as a success.
+        if not self._client:
+            return {"success": False, "error": "Razorpay client not configured - cannot record this purchase."}
 
-        if self._client:
-            try:
-                # Create order for the autonomous payment
-                order = self._client.order.create({
-                    "amount": int(amount_inr * 100),
-                    "currency": "INR",
-                    "receipt": f"kinato_auto_{proposal_id[:8]}",
-                    "notes": {
-                        "mandate_id": mandate_id,
-                        "proposal_id": proposal_id,
-                        "supplier_id": supplier_id,
-                        "payment_type": "upi_reserve_pay_autonomous",
-                        "description": description
-                    }
-                })
-                razorpay_order_id = order.get("id", razorpay_order_id)
-                logger.info(f"Autonomous payment order created: {razorpay_order_id}")
-            except Exception as e:
-                logger.warning(f"Razorpay order creation failed for autonomous payment: {e}")
+        try:
+            order = self._client.order.create({
+                "amount": int(amount_inr * 100),
+                "currency": "INR",
+                "receipt": f"kinato_auto_{proposal_id[:8]}",
+                "notes": {
+                    "mandate_id": mandate_id,
+                    "proposal_id": proposal_id,
+                    "supplier_id": supplier_id,
+                    "payment_type": "kinato_autonomous_spend_mandate",
+                    "description": description
+                }
+            })
+            razorpay_order_id = order["id"]
+        except Exception as e:
+            logger.warning(f"Razorpay order creation failed for autonomous payment: {e}")
+            return {"success": False, "error": f"razorpay_order_creation_failed: {e}"}
 
-        # 3. Update daily spend tracker
+        # 3. Update daily spend tracker - only after the real order call succeeded.
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -211,18 +218,18 @@ class UPIReservePayClient:
                 WHERE mandate_id = %s
             """, (amount_inr, mandate_id))
 
-        logger.info(f"Autonomous payment executed: ₹{amount_inr} for {supplier_name} via mandate {mandate_id}")
+        logger.info(f"Autonomous purchase recorded: ₹{amount_inr} for {supplier_name} via mandate {mandate_id}, order {razorpay_order_id}")
 
         return {
             "success": True,
-            "payment_id": payment_id,
+            "payment_id": razorpay_order_id,
             "razorpay_order_id": razorpay_order_id,
             "amount_inr": amount_inr,
             "supplier_name": supplier_name,
             "mandate_id": mandate_id,
             "daily_spent": mandate["daily_spent_inr"] + amount_inr,
             "daily_limit": mandate["daily_limit_inr"],
-            "message": f"✅ Autonomous payment of ₹{amount_inr:.0f} to {supplier_name} settled via Razorpay UPI Reserve Pay"
+            "message": f"Autonomous purchase of ₹{amount_inr:.0f} to {supplier_name} recorded as Razorpay order {razorpay_order_id}, under the ₹{mandate['daily_limit_inr']:.0f}/day Kinato cap"
         }
 
     def get_mandate_status(self, business_id: str) -> Optional[Dict[str, Any]]:
@@ -248,4 +255,4 @@ class UPIReservePayClient:
 
 
 # Singleton
-upi_reserve_pay = UPIReservePayClient()
+spend_mandate_service = SpendMandateService()

@@ -4,6 +4,7 @@ from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from app.db.repositories.merchants import is_rail_degraded
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,22 @@ class RecoveryEligibilityService:
             return
 
         logger.info(f"Evaluating recovery eligibility for checkout {checkout_id}")
+
+        # 0. Stopping rule: Razorpay's own rail is down for this merchant
+        # (set by a real payment.downtime.started webhook - see
+        # app/payments/webhooks.py). Don't call or email a customer over a
+        # failure that might just be an outage, not a real decline; the
+        # sweeper/webhook will re-fire once the rail recovers or the
+        # customer's own next attempt succeeds.
+        if merchant_id and is_rail_degraded(merchant_id):
+            logger.info(f"Eligibility Check Failed: Razorpay rail is degraded for merchant {merchant_id} - holding outreach.")
+            await bus.publish(
+                event_type="recovery.blocked",
+                payload={"checkout_id": checkout_id, "reason": "rail_degraded"},
+                correlation_id=correlation_id,
+                merchant_id=merchant_id,
+            )
+            return
 
         # 1. Double Race-Condition Protection: Is it STILL unpaid?
         # Even though AbandonmentDetector checked, we check again at the exact moment of opportunity generation.

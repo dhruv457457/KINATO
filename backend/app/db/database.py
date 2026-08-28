@@ -27,6 +27,8 @@ import re
 import sqlite3
 import logging
 import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Generator, Any, Callable, TypeVar
 from pathlib import Path
@@ -285,15 +287,37 @@ def get_db() -> Generator[Any, None, None]:
 
     if not USE_SQLITE and db_pool is not None:
         conn = db_pool.getconn()
+        broken = False
         try:
             conn.cursor_factory = RealDictCursor
             yield conn
             conn.commit()
         except Exception:
-            conn.rollback()
+            # A dead connection (Supabase drops idle ones, and any network
+            # blip does the same) makes rollback() itself raise
+            # InterfaceError - which would REPLACE the real exception the
+            # caller needs to see. Never let cleanup mask the cause.
+            try:
+                conn.rollback()
+            except Exception as rollback_error:
+                broken = True
+                logger.warning(
+                    f"Rollback failed on a dead connection ({rollback_error!r}); "
+                    "discarding it from the pool."
+                )
             raise
         finally:
-            db_pool.putconn(conn)
+            # Returning a dead connection to the pool poisons the NEXT
+            # caller - it gets handed a connection that is already unusable.
+            # psycopg2 exposes `closed` (0 = open); anything else, or a
+            # failed rollback, means this one must not be reused.
+            try:
+                if broken or getattr(conn, "closed", 0):
+                    db_pool.putconn(conn, close=True)
+                else:
+                    db_pool.putconn(conn)
+            except Exception as putback_error:
+                logger.warning(f"Could not return connection to the pool: {putback_error!r}")
     else:
         # SQLite with WAL mode, busy timeout, and check_same_thread=False for async safety
         conn = sqlite3.connect(
@@ -315,9 +339,34 @@ def get_db() -> Generator[Any, None, None]:
             wrapped_conn.close()
 
 
+# Dedicated worker pool for blocking DB calls, deliberately sized to the
+# Postgres connection pool above (max 20) rather than using asyncio's
+# default executor.
+#
+# Why this matters: psycopg2's ThreadedConnectionPool.getconn() RAISES
+# PoolError("connection pool exhausted") when every connection is checked
+# out - it does not block and wait. asyncio.to_thread's default executor is
+# sized min(32, cpu_count + 4), which on most hosts is MORE than 20. So
+# under real concurrent load (many simultaneous voice calls, each running
+# agent tools), the default executor would happily start more DB threads
+# than there are connections and turn a load spike into hard errors instead
+# of a queue. Capping the executor below the pool ceiling means excess work
+# waits for a worker thread - backpressure - instead of failing.
+_DB_MAX_WORKERS = 16  # < the pool's max of 20, leaving headroom for the
+                      # sweeper and any non-offloaded caller still using get_db() directly.
+_db_executor = ThreadPoolExecutor(max_workers=_DB_MAX_WORKERS, thread_name_prefix="kinato-db")
+
+
 async def run_db_async(fn: Callable[..., T], *args, **kwargs) -> T:
     """
-    Runs a synchronous database operation in an asynchronous threadpool worker.
-    Ensures that blocking DB operations never stall the FastAPI async event loop.
+    Runs a synchronous database operation in a bounded worker thread so it
+    never stalls the FastAPI async event loop.
+
+    This is not optional decoration: a plain sync DB call inside an
+    `async def` still occupies the single event-loop thread for its whole
+    duration, which means (a) asyncio.gather over several of them provides
+    no actual concurrency, and (b) every other in-flight request - every
+    other live voice call - is frozen until it returns.
     """
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_db_executor, functools.partial(fn, *args, **kwargs))

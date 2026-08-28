@@ -23,6 +23,12 @@ export default function IntegratePage() {
   const [copied, setCopied] = useState<string | null>(null);
   const [eventState, setEventState] = useState<"waiting" | "received">("waiting");
   const [eventMeta, setEventMeta] = useState("");
+  // Onboarding must never dead-end. This screen used to hard-disable
+  // Continue until a real webhook arrived, which meant a merchant setting
+  // up before they had live traffic - or whose test account simply never
+  // fires an event - could not finish onboarding at all. After a genuine
+  // wait we offer an honest way forward instead of trapping them.
+  const [waitedLongEnough, setWaitedLongEnough] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -63,8 +69,10 @@ export default function IntegratePage() {
     }
     poll();
     pollRef.current = setInterval(poll, 4000);
+    const escapeHatch = setTimeout(() => setWaitedLongEnough(true), 20000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      clearTimeout(escapeHatch);
     };
   }, []);
 
@@ -81,16 +89,31 @@ export default function IntegratePage() {
 Publishable key: ${pkKey || "(already issued — check your saved key, or revoke and reissue from Settings)"}
 Webhook URL:     ${webhookUrl}
 
-1. Detect the stack (Next.js/React, plain HTML, Shopify, etc.) and pick the
-   matching integration from https://docs.kinato.app/sdk — the React
-   provider, the HTML script tag, or the zero-code webhook.
-2. If this is a Next.js/React app: install @kinato/react, wrap the root
-   layout in <KinatoProvider publishableKey="...">, and call
-   useKinato().trackCheckoutStarted(...) where checkout begins.
+The ONLY integration artifact is this script tag. There is no npm package to
+install and no external SDK docs to fetch — do not look for either:
+
+    <script src="${API_URL}/sdk/kinato.js" data-key="PUBLISHABLE_KEY"></script>
+
+The tag auto-initialises from data-key. The full API it exposes on
+window.Kinato is exactly these three methods — do not invent others:
+
+    Kinato.init({ apiKey })                      // automatic via data-key
+    Kinato.identify({ externalId, name, phone, email,
+                      consent: { voice: true, email: true } })
+    Kinato.track("checkout.started", { checkoutId, amount, currency, productIds })
+
+1. If this project has no checkout or cart flow at all, STOP and say so —
+   this integration only makes sense in a store. Do not invent one.
+2. Otherwise add the script tag to the root HTML/layout, call
+   Kinato.identify(...) once you know who the customer is, and
+   Kinato.track("checkout.started", ...) at the point checkout begins.
 3. If there's a Razorpay integration already in the codebase, do NOT
    duplicate payment logic — only add the Kinato event calls around it.
-4. Register the webhook URL above in the Razorpay Dashboard under
-   Settings -> Webhooks for payment.failed and payment.captured.
+4. Do NOT try to change my Razorpay Dashboard settings yourself. Tell me to
+   register this webhook URL manually under Settings -> Webhooks for
+   payment.failed and payment.captured:
+       ${webhookUrl}
+   (If that URL is localhost, tell me it must be a public URL first.)
 5. Show me the diff before committing anything.`;
 
   return (
@@ -142,17 +165,24 @@ Webhook URL:     ${webhookUrl}
 
         {tab === "react" && (
           <div>
+            <div className="onb-status-line err mb-4" style={{ color: "#8A5A1A", borderColor: "#D8B25A" }}>
+              <span className="onb-status-dot" style={{ background: "#8A5A1A" }} />
+              <span>
+                <code>@kinato/react</code> is not published to npm yet — the source lives in this repo under{" "}
+                <code>packages/kinato-react</code>. Use the script tag below today; it works on React and
+                Next.js apps too.
+              </span>
+            </div>
             <p className="text-sm text-dark-200 leading-relaxed mb-4">
-              Wrap your app once, then call <code>useKinato()</code> anywhere a checkout starts.
+              Add this to your root layout (Next.js <code>app/layout.tsx</code>, or <code>index.html</code> for
+              Vite/CRA). It derives its endpoint from its own <code>src</code>, so no extra config.
             </p>
-            <div className="onb-code-block">{`npm install @kinato/react
-
-import { KinatoProvider } from "@kinato/react";
-
-<KinatoProvider publishableKey="${pkDisplay}">
-  <App />
-</KinatoProvider>`}</div>
-            <button className="onb-copy-btn" onClick={() => copy("npm install @kinato/react", "react")}>
+            <div className="onb-code-block">{`<script src="${API_URL}/sdk/kinato.js"
+        data-key="${pkDisplay}"></script>`}</div>
+            <button
+              className="onb-copy-btn"
+              onClick={() => copy(`<script src="${API_URL}/sdk/kinato.js" data-key="${pkDisplay}"></script>`, "react")}
+            >
               {copied === "react" ? "Copied" : "Copy snippet"}
             </button>
           </div>
@@ -161,13 +191,13 @@ import { KinatoProvider } from "@kinato/react";
         {tab === "html" && (
           <div>
             <p className="text-sm text-dark-200 leading-relaxed mb-4">
-              One script tag. It auto-detects your store from the tag's own URL.
+              One script tag. It derives its endpoint from the tag's own src, so it always talks back to the Kinato instance that served it.
             </p>
-            <div className="onb-code-block">{`<script src="https://cdn.kinato.app/kinato.js"
+            <div className="onb-code-block">{`<script src="${API_URL}/sdk/kinato.js"
         data-key="${pkDisplay}"></script>`}</div>
             <button
               className="onb-copy-btn"
-              onClick={() => copy(`<script src="https://cdn.kinato.app/kinato.js" data-key="${pkDisplay}"></script>`, "html")}
+              onClick={() => copy(`<script src="${API_URL}/sdk/kinato.js" data-key="${pkDisplay}"></script>`, "html")}
             >
               {copied === "html" ? "Copied" : "Copy snippet"}
             </button>
@@ -196,17 +226,44 @@ import { KinatoProvider } from "@kinato/react";
           </span>
         </div>
 
+        {eventState === "waiting" && waitedLongEnough && (
+          <p className="text-[12.5px] mt-3.5 leading-relaxed anim-fade" style={{ color: "#8A8678", maxWidth: "34rem" }}>
+            No event yet — that&apos;s normal if your store hasn&apos;t taken a payment since you added the webhook.
+            You can finish setting up and carry on; Kinato starts recovering the moment your first real event
+            arrives, and this step will show as verified then.
+          </p>
+        )}
+
         <div className="flex gap-3.5 mt-9 pt-5 border-t items-center" style={{ borderColor: "#EAE6D5" }}>
           <button className="onb-btn-secondary" onClick={() => router.push("/onboarding/connect")}>
             Back
           </button>
           <button
             className="onb-btn-primary"
-            disabled={eventState !== "received"}
-            onClick={() => router.push("/onboarding/catalog")}
+            disabled={eventState !== "received" && !waitedLongEnough}
+            onClick={async () => {
+              // If no event was verified, the server is still parked on
+              // "integrate" - and the funnel guard will bounce us straight
+              // back here unless we advance the step first. (events-check
+              // does this itself once a real event lands.)
+              if (eventState !== "received") {
+                try {
+                  await apiFetch("/api/merchant/onboarding/integrate/skip", { method: "POST" });
+                } catch {
+                  /* non-fatal: worst case the guard returns us here and the
+                     merchant can retry, rather than silently losing the click */
+                }
+              }
+              router.push("/onboarding/catalog");
+            }}
           >
             Continue
           </button>
+          {eventState === "waiting" && waitedLongEnough && (
+            <span className="text-[11px] uppercase tracking-wider anim-fade" style={{ color: "#8A8678" }}>
+              Continuing without a verified event
+            </span>
+          )}
         </div>
       </div>
     </>

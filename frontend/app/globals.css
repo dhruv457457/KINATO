@@ -153,3 +153,67 @@ body {
   font-size: 13px; cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease;
 }
 .onb-dropzone:hover, .onb-dropzone.drag { border-color: #44433C; background: #F5F3E9; }
+
+/* ---------------------------------------------------------------------
+ * Motion. Deliberately restrained to match the Vignelli discipline: things
+ * arrive, they don't perform. Short durations, one easing curve, small
+ * translations. Every animation is opacity/transform only (compositor-only
+ * properties - no layout thrash on a table of 100 rows), and all of it is
+ * disabled wholesale under prefers-reduced-motion.
+ * --------------------------------------------------------------------- */
+@keyframes kFade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes kRise { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+@keyframes kRow  { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@keyframes kShimmer { 0% { background-position: -420px 0; } 100% { background-position: 420px 0; } }
+
+@keyframes kDrawer { from { transform: translateX(26px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+.anim-fade { animation: kFade 0.28s ease-out both; }
+.anim-drawer { animation: kDrawer 0.3s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.anim-rise { animation: kRise 0.42s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.anim-row  { animation: kRow 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+
+.anim-shimmer {
+  background-image: linear-gradient(90deg, #EFEBDC 0%, #F7F4E9 42%, #EFEBDC 84%);
+  background-size: 420px 100%;
+  animation: kShimmer 1.25s linear infinite;
+}
+
+/* Policy sliders: a browser-default range control is the one element that
+   would break the straight-edged, hairline language of every other input. */
+.policy-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1px;
+  background: #D5D0BC;
+  outline: none;
+  cursor: pointer;
+}
+.policy-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  background: #1B1A17;
+  border-radius: 0;
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+.policy-range::-webkit-slider-thumb:hover { transform: scale(1.25); }
+.policy-range::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  background: #1B1A17;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+}
+.policy-range::-moz-range-track { height: 1px; background: #D5D0BC; }
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-fade, .anim-rise, .anim-row, .anim-shimmer, .anim-drawer,
+  .onb-status-line.pending .onb-status-dot {
+    animation: none !important;
+  }
+  .anim-fade, .anim-rise, .anim-row, .anim-drawer { opacity: 1; transform: none; }
+}

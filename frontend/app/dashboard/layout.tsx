@@ -3,16 +3,18 @@
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { getCurrentMerchant, Merchant, stepPath } from "@/lib/api";
+import { DashboardErrorBoundary } from "@/components/dashboard/ErrorBoundary";
 
 const NAV_ITEMS: { label: string; path: string; enabled: boolean }[] = [
   { label: "Overview", path: "/dashboard", enabled: true },
+  { label: "Ask", path: "/dashboard/ask", enabled: true },
   { label: "Recoveries", path: "/dashboard/recoveries", enabled: true },
   { label: "Customers", path: "/dashboard/customers", enabled: true },
-  { label: "Catalog", path: "/dashboard/catalog", enabled: false },
+  { label: "Catalog", path: "/dashboard/catalog", enabled: true },
   { label: "AI Commerce", path: "/dashboard/ai-commerce", enabled: false },
   { label: "Policies", path: "/dashboard/policies", enabled: true },
   { label: "Activity", path: "/dashboard/activity", enabled: true },
-  { label: "Settings", path: "/dashboard/settings", enabled: false },
+  { label: "Settings", path: "/dashboard/settings", enabled: true },
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
@@ -93,7 +95,11 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       </aside>
 
       {/* MAIN */}
-      <div className="flex flex-col min-w-0 overflow-x-auto">{children}</div>
+      <div className="flex flex-col min-w-0 overflow-x-auto">
+        {/* Keyed on pathname so navigating away from a page that threw
+            clears the error instead of pinning the dashboard to it. */}
+        <DashboardErrorBoundary resetKey={pathname}>{children}</DashboardErrorBoundary>
+      </div>
     </div>
   );
 }

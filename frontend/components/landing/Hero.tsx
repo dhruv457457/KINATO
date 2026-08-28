@@ -48,6 +48,7 @@ export function Hero() {
           <div className="flex items-center gap-2 rounded-full bg-white/10 backdrop-blur px-4 py-2 text-sm border border-white/15 animate-fade-in-up">
             <span aria-hidden>📧</span>
             Emailed Rahul an 8% recovery offer &mdash; ₹3,219 recovered
+            <span className="text-[10px] uppercase tracking-wider text-white/45 ml-1">example</span>
           </div>
         </div>
 

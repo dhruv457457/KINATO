@@ -3,26 +3,18 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
-from app.gateway.event_bus import bus
-from app.services.policy_engine import policy_engine
 from app.services.merchant_intelligence import merchant_intel
-from app.payments.upi_reserve_pay import upi_reserve_pay
+from app.payments.spend_mandate import spend_mandate_service
 from app.core.auth import get_current_merchant
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import audit as audit_repo
 from app.db.repositories import customers as customers_repo
+from app.db.repositories import products as products_repo
+from app.db.repositories import events as events_repo
 from app.services.identity_service import identity_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-class PolicyUpdateRequest(BaseModel):
-    max_discount_percent: Optional[float] = None
-    minimum_margin_percent: Optional[float] = None
-    calling_start_hour: Optional[int] = None
-    calling_end_hour: Optional[int] = None
-    voice_persona: Optional[str] = None
-    bundle_discount_percent: Optional[float] = None
 
 class MerchantChatRequest(BaseModel):
     question: str
@@ -31,6 +23,9 @@ class MandateRequest(BaseModel):
     customer_email: str = ""
     customer_phone: str = ""
     daily_limit_inr: float = 10000.0
+
+class ProductVisibilityRequest(BaseModel):
+    visible: bool
 
 @router.get("/dashboard/overview")
 async def get_dashboard_overview(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
@@ -55,6 +50,12 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
         "call_failed_count": stats["call_failed_count"],
         "abandoned_count": stats["abandoned_count"],
         "recovery_rate_pct": stats["recovery_rate_pct"],
+        # Why recoveries never started: real `recovery.blocked` events. A
+        # payment failed (so there IS money on the table) but Kinato
+        # deliberately stayed silent - no contact details on file, or
+        # Razorpay's own rail was degraded. Without this the merchant just
+        # sees a smaller recovered number and no reason for it.
+        "blocked_reasons": events_repo.count_blocked_reasons(merchant_id),
     }
 
 
@@ -129,15 +130,36 @@ async def revoke_customer_consent(customer_id: str, current_merchant: dict = Dep
     await identity_service.revoke_consent(current_merchant["merchant_id"], customer_id, channel="voice", source="dashboard_manual")
     return {"status": "revoked"}
 
-@router.get("/merchant/policy")
-async def get_merchant_policy(current_merchant: dict = Depends(get_current_merchant)):
-    return policy_engine.get_policy(current_merchant["merchant_id"])
+@router.get("/dashboard/catalog")
+async def list_catalog(current_merchant: dict = Depends(get_current_merchant)) -> Dict[str, Any]:
+    """Real products for this merchant - price, cogs_paise, margin, and
+    whether external AI buyers (via /mcp) can see it. Backed by the same
+    `products` table onboarding's CSV upload writes to; a fresh merchant
+    with nothing uploaded gets a real empty list, not seeded rows."""
+    rows = products_repo.list_products(current_merchant["merchant_id"])
+    return {"products": rows}
 
-@router.post("/merchant/policy")
-async def update_merchant_policy(payload: PolicyUpdateRequest, current_merchant: dict = Depends(get_current_merchant)):
-    updates = payload.dict(exclude_unset=True)
-    updated = policy_engine.update_policy(current_merchant["merchant_id"], updates)
-    return {"status": "success", "policy": updated}
+
+@router.post("/dashboard/catalog/{product_id}/visibility")
+async def set_catalog_visibility(
+    product_id: str, payload: ProductVisibilityRequest, current_merchant: dict = Depends(get_current_merchant)
+) -> Dict[str, Any]:
+    """Merchant-controlled toggle for whether one product can be discovered
+    by external AI buyers through the AI Commerce / MCP surface."""
+    updated = products_repo.set_ai_buyer_visibility(current_merchant["merchant_id"], product_id, payload.visible)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such product.")
+    return {"product": updated}
+
+
+# NOTE: the merchant policy routes used to live here as well, duplicating
+# GET /api/merchant/policy (and adding a POST variant nothing called). Both
+# files registered the same path, so FastAPI's first-match-wins silently
+# made merchant_settings.get_policy unreachable dead code while the same
+# resource was split across two modules with different verbs. They now live
+# only in app/api/merchant_settings.py (GET + PUT), which owns everything
+# else under /api/merchant. policy_engine.get_policy was a bare passthrough
+# to policies_repo.get_policy, so the served response shape is unchanged.
 
 @router.post("/merchant-intel/chat")
 async def merchant_chat(payload: MerchantChatRequest, current_merchant: dict = Depends(get_current_merchant)):
@@ -152,7 +174,7 @@ async def authorize_ai_buyer_mandate(payload: MandateRequest, current_merchant: 
     (spec's "Path A"). One-time authorization; every subsequent autonomous
     purchase is capped and audited without further human approval.
     """
-    return upi_reserve_pay.create_mandate(
+    return spend_mandate_service.create_mandate(
         business_id=current_merchant["merchant_id"],
         customer_email=payload.customer_email,
         customer_phone=payload.customer_phone,
@@ -161,7 +183,7 @@ async def authorize_ai_buyer_mandate(payload: MandateRequest, current_merchant: 
 
 @router.get("/commerce/mandate")
 async def get_ai_buyer_mandate(current_merchant: dict = Depends(get_current_merchant)):
-    mandate = upi_reserve_pay.get_mandate_status(current_merchant["merchant_id"])
+    mandate = spend_mandate_service.get_mandate_status(current_merchant["merchant_id"])
     if not mandate:
         return {"status": "NONE", "message": "No active autonomous-payment mandate for this merchant."}
     return mandate
@@ -169,4 +191,4 @@ async def get_ai_buyer_mandate(current_merchant: dict = Depends(get_current_merc
 @router.post("/commerce/mandate/{mandate_id}/revoke")
 async def revoke_ai_buyer_mandate(mandate_id: str, current_merchant: dict = Depends(get_current_merchant)):
     """Merchant can revoke the AI agent's autonomous payment authority at any time."""
-    return upi_reserve_pay.revoke_mandate(mandate_id)
+    return spend_mandate_service.revoke_mandate(mandate_id)

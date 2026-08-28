@@ -2,9 +2,10 @@ import logging
 import os
 import json
 import httpx
-from typing import Dict, Any, List
-from app.gateway.event_bus import bus
+from typing import Dict, Any
 from dotenv import load_dotenv
+from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from app.db.repositories import audit as audit_repo
 
 load_dotenv()
 
@@ -12,54 +13,74 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
+
 class MerchantIntelligenceAgent:
     """
-    [AGENT 4: MERCHANT REVENUE INTELLIGENCE AGENT]
-    Analyzes historical recoveries, customer objections, and revenue velocity.
-    Answers natural language questions asked by the merchant in the Command Center.
+    Answers a merchant's natural-language question about their own store,
+    grounded only in that merchant's real DB rows (recovery_attempts,
+    checkouts, audit_log) - never the process-wide event bus, which is
+    unscoped across merchants and empty after every restart. An earlier
+    version of this file read bus.get_recent_events() with no merchant_id
+    filter, which meant one merchant's chat could see (and answer with)
+    every other merchant's revenue and customer conversations - a real
+    cross-tenant leak, not just a wording problem. Fixed by querying the
+    same merchant-scoped repos the dashboard uses.
     """
 
     @staticmethod
-    async def query_insights(question: str, merchant_id: str = "jiva_demo") -> Dict[str, Any]:
-        """Processes a merchant natural language query against live event bus state."""
-        recent_events = bus.get_recent_events(limit=300)
-        
-        attributed_rev = sum(
-            e["payload"].get("amount", 0) 
-            for e in recent_events 
-            if e["event_type"] == "revenue.attributed"
-        )
-        abandoned_val = sum(
-            e["payload"].get("amount", 0) 
-            for e in recent_events 
-            if e["event_type"] == "checkout.abandoned"
-        )
-        completed_calls = len([e for e in recent_events if e["event_type"] == "payment.succeeded"])
-        total_calls = len([e for e in recent_events if e["event_type"] == "call.started"])
+    async def query_insights(question: str, merchant_id: str) -> Dict[str, Any]:
+        """Processes a merchant natural language query against that
+        merchant's own real, persisted data."""
+        stats = recovery_attempts_repo.summary_stats(merchant_id)
+        audit_rows = audit_repo.recent_audit(merchant_id, limit=300)
 
-        customer_objections = [
-            e["payload"].get("customer_words") or e["payload"].get("transcript")
-            for e in recent_events
-            if e["event_type"] in ["customer.understood", "voice.turn_completed"]
-            and (e["payload"].get("customer_words") or e["payload"].get("transcript"))
-        ]
+        customer_objections = []
+        for row in audit_rows:
+            if row.get("action") != "issue_offer" and row.get("action") != "check_offer":
+                continue
+            args = row.get("args")
+            try:
+                args = json.loads(args) if isinstance(args, str) else args
+            except (TypeError, ValueError):
+                continue
+            reason = (args or {}).get("reason")
+            if reason:
+                customer_objections.append(reason)
+
+        # Postgres SUM()/COUNT() come back as Decimal. FastAPI's own response
+        # encoder handles that transparently, which is why /dashboard/overview
+        # never tripped on it - but this dict gets json.dumps()'d by hand into
+        # the LLM prompt below, and json.dumps has no idea what a Decimal is.
+        # Coerce at the boundary rather than leaking Decimal into the prompt.
+        def _num(v, cast=int):
+            return None if v is None else cast(v)
 
         context_summary = {
             "merchant_id": merchant_id,
-            "kinato_attributed_revenue": attributed_rev,
-            "total_abandoned_revenue": abandoned_val,
-            "recovered_orders_count": completed_calls,
-            "total_recovery_calls": total_calls,
-            "recent_customer_objections_sample": customer_objections[-8:]
+            "revenue_recovered_paise": _num(stats["recovered_paise"]),
+            "revenue_at_risk_paise": _num(stats["revenue_at_risk_paise"]),
+            "recovered_orders_count": _num(stats["recovered_count"]),
+            "total_recovery_attempts": _num(stats["total_attempts"]),
+            "recovery_rate_pct": _num(stats["recovery_rate_pct"], float),
+            "recent_offer_reasons_sample": customer_objections[-8:],
+            "has_any_activity": _num(stats["total_attempts"]) > 0,
         }
 
         system_prompt = (
-            "You are the Kinato Merchant Intelligence AI — a sharp, conversational, executive co-pilot for the Jiva Lifestyle store owner.\n\n"
-            "CONVERSATIONAL RULES:\n"
-            "1. If the merchant greets you (e.g. 'hey', 'hello', 'hi', 'what's up'), reply warmly and concisely (1-2 sentences) with a quick status check and ask what they want to analyze.\n"
-            "2. When asked about revenue, recoveries, or customer objections, be crisp, specific, and cite real customer data from live calls (e.g. Dhruv saying 'It is too expensive yaar' on the Handcrafted Bamboo Lamp and getting a 10% discount to ₹3,149 via email).\n"
-            "3. Use clean markdown formatting (short bullet points, bold metrics, clean spacing). Never dump huge walls of unformatted text.\n"
-            "4. Keep responses punchy, helpful, and directly relevant to the merchant's question."
+            "You are the Kinato Merchant Intelligence AI - a sharp, concise analyst answering a merchant's "
+            "question about their own store.\n\n"
+            "RULES:\n"
+            "1. ANSWER THE QUESTION ASKED, directly, in your first sentence, using the real figures from the "
+            "Live Store Data Context. Only fall back to 'what would you like to analyze?' if the message is a "
+            "bare greeting with no question in it.\n"
+            "2. Money in the context is in PAISE. Convert to rupees (divide by 100) and format Indian-style "
+            "(e.g. 10576500 -> ₹1,05,765). Never show a raw paise figure to the merchant.\n"
+            "3. Answer ONLY from the Live Store Data Context. Never invent a customer name, a product, a quote, "
+            "or a discount that isn't in that context.\n"
+            "4. If `has_any_activity` is false, say plainly there is no recovery activity yet - do not fabricate "
+            "an example to fill the gap.\n"
+            "5. Be specific and useful: name the real number, then say what it implies or what to do next.\n"
+            "6. Clean markdown, short bullets, bold the key metric. Under 120 words."
         )
 
         user_prompt = (
@@ -67,52 +88,53 @@ class MerchantIntelligenceAgent:
             f"Live Store Data Context:\n{json.dumps(context_summary, indent=2)}"
         )
 
-        try:
-            async with httpx.AsyncClient(timeout=4.5) as client:
-                res = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                    json={
-                        "model": "openai/gpt-4o-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        "max_tokens": 250,
-                        "temperature": 0.5
-                    }
-                )
-                if res.status_code == 200:
-                    answer = res.json()["choices"][0]["message"]["content"]
-                    return {
-                        "question": question,
-                        "answer": answer,
-                        "metrics": context_summary
-                    }
-        except Exception as e:
-            logger.warning(f"MerchantIntel fallback: {e}")
+        if OPENROUTER_API_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=4.5) as client:
+                    res = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                        json={
+                            "model": "openai/gpt-4o-mini",
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            "max_tokens": 250,
+                            "temperature": 0.5,
+                        },
+                    )
+                    if res.status_code == 200:
+                        answer = res.json()["choices"][0]["message"]["content"]
+                        return {
+                            "question": question,
+                            "answer": answer,
+                            "metrics": context_summary,
+                            "source": "llm",
+                        }
+            except Exception as e:
+                logger.warning(f"MerchantIntel LLM call failed: {e}")
 
-        # Fallback answers
-        q_low = question.lower()
-        if any(w in q_low for w in ["hey", "hi", "hello"]):
-            fallback_answer = f"Hello Jiva! I am tracking ₹{int(attributed_rev):,} in recovered revenue today. How can I help you analyze your store performance?"
-        elif "objection" in q_low or "why" in q_low:
-            fallback_answer = (
-                f"Based on our live calls today, the #1 objection was **Price Sensitivity** on the Handcrafted Bamboo Lamp.\n\n"
-                f"- **Customer Utterance**: *\"Too expensive yaar, what is your best final price?\"* (Dhruv)\n"
-                f"- **Resolution**: Sarah unlocked a **10% Store Manager discount (₹3,149)** and dispatched the link via email.\n"
-                f"- **Outcome**: Customer agreed and completed the order via Razorpay."
-            )
+        # Heuristic fallback - grounded in the same real numbers, no
+        # confidence figure and no fabricated anecdote, since there's
+        # nothing to be confident (or not) about here.
+        if not context_summary["has_any_activity"]:
+            fallback_answer = "No recovery activity recorded yet for your store. Once a checkout fails or is abandoned, it'll show up here."
         else:
             fallback_answer = (
-                f"Kinato has recovered **₹{int(attributed_rev):,}** across **{completed_calls} successful customer calls** today. "
-                f"Our Policy Engine is maintaining a healthy **15% minimum gross margin** while resolving checkout hesitations."
+                f"Kinato has recovered **₹{(context_summary['revenue_recovered_paise'] or 0) / 100:,.0f}** "
+                f"across **{context_summary['recovered_orders_count']}** of "
+                f"**{context_summary['total_recovery_attempts']}** recovery attempts"
+                + (f" ({context_summary['recovery_rate_pct']}% recovery rate)." if context_summary["recovery_rate_pct"] is not None else ".")
             )
 
         return {
             "question": question,
             "answer": fallback_answer,
-            "metrics": context_summary
+            "metrics": context_summary,
+            "source": "heuristic",
+            "degraded": True,
         }
+
 
 merchant_intel = MerchantIntelligenceAgent()

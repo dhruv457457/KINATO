@@ -1,7 +1,7 @@
 # KINATO
 
-> **Razorpay AI Buildathon 2026 — Track 01: AI Growth & Agentic Commerce**  
-> *"Grow the merchant's revenue, and make them sellable to AI buyers"*
+> **Razorpay AI Buildathon 2026 — Track 03: AI Revenue Recovery**  
+> *"Don't just identify the problem. Show measured money recovered across a batch, with compliant escalation, stopping rules, and an audit trail."*
 
 **Kinato turns a merchant's existing website into an autonomous revenue surface for both humans and AI buyers.**
 
@@ -84,9 +84,18 @@ The **Policy Engine** deterministically evaluates merchant rules (margins, max d
 The **Communication Consent** is re-checked, then a WhatsApp checkout payload is dispatched **during the live call**.  
 The customer pays via Razorpay. The webhook hits the Event Bus, and the dashboard instantly displays the `Kinato-Attributed Revenue`.
 
-### 2. AI-Buyer Commerce (Priority 2)
-Claude is prompted: *"Find me room decor under ₹3,000 that arrives this week."*  
-Claude discovers the merchant via the Agent Catalog (`/.well-known/agent-catalog.json`), connects to Kinato's MCP, queries structured data (prices, shipping rules), and receives a **Quote**. When creating a purchase intent, Kinato performs strict **Intent Revalidation** (price, expiry, inventory) before securely handing off a merchant-scoped Razorpay checkout flow.
+### 2. AI-Buyer Commerce — *partially built, and honest about it*
+An external AI buyer can search a catalog, receive a **Quote**, and have that
+quote strictly revalidated (price changed, quote expired, inventory gone) before
+any purchase is allowed. **That revalidation boundary is real and tested.**
+
+What is **not** built: the catalog behind it is not yet multi-tenant, so
+`create_purchase_intent` deliberately returns
+`REJECTED: catalog_not_yet_multi_tenant` rather than guessing which merchant to
+bill. There is no Agent Catalog manifest and no MCP transport shipped — earlier
+drafts of this README advertised both; neither existed, so the claims have been
+removed rather than left pointing at 404s. The dashboard marks this surface
+"soon" instead of faking it.
 
 ---
 

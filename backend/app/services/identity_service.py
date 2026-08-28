@@ -1,6 +1,7 @@
 import logging
 from typing import Optional, Dict, Any
 
+from app.db.database import run_db_async
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import consents as consents_repo
 
@@ -54,7 +55,8 @@ class IdentityConsentService:
         append-only row - never mutates the earlier grant. check_consent()
         will return False for this channel from this point on, since it
         reads the latest row."""
-        record = consents_repo.record_consent(
+        record = await run_db_async(
+            consents_repo.record_consent,
             merchant_id, customer_id, channel, status="revoked", source=source
         )
         logger.warning(f"Consent REVOKED for {customer_id} on channel {channel} via {source}")
@@ -67,7 +69,7 @@ class IdentityConsentService:
         checked immediately before any communication (Dual Consent Check).
         No granted record => False. This is a real DB read, not a stub.
         """
-        granted = consents_repo.check_consent(merchant_id, customer_id, channel)
+        granted = await run_db_async(consents_repo.check_consent, merchant_id, customer_id, channel)
         if granted:
             logger.info(f"Consent CHECK PASSED for {customer_id} on {channel}")
         else:

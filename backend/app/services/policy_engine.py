@@ -16,15 +16,18 @@ class OfferPolicyEngine:
     the old in-memory MERCHANT_POLICIES dict that had exactly one entry
     ("jiva_demo") and silently coerced any unknown merchant_id into it via
     `.get(merchant_id, MERCHANT_POLICIES["jiva_demo"])`. get_policy() now
-    RAISES (PolicyNotFoundError) for a merchant that doesn't exist - the
-    "jiva_demo" default below is an explicit, visible default parameter for
-    still-unauthenticated call sites (dashboard routes not yet wired to a
-    real session - see Day 4), backed by a real seeded row, not a silent
-    fallback for garbage input.
+    RAISES (PolicyNotFoundError) for a merchant that doesn't exist.
+
+    get_policy() takes a REQUIRED merchant_id. It previously defaulted to
+    "jiva_demo" for "dashboard routes not yet wired to a real session" -
+    those routes have all been on get_current_merchant since Day 4, so that
+    default outlived its reason and became a tenancy landmine: any call site
+    that forgot the argument would silently read another merchant's discount
+    ceiling and margin floor.
     """
 
     @staticmethod
-    def get_policy(merchant_id: str = "jiva_demo") -> Dict[str, Any]:
+    def get_policy(merchant_id: str) -> Dict[str, Any]:
         return policies_repo.get_policy(merchant_id)
 
     @staticmethod
@@ -42,13 +45,34 @@ class OfferPolicyEngine:
     ) -> Dict[str, Any]:
         """
         Evaluates a candidate discount against hard merchant rules.
+
+        merchant_policy and cart_details are REQUIRED. They used to have
+        silent defaults that were both genuinely dangerous:
+
+          - merchant_policy fell back to get_policy() with no merchant_id,
+            i.e. another tenant's discount ceiling and margin floor.
+          - cart_details fell back to {"amount": 3499.0, "cogs": 1749.5} -
+            the fabricated cart the rebuild plan called out ("every recovery
+            prices a fictional cart"). It was removed from call_orchestrator
+            but survived here, so a caller that omitted it would have sized
+            a real discount against invented money.
+
+        Every real call site already passes both, so these defaults were
+        never exercised - they were landmines, not behaviour. Failing loudly
+        is the only safe thing to do in a money path.
         """
         if merchant_policy is None:
-            merchant_policy = OfferPolicyEngine.get_policy()
+            raise ValueError(
+                "evaluate() requires an explicit merchant_policy - refusing to "
+                "price a discount against an unspecified merchant's rules."
+            )
+        if cart_details is None:
+            raise ValueError(
+                "evaluate() requires explicit cart_details - refusing to price a "
+                "discount against a fabricated cart."
+            )
         if customer_context is None:
             customer_context = {}
-        if cart_details is None:
-            cart_details = {"amount": 3499.0, "cogs": 1749.5}
 
         logger.info(f"🛡️ [PolicyEngine] Evaluating requested discount: {requested_discount}%")
 

@@ -19,7 +19,6 @@ import app.gateway.sweeper  # noqa: F401
 import app.services.checkout_tracking  # noqa: F401
 import app.services.identity_service  # noqa: F401
 import app.services.recovery_eligibility  # noqa: F401
-import app.services.customer_intelligence  # noqa: F401
 import app.services.discovery_agent  # noqa: F401
 import app.services.call_orchestrator  # noqa: F401
 import app.services.policy_engine  # noqa: F401
@@ -79,7 +78,8 @@ class _FakePaymentLink:
     ships this; app/services/payment_execution.py always calls the real SDK
     method and raises PaymentExecutionError if it fails). This is the same
     pattern already used in test_customer_intelligence_fallback.py to stand
-    in for the LLM call."""
+    in for the LLM call - the same test-double pattern used for the LLM
+    calls in app/services/merchant_intelligence.py and discovery_agent.py."""
     def create(self, payload):
         return {"id": f"plink_test_{uuid.uuid4().hex[:8]}", "short_url": "https://rzp.io/i/test_stub"}
 
@@ -103,10 +103,8 @@ def connected_merchant_id(real_merchant_id, monkeypatch):
 @pytest.fixture(autouse=True)
 def _discovery_agent_heuristic_only(monkeypatch):
     """Forces app/services/discovery_agent.py onto its heuristic (no-LLM-call)
-    path for every test - same reasoning as test_customer_intelligence_fallback.py:
-    the suite should be fast and network-independent by default. A live-LLM
-    smoke test lives separately as a manual script, same pattern as
-    backend/test_customer_intelligence.py."""
+    path for every test - the suite should be fast and network-independent
+    by default. A live-LLM smoke test lives separately as a manual script."""
     import app.services.discovery_agent as discovery_agent_module
     monkeypatch.setattr(discovery_agent_module.settings, "OPENROUTER_API_KEY", "")
 

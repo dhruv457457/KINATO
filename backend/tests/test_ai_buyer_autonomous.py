@@ -1,21 +1,40 @@
 """
-Tests the autonomous (Path A) AI-buyer payment flow: a merchant-authorized
-UPI Reserve Pay mandate lets an AI buyer settle instantly, capped by a daily
-spend limit enforced deterministically (never by the LLM).
+Tests the autonomous (Path A) AI-buyer purchase flow: a merchant-authorized
+spend mandate lets an AI buyer's purchase go through without per-transaction
+approval, capped by a daily spend limit enforced deterministically (never by
+the LLM). See app/payments/spend_mandate.py's module docstring for why this
+is a Kinato-enforced cap on top of a real Razorpay Order, not an actual
+NPCI/RBI UPI Autopay settlement - that requires the customer's own in-app
+approval, which a headless AI agent cannot complete.
 """
 import uuid
 import pytest
 
 from app.commerce.catalog import merchant_catalog
 from app.commerce.mcp_server import ai_commerce_mcp
-from app.payments.upi_reserve_pay import upi_reserve_pay
+from app.payments.spend_mandate import spend_mandate_service
 from app.gateway.event_bus import bus
+
+
+class _FakeOrder:
+    """Stands in for the real Razorpay SDK's `client.order` resource - a test
+    double for test isolation (spend_mandate_service uses a single global
+    Razorpay client, not the per-merchant factory payment_execution.py uses,
+    so there's no real per-merchant account to call here). Same pattern as
+    conftest.py's _FakePaymentLink."""
+    def create(self, payload):
+        return {"id": f"order_test_{uuid.uuid4().hex[:8]}"}
+
+
+@pytest.fixture(autouse=True)
+def _fake_razorpay_order_client(monkeypatch):
+    monkeypatch.setattr(spend_mandate_service, "_client", type("C", (), {"order": _FakeOrder()})())
 
 
 @pytest.fixture
 def mandate():
     business_id = f"biz_{uuid.uuid4().hex[:8]}"
-    result = upi_reserve_pay.create_mandate(
+    result = spend_mandate_service.create_mandate(
         business_id=business_id,
         customer_email="buyer@example.com",
         customer_phone="+910000000000",
@@ -67,7 +86,7 @@ async def test_autonomous_purchase_still_revalidates_price_and_inventory(mandate
 async def test_revoked_mandate_blocks_further_autonomous_purchases(mandate):
     merchant_catalog.mutate_price("sku_lamp_01", 2499.0)
     merchant_catalog.mutate_inventory("sku_lamp_01", 10)
-    upi_reserve_pay.revoke_mandate(mandate)
+    spend_mandate_service.revoke_mandate(mandate)
 
     quote = ai_commerce_mcp.quote("sku_lamp_01")
     result = await ai_commerce_mcp.create_purchase_intent_autonomous(quote["quote_id"], mandate)

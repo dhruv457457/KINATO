@@ -10,11 +10,12 @@ export function FeatureSplit() {
           </h2>
           <p className="mt-6 text-dark-200/90 text-[15px] leading-relaxed max-w-md">
             Ask Kinato anything about your sales — what&apos;s causing abandonment, how much was
-            recovered this week, which products customers hesitate on. It answers from your real,
-            live event stream, not a stale report.
+            recovered this week, which products customers hesitate on. It answers from your own live
+            recovery records — never a generic benchmark, and never an invented example.
           </p>
         </div>
         <div className="glass-card !bg-dark-100/60 !border-white/10 p-6 font-mono text-sm text-background/90">
+          <div className="text-[10px] uppercase tracking-widest text-background/40 mb-3">Illustrative example</div>
           <p className="text-brand-100/70">Merchant:</p>
           <p className="mt-1">&ldquo;Recover today&apos;s failed payments above ₹1,000.&rdquo;</p>
           <p className="mt-4 text-brand-100/70">Kinato:</p>
@@ -26,6 +27,12 @@ export function FeatureSplit() {
 
       <div className="mx-auto max-w-5xl grid gap-16 sm:grid-cols-2 items-center mt-24">
         <div className="glass-card !bg-dark-100/60 !border-white/10 p-6 order-2 sm:order-1">
+          {/* Labelled as an example on purpose. The product's own rule is
+              that nothing fabricated may be presented as real output - that
+              applies to the marketing site too, not just the dashboard. */}
+          <div className="text-[10px] uppercase tracking-widest text-background/40 font-mono mb-3">
+            Illustrative example
+          </div>
           <div className="flex items-center justify-between text-xs text-background/60 font-mono">
             <span>RAHUL SHARMA — ₹3,499</span>
             <span className="text-emerald-300">RECOVERED</span>

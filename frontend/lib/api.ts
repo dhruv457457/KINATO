@@ -85,6 +85,10 @@ export interface DashboardOverview {
   call_failed_count: number;
   abandoned_count: number;
   recovery_rate_pct: number | null;
+  /** Real `recovery.blocked` counts, keyed by reason (e.g. "no_contact",
+   *  "rail_degraded"). Money was on the table but Kinato deliberately
+   *  stayed silent — this says why. */
+  blocked_reasons: Record<string, number>;
 }
 
 export interface RecoveryRow {
@@ -150,6 +154,91 @@ export function getCustomers(): Promise<{ customers: CustomerRow[] }> {
 
 export function revokeCustomerConsent(customerId: string): Promise<{ status: string }> {
   return apiFetch(`/api/dashboard/customers/${customerId}/revoke-consent`, { method: "POST" });
+}
+
+export interface ProductRow {
+  product_id: string;
+  name: string;
+  description: string;
+  price_paise: number;
+  cogs_paise: number | null;
+  currency: string;
+  inventory_count: number;
+  image_url: string;
+  visible_to_ai_buyers: boolean;
+  active: boolean;
+}
+
+export function getCatalog(): Promise<{ products: ProductRow[] }> {
+  return apiFetch("/api/dashboard/catalog");
+}
+
+export function setProductVisibility(productId: string, visible: boolean): Promise<{ product: ProductRow }> {
+  return apiFetch(`/api/dashboard/catalog/${productId}/visibility`, {
+    method: "POST",
+    body: JSON.stringify({ visible }),
+  });
+}
+
+export interface ApiKeyRow {
+  key_id: string;
+  key_type: "publishable" | "secret";
+  key_prefix: string;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+export function getApiKeys(): Promise<{ keys: ApiKeyRow[] }> {
+  return apiFetch("/api/merchant/api-keys");
+}
+
+export function createApiKey(keyType: "publishable" | "secret"): Promise<{ key: string; key_id: string; key_prefix: string; warning: string }> {
+  return apiFetch("/api/merchant/api-keys", { method: "POST", body: JSON.stringify({ key_type: keyType }) });
+}
+
+export function revokeApiKey(keyId: string): Promise<{ status: string }> {
+  return apiFetch(`/api/merchant/api-keys/${keyId}/revoke`, { method: "POST" });
+}
+
+export function getRazorpayStatus(): Promise<{ connected: boolean; webhook_secret_set: boolean }> {
+  return apiFetch("/api/merchant/razorpay/status");
+}
+
+/** Sets ONLY the webhook signing secret. Until it's set, Razorpay events are
+ *  rejected unverified and recovery never starts — see
+ *  backend/app/payments/webhooks.py. */
+export function saveWebhookSecret(webhookSecret: string): Promise<{ status: string }> {
+  return apiFetch("/api/merchant/razorpay/webhook-secret", {
+    method: "PUT",
+    body: JSON.stringify({ webhook_secret: webhookSecret }),
+  });
+}
+
+export function getAllowedOrigins(): Promise<{ origins: string[] }> {
+  return apiFetch("/api/merchant/allowed-origins");
+}
+
+export function setAllowedOrigins(origins: string[]): Promise<{ origins: string[] }> {
+  return apiFetch("/api/merchant/allowed-origins", { method: "POST", body: JSON.stringify({ origins }) });
+}
+
+export interface IntelAnswer {
+  question: string;
+  answer: string;
+  metrics: Record<string, any>;
+  source?: "llm" | "heuristic";
+  degraded?: boolean;
+}
+
+/** Ask a natural-language question about this merchant's own real data.
+ *  Backed by /api/merchant-intel/chat, which is grounded strictly in this
+ *  merchant's DB rows — see backend/app/services/merchant_intelligence.py. */
+export function askMerchantIntel(question: string): Promise<IntelAnswer> {
+  return apiFetch("/api/merchant-intel/chat", {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
 }
 
 /** paise -> "₹1,234.56" */

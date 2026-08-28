@@ -277,6 +277,23 @@ def init_db(force_reseed: bool = False) -> None:
             "CREATE INDEX IF NOT EXISTS idx_audit_log_correlation ON audit_log (correlation_id);"
         )
 
+    # Rail-health flag: set by the payment.downtime.* webhook handler
+    # (app/payments/webhooks.py), checked by RecoveryEligibilityService
+    # before generating any new recovery opportunity - a real stopping rule
+    # (never call/email a customer over a failed payment that might just be
+    # Razorpay's own outage, not a real decline). Added via ALTER since this
+    # column postdates merchants' original CREATE TABLE and real deployed
+    # databases already have that table without it. Run in its own
+    # connection/transaction, deliberately outside the block above: init_db()
+    # runs on every app startup, so the "column already exists" case is the
+    # normal path after the first boot, and it must never abort the main
+    # schema transaction's CREATE TABLEs.
+    try:
+        with get_db() as alter_conn:
+            alter_conn.cursor().execute("ALTER TABLE merchants ADD COLUMN rail_degraded_at TIMESTAMPTZ")
+    except Exception:
+        pass  # column already exists
+
 
 if __name__ == "__main__":
     init_db()

@@ -163,13 +163,12 @@ def _to_json(obj: Dict[str, Any]) -> str:
 
 
 # Register handlers. Note: this no longer subscribes to `customer.understood`
-# (published by app/services/customer_intelligence.py) - that event's
+# (formerly published by app/services/customer_intelligence.py, deleted -
+# it had become fully orphaned dead code, unreachable from any real path,
+# with no test coverage beyond its own). That event's
 # next_action=="request_offer"/"opt_out" routing was the old, separate
 # reasoning path this orchestrator used to act on. The live call now
 # resolves both (via check_offer/issue_offer and record_opt_out) inline,
-# in the same agent turn - see app/channels/voice_runtime.py. That leaves
-# customer_intelligence.py's subscriber intact but currently unreached by
-# the voice path; it's not deleted here since other tests exercise it
-# directly and it may still be useful as an independent classifier later.
+# in the same agent turn - see app/channels/voice_runtime.py.
 bus.subscribe("recovery.opportunity.created", CallOrchestrator.handle_opportunity_created)
 bus.subscribe("recovery.plan_ready", CallOrchestrator.handle_plan_ready)

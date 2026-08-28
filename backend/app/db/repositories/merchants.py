@@ -2,6 +2,7 @@
 should ever inline SQL against this table; go through here so tenancy rules
 (e.g. "unknown merchant is an error, not a silent default") stay centralized."""
 import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from app.db.database import get_db
 from app.core.ids import new_id
@@ -80,6 +81,24 @@ def set_razorpay_credentials(
         )
 
 
+def set_webhook_secret(merchant_id: str, webhook_secret_enc: str) -> None:
+    """Updates ONLY the Razorpay webhook signing secret.
+
+    Separate from set_razorpay_credentials() because the webhook secret is
+    obtained at a different moment and from a different screen than the API
+    keys: a merchant invents it while creating the webhook in Razorpay's
+    dashboard, long after connecting their keys. Without this, adding it
+    meant re-entering the key id and secret too - friction that makes people
+    skip it, and skipping it means every incoming webhook is rejected
+    unverified."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE merchants SET rzp_webhook_secret_enc = %s WHERE merchant_id = %s",
+            (webhook_secret_enc, merchant_id),
+        )
+
+
 def set_allowed_origins(merchant_id: str, origins: list) -> None:
     with get_db() as conn:
         cursor = conn.cursor()
@@ -95,3 +114,22 @@ def get_allowed_origins(merchant_id: str) -> list:
         return json.loads(merchant.get("allowed_origins") or "[]")
     except (TypeError, ValueError):
         return []
+
+
+def set_rail_degraded(merchant_id: str, degraded: bool) -> None:
+    """Durable stopping-rule flag: set True on a real Razorpay
+    payment.downtime.started webhook, cleared on payment.downtime.resolved.
+    Checked by RecoveryEligibilityService before any new outreach - never
+    call/email a customer over a failed payment that might just be
+    Razorpay's own outage."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE merchants SET rail_degraded_at = %s WHERE merchant_id = %s",
+            (datetime.now(timezone.utc) if degraded else None, merchant_id),
+        )
+
+
+def is_rail_degraded(merchant_id: str) -> bool:
+    merchant = get_merchant(merchant_id)
+    return bool(merchant and merchant.get("rail_degraded_at"))

@@ -33,13 +33,17 @@ class PaymentExecutionService:
         customer_id: str,
         recovery_attempt_id: str,
         original_amount: float,
-        approved_discount_percent: float
+        approved_discount_percent: float,
+        offer_token: str = "",
     ) -> Dict[str, Any]:
         """
         Creates a merchant-scoped Razorpay payment link for human recovery.
-        Embeds the recovery_attempt_id/checkout_id as immutable metadata (Razorpay
-        "notes") so the webhook receiver can attribute the payment back to Kinato
-        with no guesswork.
+        Embeds the recovery_attempt_id/checkout_id/offer_token as immutable
+        metadata (Razorpay "notes") so the webhook receiver can attribute the
+        payment back to Kinato with no guesswork, and so the payment link
+        itself - a real Razorpay entity - carries the exact token the
+        two-phase money gate (app/agents/tools.py check_offer/issue_offer)
+        approved, not just the discount it produced.
 
         Raises PaymentExecutionError if the merchant hasn't connected Razorpay
         yet, or if the live API call fails - never returns a fake link.
@@ -62,6 +66,7 @@ class PaymentExecutionService:
             "merchant_id": merchant_id,
             "discount_percent": approved_discount_percent,
             "original_amount_paise": int(round(original_amount * 100)),
+            "offer_token": offer_token,
             "kinato_touchpoint": "voice_recovery",
         }
 

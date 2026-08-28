@@ -68,3 +68,8 @@ skills-lock.json
 ---
 # Generated at runtime, not source
 backend/static/audio/*.mp3
+
+# Build artifacts / stray local files that must not reach the public repo
+frontend/tsconfig.tsbuildinfo
+frontend/public/videos/*.zip
+frontend/public/videos/*.png

@@ -3,7 +3,7 @@ import uuid
 import time
 from typing import Dict, Any, Optional
 from app.commerce.catalog import merchant_catalog
-from app.payments.upi_reserve_pay import upi_reserve_pay
+from app.payments.spend_mandate import spend_mandate_service
 from app.gateway.event_bus import bus
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class AgentCommerceMCP:
         """Tool 1: Allow AI to discover normalized products."""
         logger.info(f"[MCP] AI Buyer searching for: '{query}' (Max Price: {max_price})")
         products = merchant_catalog.search(query, max_price)
-        return [p.dict() for p in products]
+        return [p.model_dump() for p in products]
 
     def quote(self, product_id: str, quantity: int = 1) -> Dict[str, Any]:
         """Tool 2: Generates an immutable snapshot of a product's price."""
@@ -123,14 +123,17 @@ class AgentCommerceMCP:
         self, quote_id: str, mandate_id: str, buyer_id: str = "ai_agent"
     ) -> Dict[str, Any]:
         """
-        Tool 3b (Path A - fully autonomous payment, Razorpay UPI Reserve Pay):
-        for AI buyers already covered by a merchant-authorized spending
+        Tool 3b (Path A - autonomous purchase against a Kinato spend mandate):
+        for AI buyers already covered by a merchant-authorized daily-spend
         mandate (see /api/commerce/mandate). Runs the exact same strict
-        revalidation as the human-in-the-loop path, then settles immediately
-        against the mandate's pre-authorized daily cap - no payment link, no
-        human approval per transaction. The mandate's own daily-cap check
-        (in app/payments/upi_reserve_pay.py) is the deterministic gate; the
-        LLM never decides whether the spend is allowed.
+        revalidation as the human-in-the-loop path, then records the purchase
+        immediately against the mandate's pre-authorized daily cap - no
+        payment link, no human approval per transaction. The mandate's own
+        daily-cap check (in app/payments/spend_mandate.py) is the
+        deterministic gate; the LLM never decides whether the spend is
+        allowed. See that file's docstring: this is a Kinato-enforced cap on
+        top of a real Razorpay Order, not an NPCI/RBI-compliant UPI Autopay
+        settlement.
         """
         logger.info(f"[MCP] AI Buyer requesting AUTONOMOUS intent for quote {quote_id} via mandate {mandate_id}")
 
@@ -146,7 +149,7 @@ class AgentCommerceMCP:
 
         quote, product = revalidation["quote"], revalidation["product"]
 
-        result = upi_reserve_pay.execute_autonomous_payment(
+        result = spend_mandate_service.execute_autonomous_payment(
             mandate_id=mandate_id,
             proposal_id=quote_id,
             amount_inr=quote["quoted_amount"],

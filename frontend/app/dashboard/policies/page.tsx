@@ -2,6 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api";
+import {
+  PageHeader,
+  PageBody,
+  SectionTitle,
+  RULE_SOFT,
+  INK_MUTED,
+  POSITIVE,
+  NEGATIVE,
+} from "@/components/dashboard/primitives";
 
 interface Policy {
   max_discount_percent: number;
@@ -9,6 +18,44 @@ interface Policy {
   calling_start_hour: number;
   calling_end_hour: number;
   auto_approval_threshold_inr: number;
+}
+
+/** A policy slider with its live value read out in Playfair, so the number
+ *  a merchant is committing to is the loudest thing on the row. */
+function PolicySlider({
+  label,
+  value,
+  max,
+  onChange,
+  hint,
+}: {
+  label: string;
+  value: number;
+  max: number;
+  onChange: (v: number) => void;
+  hint: string;
+}) {
+  return (
+    <div className="mb-8 anim-rise">
+      <div className="flex justify-between items-baseline mb-3">
+        <label className="text-[11.5px] font-semibold uppercase tracking-wider" style={{ color: INK_MUTED }}>
+          {label}
+        </label>
+        <span className="font-serif text-xl font-semibold tabular-nums">{value}%</span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full policy-range"
+      />
+      <div className="text-xs mt-2" style={{ color: INK_MUTED }}>
+        {hint}
+      </div>
+    </div>
+  );
 }
 
 export default function PoliciesPage() {
@@ -41,56 +88,35 @@ export default function PoliciesPage() {
 
   return (
     <>
-      <header className="border-b px-14 py-10" style={{ borderColor: "#D5D0BC" }}>
-        <div className="text-[11px] font-semibold uppercase tracking-widest text-dark-200 mb-2">Policies</div>
-        <h1 className="font-serif font-semibold text-[28px]">The rules your AI must never break</h1>
-      </header>
+      <PageHeader eyebrow="Policies" title="The rules your AI must never break" />
 
-      <div className="flex-1 px-14 py-10 max-w-[560px] w-full">
-        {error && <p className="text-sm text-red-700 mb-6">{error}</p>}
-        {!policy && !error && <p className="text-sm text-dark-200">Loading…</p>}
+      <PageBody narrow>
+        {error && <p className="text-sm mb-6 anim-fade" style={{ color: NEGATIVE }}>{error}</p>}
+        {!policy && !error && (
+          <div className="space-y-6">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="anim-shimmer h-[46px]" style={{ animationDelay: `${i * 80}ms` }} />
+            ))}
+          </div>
+        )}
 
         {policy && (
           <>
-            <div className="mb-8">
-              <div className="flex justify-between items-baseline mb-3">
-                <label className="text-[11.5px] font-semibold uppercase tracking-wider text-dark-200">
-                  Max discount ceiling
-                </label>
-                <span className="font-serif text-xl font-semibold tabular-nums">{policy.max_discount_percent}%</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={40}
-                value={policy.max_discount_percent}
-                onChange={(e) => setPolicy({ ...policy, max_discount_percent: Number(e.target.value) })}
-                className="w-full"
-              />
-              <div className="text-xs text-dark-200 mt-2">
-                The AI will never propose more than this, no matter how the negotiation goes.
-              </div>
-            </div>
+            <PolicySlider
+              label="Max discount ceiling"
+              value={policy.max_discount_percent}
+              max={40}
+              onChange={(v) => setPolicy({ ...policy, max_discount_percent: v })}
+              hint="The AI will never propose more than this, no matter how the negotiation goes."
+            />
 
-            <div className="mb-8">
-              <div className="flex justify-between items-baseline mb-3">
-                <label className="text-[11.5px] font-semibold uppercase tracking-wider text-dark-200">
-                  Minimum margin
-                </label>
-                <span className="font-serif text-xl font-semibold tabular-nums">{policy.minimum_margin_percent}%</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={80}
-                value={policy.minimum_margin_percent}
-                onChange={(e) => setPolicy({ ...policy, minimum_margin_percent: Number(e.target.value) })}
-                className="w-full"
-              />
-              <div className="text-xs text-dark-200 mt-2">
-                A discount is capped further if it would push margin below this, even if the ceiling above allows more.
-              </div>
-            </div>
+            <PolicySlider
+              label="Minimum margin"
+              value={policy.minimum_margin_percent}
+              max={80}
+              onChange={(v) => setPolicy({ ...policy, minimum_margin_percent: v })}
+              hint="A discount is capped further if it would push margin below this, even if the ceiling above allows more."
+            />
 
             <div className="onb-field mb-8">
               <label>Auto-approve threshold (₹)</label>
@@ -103,9 +129,10 @@ export default function PoliciesPage() {
               <div className="hint">Discounts that cost less than this need no human review.</div>
             </div>
 
+            <SectionTitle>Calling hours</SectionTitle>
             <div className="grid grid-cols-2 gap-6 mb-8">
               <div className="onb-field">
-                <label>Calling hours start</label>
+                <label>Start</label>
                 <input
                   type="number"
                   min={0}
@@ -115,7 +142,7 @@ export default function PoliciesPage() {
                 />
               </div>
               <div className="onb-field">
-                <label>Calling hours end</label>
+                <label>End</label>
                 <input
                   type="number"
                   min={0}
@@ -126,15 +153,19 @@ export default function PoliciesPage() {
               </div>
             </div>
 
-            <div className="flex items-center gap-4 pt-5 border-t" style={{ borderColor: "#EAE6D5" }}>
+            <div className="flex items-center gap-4 pt-5 border-t" style={{ borderColor: RULE_SOFT }}>
               <button className="onb-btn-primary" disabled={saving} onClick={save}>
                 {saving ? "Saving…" : "Save changes"}
               </button>
-              {saved && <span className="text-sm" style={{ color: "#1F6B3C" }}>Saved</span>}
+              {saved && (
+                <span className="text-sm anim-fade" style={{ color: POSITIVE }}>
+                  Saved
+                </span>
+              )}
             </div>
           </>
         )}
-      </div>
+      </PageBody>
     </>
   );
 }
