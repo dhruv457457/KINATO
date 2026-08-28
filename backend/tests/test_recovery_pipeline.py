@@ -224,3 +224,36 @@ async def test_watchdog_proceeds_with_generic_line_if_plan_never_arrives(
 async def _never_completes():
     import asyncio
     await asyncio.sleep(3600)
+
+
+async def test_sdk_external_id_resolves_to_real_customer(real_merchant_id, unique_checkout_id):
+    """The SDK identifies customers by a merchant-chosen externalId - usually
+    an email. That string used to be written straight into
+    checkouts.customer_id, while consent was recorded against the real
+    cust_... id. The consent lookup then found nothing and recovery was
+    silently blocked for a customer who HAD consented - no error anywhere,
+    just a recovery that never happened.
+    """
+    from app.db.repositories import customers as customers_repo
+
+    email = f"sdk_{uuid.uuid4().hex[:8]}@example.com"
+    customer = customers_repo.upsert_by_external_id(
+        real_merchant_id, email, email=email, phone="+919999999997", name="SDK Customer"
+    )
+    real_id = customer["customer_id"]
+    assert real_id != email, "precondition: the real id must differ from the external id"
+
+    # Exactly what the SDK sends: customer identified by the external id.
+    await bus.publish(
+        event_type="checkout.started",
+        payload={"checkout_id": unique_checkout_id, "customer_id": email, "amount": 2990, "currency": "INR"},
+        correlation_id=unique_checkout_id,
+        merchant_id=real_merchant_id,
+    )
+
+    stored = await wait_until(
+        lambda: (checkouts_repo.get_checkout(unique_checkout_id) or {}).get("customer_id") == real_id,
+        timeout=10.0,
+    )
+    row = checkouts_repo.get_checkout(unique_checkout_id)
+    assert stored, f"checkout.customer_id was {row and row.get('customer_id')!r}, expected {real_id!r}"

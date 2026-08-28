@@ -72,6 +72,40 @@ def upsert_by_contact(merchant_id: str, email: str = "", phone: str = "", name: 
         return dict(cursor.fetchone())
 
 
+def resolve_customer_id(merchant_id: str, identifier: str) -> Optional[str]:
+    """Maps whatever a storefront called the customer onto our real
+    customer_id.
+
+    The SDK's identify() takes an `externalId` chosen by the merchant - very
+    often an email. That same string then arrives on checkout.started, and
+    it was previously written straight into checkouts.customer_id. The
+    result: consent is recorded against the real id (cust_...), the checkout
+    points at "someone@example.com", the consent lookup finds nothing, and
+    recovery is silently blocked for a customer who HAD granted consent.
+    That failure is invisible - no error anywhere, just a recovery that
+    never happens.
+
+    Accepts a real customer_id, an external_id, or an email/phone, and
+    returns the real customer_id (or None if this merchant has no such
+    customer).
+    """
+    if not identifier:
+        return None
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT customer_id FROM customers
+            WHERE merchant_id = %s
+              AND (customer_id = %s OR external_id = %s OR email = %s OR phone = %s)
+            LIMIT 1
+            """,
+            (merchant_id, identifier, identifier, identifier, identifier),
+        )
+        row = cursor.fetchone()
+    return dict(row)["customer_id"] if row else None
+
+
 def get_customer(customer_id: str) -> Optional[Dict[str, Any]]:
     with get_db() as conn:
         cursor = conn.cursor()
