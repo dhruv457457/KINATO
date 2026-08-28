@@ -45,6 +45,13 @@ from app.agents.audit import execute_tool
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 4
+
+# Live calls want a little warmth so replies don't sound canned. The batch
+# scoreboard sets this to 0.0: a measurement harness whose cases flip
+# between runs is not a measurement. Three cases changed verdict between
+# two consecutive scoreboard runs at 0.2, which made it impossible to tell
+# a real regression from sampling noise.
+LLM_TEMPERATURE = 0.2
 DEFAULT_DEADLINE_S = 8.0
 
 # Multi-turn history per conversation (see module docstring for why this is
@@ -96,7 +103,7 @@ def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: Lis
                 model=settings.LLM_MODEL,
                 messages=state["messages"],
                 tools=[t.to_openai_schema() for t in tools],
-                temperature=0.2,
+                temperature=LLM_TEMPERATURE,
                 timeout=6.0,
             )
         except Exception as e:

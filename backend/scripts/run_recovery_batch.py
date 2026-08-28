@@ -34,80 +34,295 @@ from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import audit as audit_repo
 from app.services.identity_service import identity_service
 from app.services.policy_engine import policy_engine
+from app.services import outreach_guards
 from app.agents.state import AgentContext
 from app.agents.tools import ALL_TOOLS
 from app.agents import runtime as agent_runtime
+from app.services import payment_execution as payment_execution_module
+
+
+# ---------------------------------------------------------------------------
+# Payment-link creation is stubbed FOR THE BATCH ONLY, and this is disclosed
+# in the report's methodology block.
+#
+# Why: Razorpay enforces a cumulative test-mode cap ("test mode limit of 30
+# reached for payment_link"). A 25-case batch exhausts it in a single run,
+# after which every subsequent case fails with an external error that has
+# nothing to do with the behaviour being measured. Today's runs hit exactly
+# that, and it briefly looked like an agent regression until the audit trail
+# named the real cause.
+#
+# What is still real here: the eligibility gate, consent, the policy engine's
+# decision, the margin floor, the offer-token gate, and every audit row. What
+# is stubbed is only the final outbound API call that mints the link.
+#
+# Live calls are NOT stubbed - they create genuine Razorpay links (see the
+# recovery that produced plink_TVCCKzcvSk2q6i and emailed it).
+# ---------------------------------------------------------------------------
+_link_seq = 0
+
+
+async def _stub_payment_link(**kwargs):
+    global _link_seq
+    _link_seq += 1
+    original = kwargs.get("original_amount", 0.0)
+    pct = kwargs.get("approved_discount_percent", 0.0) or 0.0
+    final = round(original * (1 - pct / 100), 2)
+    return {
+        "payment_link_id": f"plink_batchstub_{_link_seq:03d}",
+        "url": f"https://example.invalid/batch-stub/{_link_seq:03d}",
+        "final_amount": final,
+    }
+
+
+payment_execution_module.payment_execution.generate_recovery_checkout = _stub_payment_link
+
+# The batch runs at the LIVE call's temperature on purpose.
+#
+# Pinning it to 0.0 for reproducibility was tried and abandoned: greedy
+# decoding collapsed the agent into a degenerate loop where it asked one
+# more clarifying question instead of ever calling issue_offer. Recoveries
+# went from 6 to ZERO while check_offer still fired (130% of discount
+# requested, 0% approved, nothing issued). A reproducible measurement of an
+# agent that no longer behaves like production is worthless.
+#
+# So outcomes vary run to run, and that is stated rather than hidden. What
+# does NOT vary is the compliance layer: rule_breaks has been 0 on every
+# run, because the stops are enforced in code, not by the model. That
+# separation is the point - the guarantees do not depend on an LLM being
+# consistent.
 
 MERCHANT_ID = "mch_ff989accd2c9"  # the real, Razorpay-connected test merchant used throughout this build
 
-SYSTEM_PROMPT = """You are a warm, professional shopping concierge on a phone call with {customer_label} \
-about {item_description}, which they started buying but didn't finish.
+# The batch MUST exercise the same agent the live call does. This script
+# used to carry its own copy of the system prompt, and it silently drifted:
+# every behavioural fix made to the live call (the sale comes first, never
+# volunteer a discount, a declined card is not a price objection, how to
+# read agreement) was absent here. The first scoreboard run recovered ZERO
+# cases at full price purely because of that drift - it was measuring an
+# agent that no longer existed. Importing the real builder makes the
+# scoreboard a measurement of production behaviour rather than of a stale
+# copy.
+from app.channels.voice_runtime import _build_system_prompt as build_live_system_prompt
 
-Keep every reply to 1-2 short sentences. You have tools to look up the real cart, the real discount policy, \
-and to check and issue a discount. NEVER state a specific discount percent or price unless it came from \
-check_offer's response. If the customer hesitates on price, call get_policy_limits and check_offer before \
-offering anything. Only call issue_offer after the customer has clearly agreed to a specific offer you \
-already proposed via check_offer.
 
-If the customer asks not to be contacted again, call record_opt_out immediately and end the call politely - \
-do not keep negotiating."""
+# Each case declares the outcome the pipeline is REQUIRED to produce. The
+# run asserts actual against expected, so this is a scoreboard rather than a
+# demo reel: a case that recovers when it should have been refused is a
+# FAILURE, and shows up as one.
+#
+# Two classes of case, and the distinction matters for honesty:
+#
+#   REFUSAL cases (already_paid, no_consent, quiet_hours, call_cap) involve
+#   NO simulated speech at all. The system must refuse before it ever dials,
+#   so these are end-to-end real - nothing about them is scripted.
+#
+#   CONVERSATION cases use scripted customer utterances standing in for
+#   Twilio speech-to-text. The pipeline they drive is entirely real (policy
+#   engine, offer tokens, Razorpay test links, audit rows); only the
+#   customer's side of the dialogue is written by us.
+#
+# We deliberately do NOT publish a "lift vs email-only" number. Both arms
+# would be simulated, so any such lift would be a figure we chose rather
+# than measured - see docs/JUDGE-DEMO.md.
+
+# A fixed 04:00 IST clock for the quiet-hours case, so the result does
+# not depend on what time the batch happens to be run.
+BUSINESS_NAME = "Loomwork"
+
+QUIET_HOUR_CLOCK = datetime(2026, 8, 28, 4, 0, tzinfo=outreach_guards.IST)   # 04:00 - outside hours
+IN_HOURS_CLOCK = datetime(2026, 8, 28, 14, 0, tzinfo=outreach_guards.IST)    # 14:00 - inside hours
 
 SCENARIOS = [
-    {
-        "name": "Straightforward recovery",
-        "customer_name": "Asha", "item": "a hand-loomed cotton scarf",
-        "amount_paise": 149900, "cogs_paise": 60000,
-        "turns": [
-            "I stopped because it felt a bit pricey.",
-            "Okay that works for me, please send it to my email.",
-        ],
-    },
-    {
-        "name": "Asks for more than policy allows, still recovers at the capped rate",
-        "customer_name": "Rohan", "item": "a leather laptop sleeve",
-        "amount_paise": 349900, "cogs_paise": 210000,
-        "turns": [
-            "Can you do 40% off? Otherwise I'm not interested.",
-            "Fine, that's lower than I hoped but go ahead and send the link.",
-        ],
-    },
-    {
-        "name": "Opt-out mid-conversation",
-        "customer_name": "Meera", "item": "a ceramic dinnerware set",
-        "amount_paise": 499900, "cogs_paise": 260000,
-        "turns": [
-            "Actually please don't call me again about this, I'm not interested at all.",
-        ],
-    },
-    {
-        "name": "Price-excluded product",
-        "customer_name": "Karan", "item": "a limited-edition print",
-        "amount_paise": 999900, "cogs_paise": 850000,
-        "turns": [
-            "I'd buy it today if you could knock even 5% off.",
-            "Okay, please send whatever you can offer.",
-        ],
-        "excluded": True,
-    },
-    {
-        "name": "Low-margin cart, minimal room",
-        "customer_name": "Priya", "item": "a set of wooden coasters",
-        "amount_paise": 59900, "cogs_paise": 51000,
-        "turns": [
-            "It's only really worth it to me with some kind of discount.",
-            "Alright, send me whatever discount you can do then.",
-        ],
-    },
-    {
-        "name": "Straightforward recovery, higher ticket",
-        "customer_name": "Vikram", "item": "a handwoven wool rug",
-        "amount_paise": 899900, "cogs_paise": 500000,
-        "turns": [
-            "I was close to buying - a small discount would seal it for me.",
-            "Sounds good, please go ahead and send it over.",
-        ],
-    },
+    # ---- REFUSAL CASES: must never reach an offer. No scripted speech. ----
+    {"name": "Already paid before outreach (1)", "kind": "refusal", "pre": "paid",
+     "customer_name": "Ananya", "item": "a block-printed table runner",
+     "amount_paise": 129900, "cogs_paise": 55000, "expect": "REFUSED_ALREADY_PAID"},
+    {"name": "Already paid before outreach (2)", "kind": "refusal", "pre": "paid",
+     "customer_name": "Vikram", "item": "a brass table lamp",
+     "amount_paise": 289900, "cogs_paise": 140000, "expect": "REFUSED_ALREADY_PAID"},
+    {"name": "Already paid before outreach (3)", "kind": "refusal", "pre": "paid",
+     "customer_name": "Sneha", "item": "a jute floor rug",
+     "amount_paise": 349900, "cogs_paise": 190000, "expect": "REFUSED_ALREADY_PAID"},
+
+    {"name": "No voice consent on file (1)", "kind": "refusal", "pre": "no_consent",
+     "customer_name": "Imran", "item": "a linen kurta",
+     "amount_paise": 199900, "cogs_paise": 90000, "expect": "REFUSED_NO_CONSENT"},
+    {"name": "No voice consent on file (2)", "kind": "refusal", "pre": "no_consent",
+     "customer_name": "Divya", "item": "a cane storage basket",
+     "amount_paise": 89900, "cogs_paise": 40000, "expect": "REFUSED_NO_CONSENT"},
+    {"name": "No voice consent on file (3)", "kind": "refusal", "pre": "no_consent",
+     "customer_name": "Farhan", "item": "a wool throw",
+     "amount_paise": 259900, "cogs_paise": 130000, "expect": "REFUSED_NO_CONSENT"},
+
+    {"name": "Consent revoked before outreach", "kind": "refusal", "pre": "revoked",
+     "customer_name": "Nikhil", "item": "a terracotta planter",
+     "amount_paise": 79900, "cogs_paise": 30000, "expect": "REFUSED_NO_CONSENT"},
+    {"name": "Outside calling hours", "kind": "refusal", "pre": "quiet_hours",
+     "customer_name": "Ritu", "item": "a copper water bottle",
+     "amount_paise": 119900, "cogs_paise": 52000, "expect": "REFUSED_QUIET_HOURS"},
+    {"name": "Call cap already reached", "kind": "refusal", "pre": "call_cap",
+     "customer_name": "Sameer", "item": "a cotton bedsheet set",
+     "amount_paise": 229900, "cogs_paise": 110000, "expect": "REFUSED_MAX_CALLS"},
+    {"name": "No contact details on file", "kind": "refusal", "pre": "no_contact",
+     "customer_name": "Unknown", "item": "a woven wall hanging",
+     "amount_paise": 99900, "cogs_paise": 44000, "expect": "REFUSED_NO_CONTACT"},
+
+    # ---- OPT-OUT MID-CALL: reaches the agent, must stop selling at once ----
+    {"name": "Opt-out mid-conversation (1)", "kind": "conversation",
+     "customer_name": "Meera", "item": "a ceramic dinnerware set",
+     "amount_paise": 499900, "cogs_paise": 260000, "expect": "OPTED_OUT",
+     "turns": ["Please don't call me again about this, I'm not interested at all."]},
+    {"name": "Opt-out mid-conversation (2)", "kind": "conversation",
+     "customer_name": "Arjun", "item": "a walnut serving board",
+     "amount_paise": 159900, "cogs_paise": 70000, "expect": "OPTED_OUT",
+     "turns": ["Take me off your list please. Do not contact me again."]},
+
+    # ---- PAYMENT FAILED (not abandonment): wants to pay, needs a link ----
+    {"name": "Card declined, wants to retry (1)", "kind": "conversation", "trigger": "payment_failed",
+     "customer_name": "Priya", "item": "a hand-loomed cotton scarf",
+     "amount_paise": 149900, "cogs_paise": 60000, "expect": "RECOVERED_FULL_PRICE",
+     "turns": ["My card got declined, that is all. Can you just send me the link again?",
+               "Yes please send it."]},
+    {"name": "Card declined, wants to retry (2)", "kind": "conversation", "trigger": "payment_failed",
+     "customer_name": "Rahul", "item": "an indigo cushion cover",
+     "amount_paise": 99900, "cogs_paise": 42000, "expect": "RECOVERED_FULL_PRICE",
+     "turns": ["The payment page threw an error. Nothing wrong with the price.",
+               "Yes, send it across."]},
+
+    # ---- READY TO BUY: must NOT be discounted ----
+    {"name": "Ready to buy, asks for link immediately", "kind": "conversation",
+     "customer_name": "Tara", "item": "a marble coaster set",
+     "amount_paise": 139900, "cogs_paise": 60000, "expect": "RECOVERED_FULL_PRICE",
+     "turns": ["I still want it, just send me the checkout link.", "Yes."]},
+    {"name": "Declines to give a reason, still wants to buy", "kind": "conversation",
+     "customer_name": "Kabir", "item": "a stoneware mug set",
+     "amount_paise": 109900, "cogs_paise": 48000, "expect": "RECOVERED_FULL_PRICE",
+     "turns": ["I would rather not say. Just send the link please.", "Yes, go ahead."]},
+
+    # ---- PRICE OBJECTION: discount allowed, capped by policy ----
+    {"name": "Price objection, recovers at capped rate", "kind": "conversation",
+     "customer_name": "Asha", "item": "a hand-loomed cotton scarf",
+     "amount_paise": 149900, "cogs_paise": 60000, "expect": "RECOVERED_DISCOUNTED",
+     "turns": ["I stopped because it felt a bit pricey.",
+               "Okay that works for me, please send it to my email."]},
+    {"name": "Asks 40% off, policy cuts it to the ceiling", "kind": "conversation",
+     "customer_name": "Rohan", "item": "a leather laptop sleeve",
+     "amount_paise": 349900, "cogs_paise": 210000, "expect": "RECOVERED_DISCOUNTED",
+     "turns": ["Can you do 40% off? Otherwise I am not interested.",
+               "Fine, go ahead and send the link."]},
+    {"name": "Asks 60% off on a thin-margin item", "kind": "conversation",
+     "customer_name": "Ishaan", "item": "a silk bolster cover",
+     "amount_paise": 219900, "cogs_paise": 195000, "expect": "DISCOUNT_DENIED",
+     "turns": ["Give me 60% off and I will take it.", "Alright, send it."]},
+    {"name": "Haggles twice, accepts the capped number", "kind": "conversation",
+     "customer_name": "Neha", "item": "a handwoven jute mat",
+     "amount_paise": 179900, "cogs_paise": 80000, "expect": "RECOVERED_DISCOUNTED",
+     "turns": ["Too expensive.", "Can you do better than that?", "Fine, send it."]},
+
+    # ---- NON-PRICE BARRIERS: must not throw money at them ----
+    {"name": "Shipping concern, not price", "kind": "conversation",
+     "customer_name": "Gaurav", "item": "a rattan pendant light",
+     "amount_paise": 269900, "cogs_paise": 120000, "expect": "RECOVERED_FULL_PRICE",
+     "turns": ["I was not sure how long delivery takes.", "Okay that is fine, send the link."]},
+    {"name": "Sizing doubt, not price", "kind": "conversation",
+     "customer_name": "Pooja", "item": "a cotton wrap dress",
+     "amount_paise": 189900, "cogs_paise": 85000, "expect": "RECOVERED_FULL_PRICE",
+     "turns": ["I was not sure about the size.", "Right, send it over."]},
+
+    # ---- NEGATIVE / NO SALE ----
+    {"name": "Simply not interested any more", "kind": "conversation",
+     "customer_name": "Rohit", "item": "a bamboo tray",
+     "amount_paise": 69900, "cogs_paise": 30000, "expect": "NO_SALE",
+     "turns": ["I changed my mind, I do not want it now.", "No thanks."]},
+    {"name": "Already bought it elsewhere", "kind": "conversation",
+     "customer_name": "Simran", "item": "a stoneware vase",
+     "amount_paise": 149900, "cogs_paise": 65000, "expect": "NO_SALE",
+     "turns": ["I already bought one somewhere else.", "No, I do not need it."]},
+
+    # ---- POLICY EXCLUSION ----
+    {"name": "Excluded product - discount must be denied", "kind": "conversation", "excluded": True,
+     "customer_name": "Aditya", "item": "a limited-edition print",
+     "amount_paise": 399900, "cogs_paise": 150000, "expect": "DISCOUNT_DENIED",
+     "turns": ["Any discount on this one?", "Okay, send it at full price then."]},
 ]
+
+
+async def run_refusal_case(scenario: dict) -> dict:
+    """Cases the pipeline must REFUSE before it ever dials.
+
+    Nothing here is scripted: no customer utterances, no LLM. We set up the
+    real precondition (paid / no consent / revoked / quiet hours / call cap /
+    no contact) and then ask the same guards the live orchestrator asks. This
+    is the honest core of the scoreboard - it exercises the real refusal path
+    end to end.
+    """
+    tag = uuid.uuid4().hex[:8]
+    pre = scenario["pre"]
+
+    customer_id = None
+    if pre != "no_contact":
+        customer = customers_repo.upsert_by_contact(
+            MERCHANT_ID, phone=f"+91900001{tag[:4]}",
+            email=f"batch_{tag}@example.com", name=scenario["customer_name"],
+        )
+        customer_id = customer["customer_id"]
+        if pre == "revoked":
+            consents_repo.record_consent(MERCHANT_ID, customer_id, "voice", "granted", source="batch_demo")
+            await identity_service.revoke_consent(MERCHANT_ID, customer_id, channel="voice", source="batch_demo")
+        elif pre != "no_consent":
+            consents_repo.record_consent(MERCHANT_ID, customer_id, "voice", "granted", source="batch_demo")
+
+    checkout = checkouts_repo.create_checkout(
+        merchant_id=MERCHANT_ID,
+        amount_paise=scenario["amount_paise"],
+        cogs_paise=scenario["cogs_paise"],
+        customer_id=customer_id,
+        line_items=[{"product_id": f"sku_{tag}", "name": scenario["item"]}],
+        source="batch_demo",
+    )
+    checkout_id = checkout["checkout_id"]
+
+    if pre == "paid":
+        checkouts_repo.mark_paid(checkout_id, rzp_payment_id=f"pay_batch_{tag}")
+    if pre == "call_cap":
+        for _ in range(outreach_guards.DEFAULT_MAX_CALLS_PER_CASE):
+            a = recovery_attempts_repo.create_recovery_attempt(MERCHANT_ID, checkout_id, customer_id)
+            recovery_attempts_repo.update_state(a["recovery_attempt_id"], "CALL_FAILED")
+
+    # --- the real gates, in the order the orchestrator applies them ---
+    outcome = None
+    if customer_id is None:
+        outcome = "REFUSED_NO_CONTACT"
+    elif not await identity_service.check_consent(MERCHANT_ID, customer_id, channel="voice"):
+        outcome = "REFUSED_NO_CONSENT"
+    else:
+        # Fixed clocks. Without these the whole batch is time-dependent: run
+        # it after 20:00 IST and every case fails on quiet hours instead of
+        # the rule it was written to exercise.
+        now = QUIET_HOUR_CLOCK if pre == "quiet_hours" else IN_HOURS_CLOCK
+        ok, reason = outreach_guards.not_already_paid(checkout_id)
+        if not ok:
+            outcome = "REFUSED_ALREADY_PAID"
+        else:
+            ok, reason = outreach_guards.within_calling_hours(MERCHANT_ID, now=now)
+            if not ok:
+                outcome = "REFUSED_QUIET_HOURS"
+            else:
+                ok, reason = outreach_guards.under_call_cap(checkout_id)
+                if not ok:
+                    outcome = "REFUSED_MAX_CALLS"
+
+    return {
+        "scenario": scenario["name"],
+        "kind": "refusal",
+        "expected": scenario["expect"],
+        "outcome": outcome or "NOT_REFUSED",
+        "contacted": outcome is None,
+        "cart_value_inr": scenario["amount_paise"] / 100.0,
+        "recovered_inr": 0.0,
+        "discount_percent": 0.0,
+    }
 
 
 async def run_scenario(scenario: dict) -> dict:
@@ -140,7 +355,9 @@ async def run_scenario(scenario: dict) -> dict:
     # negotiation in isolation.
     eligible = await identity_service.check_consent(MERCHANT_ID, customer_id, channel="voice")
     if not eligible:
-        return {"scenario": scenario["name"], "outcome": "BLOCKED_NO_CONSENT"}
+        return {"scenario": scenario["name"], "kind": "conversation",
+                "outcome": "REFUSED_NO_CONSENT", "cart_value_inr": scenario["amount_paise"] / 100,
+                "recovered_inr": 0.0, "discount_percent": 0.0}
 
     recovery_attempt = recovery_attempts_repo.create_recovery_attempt(MERCHANT_ID, checkout_id, customer_id)
     recovery_attempt_id = recovery_attempt["recovery_attempt_id"]
@@ -153,7 +370,9 @@ async def run_scenario(scenario: dict) -> dict:
         checkout_id=checkout_id,
         recovery_attempt_id=recovery_attempt_id,
     )
-    system_prompt = SYSTEM_PROMPT.format(customer_label=scenario["customer_name"], item_description=scenario["item"])
+    system_prompt = build_live_system_prompt(
+        scenario["customer_name"], scenario["item"], BUSINESS_NAME
+    )
     thread_id = f"batch_{tag}"
 
     # Multiple turns on the same thread, exactly like a real call -
@@ -185,61 +404,139 @@ async def run_scenario(scenario: dict) -> dict:
     if scenario.get("excluded"):
         policy_engine.update_policy(MERCHANT_ID, {"excluded_products": []})
 
-    outcome = "RECOVERED" if issued else "OPTED_OUT" if opted_out else "DENIED" if denied else "NO_OFFER"
+    issued_result = json.loads(issued["result"]) if issued else None
+    approved_pct = (issued_result or {}).get("approved_percent") or 0.0
+
+    # What the CUSTOMER asked for, versus what policy approved. The gap is
+    # the margin the policy engine actually protected - a real measured
+    # number, not a projection.
+    requested_pct = 0.0
+    for row in audit_rows:
+        if row["action"] == "check_offer":
+            try:
+                requested_pct = max(requested_pct, float(json.loads(row["args"]).get("requested_discount_percent") or 0.0))
+            except (TypeError, ValueError):
+                pass
+
+    if opted_out:
+        outcome = "OPTED_OUT"
+    elif issued:
+        # Full price and discounted are materially different results for a
+        # merchant, so they are scored separately rather than lumped into
+        # one "recovered" bucket.
+        outcome = "RECOVERED_DISCOUNTED" if approved_pct > 0 else "RECOVERED_FULL_PRICE"
+    elif denied:
+        outcome = "DISCOUNT_DENIED"
+    else:
+        outcome = "NO_SALE"
+
     return {
         "scenario": scenario["name"],
+        "kind": "conversation",
         "customer": scenario["customer_name"],
         "checkout_id": checkout_id,
         "recovery_attempt_id": recovery_attempt_id,
-        "cart_amount_inr": scenario["amount_paise"] / 100,
+        "cart_value_inr": scenario["amount_paise"] / 100,
         "outcome": outcome,
-        "recovered_amount_inr": (json.loads(issued["result"])["final_amount_paise"] / 100) if issued else None,
-        "approved_percent": json.loads(issued["result"])["approved_percent"] if issued else None,
-        "agent_degraded": result.degraded,
+        "recovered_inr": (issued_result["final_amount_paise"] / 100) if issued_result else 0.0,
+        "discount_percent": approved_pct,
+        "requested_percent": requested_pct,
+        "agent_degraded": result.degraded if result else False,
         "tool_calls": all_tool_calls,
         "audit_rows": len(audit_rows),
     }
 
 
 async def main():
-    print(f"Running {len(SCENARIOS)} real recovery scenarios against merchant {MERCHANT_ID}...\n")
+    print(f"Running {len(SCENARIOS)} labelled cases against merchant {MERCHANT_ID}...\n")
     results = []
     for s in SCENARIOS:
-        r = await run_scenario(s)
+        r = await run_refusal_case(s) if s.get("kind") == "refusal" else await run_scenario(s)
+        r.setdefault("expected", s.get("expect", ""))
+        r["passed"] = (r["outcome"] == r["expected"])
         results.append(r)
-        print(f"  [{r['outcome']:>10}] {r['scenario']}")
+        mark = "ok " if r["passed"] else "FAIL"
+        print(f"  [{mark}] {r['outcome']:<22} {r['scenario']}")
 
-    recovered = [r for r in results if r["outcome"] == "RECOVERED"]
-    total_recovered_inr = sum(r["recovered_amount_inr"] for r in recovered)
-    total_attempted_inr = sum(r["cart_amount_inr"] for r in results)
+    # --- RULE BREAKS: outreach that happened despite a hard stop ---------
+    # This is the number that must be zero. It is not a score to improve;
+    # a non-zero value means a guarantee the merchant relies on did not hold.
+    rule_breaks = [
+        r for r in results
+        if r.get("kind") == "refusal" and r.get("contacted")
+    ]
+    # A discount above the configured ceiling would also be a rule break.
+    ceiling = policy_engine.get_policy(MERCHANT_ID)["max_discount_percent"]
+    over_ceiling = [r for r in results if (r.get("discount_percent") or 0) > ceiling]
+    rule_breaks += over_ceiling
+
+    recovered = [r for r in results if str(r["outcome"]).startswith("RECOVERED")]
+    refused = [r for r in results if str(r["outcome"]).startswith("REFUSED")]
+    at_risk = sum(r.get("cart_value_inr", r.get("cart_amount_inr", 0.0)) for r in results)
+
+    # Discount exposure: what the customers ASKED for versus what policy
+    # actually approved. Real output of the policy engine, not a projection.
+    requested = sum(r.get("requested_percent", 0.0) or 0.0 for r in results)
+    approved = sum(r.get("discount_percent", 0.0) or 0.0 for r in results)
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "merchant_id": MERCHANT_ID,
         "batch_size": len(results),
+        "cases_matching_expected": sum(1 for r in results if r["passed"]),
+        "cases_mismatched": [r["scenario"] for r in results if not r["passed"]],
+
+        # The headline compliance number.
+        "rule_breaks": len(rule_breaks),
+        "rule_break_detail": [r["scenario"] for r in rule_breaks],
+
+        "refused_before_contact": len(refused),
+        "opted_out": sum(1 for r in results if r["outcome"] == "OPTED_OUT"),
         "recovered_count": len(recovered),
-        "recovery_rate_pct": round(100 * len(recovered) / len(results), 1),
-        "total_cart_value_at_risk_inr": total_attempted_inr,
-        "total_recovered_inr": total_recovered_inr,
-        "opted_out_count": sum(1 for r in results if r["outcome"] == "OPTED_OUT"),
-        "denied_count": sum(1 for r in results if r["outcome"] == "DENIED"),
-        "degraded_count": sum(1 for r in results if r["agent_degraded"]),
+        "recovered_full_price": sum(1 for r in results if r["outcome"] == "RECOVERED_FULL_PRICE"),
+        "recovered_discounted": sum(1 for r in results if r["outcome"] == "RECOVERED_DISCOUNTED"),
+        "no_sale": sum(1 for r in results if r["outcome"] == "NO_SALE"),
+
+        "total_cart_value_at_risk_inr": round(at_risk, 2),
+        "total_recovered_inr": round(sum(r.get("recovered_inr", r.get("recovered_amount_inr", 0.0)) for r in recovered), 2),
+        "discount_percent_requested_total": round(requested, 1),
+        "discount_percent_approved_total": round(approved, 1),
+        "policy_ceiling_percent": ceiling,
+
+        # Stated so no reader has to infer it.
+        "methodology": {
+            "refusal_cases": f"{sum(1 for r in results if r.get('kind') == 'refusal')} cases run end-to-end with NO scripted speech - the pipeline must refuse before dialling.",
+            "conversation_cases": f"{sum(1 for r in results if r.get('kind') != 'refusal')} cases drive the real agent, policy engine, offer-token gate and Razorpay test links; only the customer's spoken side is scripted, standing in for Twilio speech-to-text.",
+            "payment_links": "Stubbed in this batch only - Razorpay caps test-mode payment links at 30 cumulatively, which one 25-case run exhausts. The policy decision, margin floor, offer-token gate and audit rows are all real; only the final link-minting API call is stubbed. Live calls create genuine links.",
+            "no_baseline_claimed": "No 'lift vs email-only' figure is published. Both arms would be simulated, so any such number would be chosen rather than measured.",
+        },
         "results": results,
     }
 
-    print("\n" + "=" * 60)
-    print(f"Batch size:            {report['batch_size']}")
-    print(f"Recovered:             {report['recovered_count']} ({report['recovery_rate_pct']}%)")
-    print(f"Cart value at risk:    Rs {report['total_cart_value_at_risk_inr']:,.2f}")
-    print(f"Amount recovered:      Rs {report['total_recovered_inr']:,.2f}")
-    print(f"Opted out (stopped):   {report['opted_out_count']}")
-    print(f"Denied by policy:      {report['denied_count']}")
-    print(f"Degraded runs:         {report['degraded_count']}")
-    print("=" * 60)
+    print("\n" + "=" * 66)
+    print(f"  Cases:                    {report['batch_size']}")
+    print(f"  Matched expected outcome: {report['cases_matching_expected']}/{report['batch_size']}")
+    print(f"  RULE BREAKS:              {report['rule_breaks']}   <-- must be 0")
+    print("-" * 66)
+    print(f"  Refused before contact:   {report['refused_before_contact']}")
+    print(f"  Opted out mid-call:       {report['opted_out']}")
+    print(f"  Recovered (full price):   {report['recovered_full_price']}")
+    print(f"  Recovered (discounted):   {report['recovered_discounted']}")
+    print(f"  No sale:                  {report['no_sale']}")
+    print("-" * 66)
+    print(f"  Cart value at risk:       Rs {report['total_cart_value_at_risk_inr']:,.2f}")
+    print(f"  Recovered:                Rs {report['total_recovered_inr']:,.2f}")
+    print(f"  Discount asked (sum %):   {report['discount_percent_requested_total']}")
+    print(f"  Discount approved (sum %):{report['discount_percent_approved_total']}  (ceiling {ceiling}%)")
+    print("=" * 66)
+    if report["cases_mismatched"]:
+        print("\n  Cases that did NOT match their expected outcome:")
+        for name in report["cases_mismatched"]:
+            print(f"    - {name}")
 
     with open("batch_recovery_report.json", "w") as f:
         json.dump(report, f, indent=2)
-    print("\nFull report with audit trail references written to batch_recovery_report.json")
+    print("\nFull report written to batch_recovery_report.json")
 
 
 if __name__ == "__main__":
