@@ -19,6 +19,7 @@ the real checkout and customer rows instead.
 """
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -27,6 +28,7 @@ from app.core.config import settings
 from app.gateway.event_bus import bus
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
+from app.db.repositories import merchants as merchants_repo
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,30 @@ def _describe_cart(checkout: Dict[str, Any]) -> str:
     return "your order"
 
 
+_PLACEHOLDER_PATTERN = re.compile(
+    r"\[[^\]]{1,40}\]"           # [Your Name], [Company], [product]
+    r"|\{[^}]{1,40}\}"            # {name}, {{company}}
+    r"|<[^>]{1,40}>"              # <name>
+    r"|\byour (?:name|company|business|store)\b"  # bare "Your Company"
+    r"|\bxyz\b|\bacme\b",
+    re.IGNORECASE,
+)
+
+
+def contains_placeholder(text: str) -> bool:
+    """True if this text still contains a template slot.
+
+    An opening line is SPOKEN ALOUD to a real customer, and nothing
+    downstream fills these in - a model that writes "this is [Your Name]
+    from [Your Company]" produces a call that reads those brackets out.
+    That happened on a real call. The prompt now forbids it, but a prompt
+    is a request, not a guarantee, so this is the structural check: any
+    line matching here is discarded in favour of a safe line that simply
+    names nobody.
+    """
+    return bool(text) and bool(_PLACEHOLDER_PATTERN.search(text))
+
+
 class RecoveryStrategist:
     @staticmethod
     async def handle_opportunity_created(event: Dict[str, Any]):
@@ -70,7 +96,18 @@ class RecoveryStrategist:
         item_description = _describe_cart(checkout)
         amount = checkout["amount_paise"] / 100.0
 
-        plan = await RecoveryStrategist._generate_plan(customer_name, item_description, amount)
+        # Who the agent says it is. If the merchant has no usable business
+        # name on file we pass an empty string and the opening line simply
+        # doesn't name one - far better than the model inventing a
+        # placeholder and reading "[Your Company]" aloud to a customer.
+        business_name = ""
+        try:
+            merchant = merchants_repo.get_merchant(merchant_id) if merchant_id else None
+            business_name = ((merchant or {}).get("name") or "").strip()
+        except Exception:
+            business_name = ""
+
+        plan = await RecoveryStrategist._generate_plan(customer_name, item_description, amount, business_name)
 
         await bus.publish(
             event_type="recovery.plan_ready",
@@ -80,7 +117,7 @@ class RecoveryStrategist:
         )
 
     @staticmethod
-    async def _generate_plan(customer_name: str, item_description: str, amount: float) -> CallPlan:
+    async def _generate_plan(customer_name: str, item_description: str, amount: float, business_name: str = "") -> CallPlan:
         greeting_name = f" Is this {customer_name}?" if customer_name else ""
         if not settings.OPENROUTER_API_KEY:
             return CallPlan(
@@ -90,10 +127,21 @@ class RecoveryStrategist:
                 degraded=True,
             )
 
+        who = (
+            f"You are calling on behalf of {business_name}. You may say that name."
+            if business_name
+            else "You do NOT know the caller's name or the business name. Do not state either one - "
+                 "open with the reason for the call instead."
+        )
         prompt = (
             f"Write a one-sentence warm, natural phone opening line for a checkout-recovery call, and one short "
-            f"talking point to use if the customer hesitates on price. Customer name: {customer_name or 'unknown - do not guess a name'}. "
+            f"talking point to use if the customer hesitates on price. "
+            f"{who} "
+            f"Customer name: {customer_name or 'unknown - do not guess a name'}. "
             f"Item(s): {item_description}. Cart total: INR {amount:.2f}. "
+            f"This text is SPOKEN ALOUD to a real customer. NEVER output a placeholder, bracket, or template "
+            f"slot such as [Your Name], [Your Company], {{name}} or XYZ - there is no later step that fills "
+            f"them in. If you do not know a fact, leave it out entirely. "
             f"Do not invent product details you weren't given. Output JSON with keys: opening_line, talking_point."
         )
         try:
@@ -110,11 +158,21 @@ class RecoveryStrategist:
                 timeout=4.0,
             )
             parsed = json.loads(response.choices[0].message.content)
-            return CallPlan(
-                opening_line=parsed.get("opening_line") or f"Hi there!{greeting_name} I wanted to help you finish your order.",
-                talking_point=parsed.get("talking_point", ""),
-                degraded=False,
+            safe_fallback = (
+                f"Hi there!{greeting_name} I noticed you were checking out {item_description} "
+                f"and wanted to see if I could help you finish that up."
             )
+            line = parsed.get("opening_line") or safe_fallback
+            if contains_placeholder(line):
+                logger.warning(
+                    "RecoveryStrategist: model returned an opening line containing a placeholder "
+                    f"({line!r}) - discarding it rather than speaking it to a customer."
+                )
+                line = safe_fallback
+            talking_point = parsed.get("talking_point", "")
+            if contains_placeholder(talking_point):
+                talking_point = ""
+            return CallPlan(opening_line=line, talking_point=talking_point, degraded=False)
         except Exception as e:
             logger.warning(f"RecoveryStrategist LLM call failed, using heuristic plan: {e}")
             return CallPlan(
