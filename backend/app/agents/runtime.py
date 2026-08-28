@@ -67,7 +67,7 @@ def _get_llm_client():
     return AsyncOpenAI(base_url=settings.LLM_BASE_URL, api_key=settings.OPENROUTER_API_KEY, http_client=ipv4_client())
 
 
-def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: List[str]):
+def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: List[str], inflight_mutations: list):
     """tool_calls_tracker is a plain list owned by the caller (run_agent),
     appended to directly here rather than only through the graph's own
     state - a real, confirmed bug: when the overall deadline_s wrapper in
@@ -144,7 +144,26 @@ def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: Lis
             if tool is None:
                 result = {"status": "REJECTED", "reason": f"unknown_tool: {name}"}
             else:
-                result = await execute_tool(tool, args, ctx)
+                if tool.mutating:
+                    # A mutating tool MOVES MONEY. asyncio.wait_for cancels
+                    # whatever it is waiting on when the deadline passes, and
+                    # on a real call that killed issue_offer *after* it had
+                    # created a live Razorpay payment link but before it
+                    # recorded the call or dispatched the email - so the
+                    # customer was told "someone will follow up" while a real
+                    # link sat unsent. Shielding means a money action that has
+                    # started always finishes; the deadline may end the
+                    # conversation turn, never a half-applied effect.
+                    # Track the INNER task, not the shield wrapper: cancelling
+                    # a shield cancels only the wrapper, and if that is all we
+                    # kept a handle to, the real work becomes unreachable and
+                    # unawaitable - which is precisely the half-applied effect
+                    # this is meant to prevent.
+                    inner = asyncio.create_task(execute_tool(tool, args, ctx))
+                    inflight_mutations.append((tool.name, inner))
+                    result = await asyncio.shield(inner)
+                else:
+                    result = await execute_tool(tool, args, ctx)
                 state["tool_calls_made"].append(tool.name)
                 tool_calls_tracker.append(tool.name)  # survives even if the overall run later times out
             return {"tool_call_id": tc["id"], "role": "tool", "name": name, "content": json.dumps(result)}
@@ -216,7 +235,29 @@ async def run_agent(
     # already-executed tool calls (real audit rows, real money moved)
     # disappear from the result as if they never happened.
     tool_calls_tracker: List[str] = []
-    graph = _build_graph(tools, max_iterations, tool_calls_tracker)
+    # Money actions started but not yet finished when the deadline fires.
+    # They are shielded from cancellation (see run_one), so they WILL
+    # complete - we just have to wait for them before reporting, or we would
+    # tell the customer nothing happened while a real payment link was being
+    # created behind them. That exact contradiction happened on a live call.
+    inflight_mutations: list = []
+    graph = _build_graph(tools, max_iterations, tool_calls_tracker, inflight_mutations)
+
+    async def _settle_inflight_mutations(grace_s: float = 6.0) -> None:
+        pending = [(n, t) for n, t in inflight_mutations if not t.done()]
+        if not pending:
+            return
+        logger.warning(
+            f"Deadline hit with {len(pending)} money action(s) still running "
+            f"({[n for n, _ in pending]}) - waiting for them rather than reporting a half-applied effect."
+        )
+        try:
+            await asyncio.wait_for(asyncio.gather(*(t for _, t in pending), return_exceptions=True), timeout=grace_s)
+        except asyncio.TimeoutError:
+            logger.error(f"Money action(s) {[n for n, _ in pending]} did not settle within {grace_s}s.")
+        for name, task in inflight_mutations:
+            if task.done() and not task.cancelled() and task.exception() is None and name not in tool_calls_tracker:
+                tool_calls_tracker.append(name)
 
     try:
         final_state = await asyncio.wait_for(
@@ -224,6 +265,7 @@ async def run_agent(
             timeout=deadline_s,
         )
     except asyncio.TimeoutError:
+        await _settle_inflight_mutations()
         return AgentResult(ok=False, error="deadline_exceeded", degraded=True, tool_calls_made=list(tool_calls_tracker))
     except GraphRecursionError:
         return AgentResult(ok=False, error="recursion_limit_reached", degraded=True, tool_calls_made=list(tool_calls_tracker))

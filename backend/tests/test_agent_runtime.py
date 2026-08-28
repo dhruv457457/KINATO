@@ -6,11 +6,12 @@ Day 5 verification, per the rebuild plan:
   - a degraded agent cannot mutate
   - no tool schema accepts a forbidden argument name
 """
+import asyncio
 import uuid
 import pytest
 
 from app.agents.state import AgentContext
-from app.agents.tools import ALL_TOOLS, FORBIDDEN_ARG_NAMES, check_offer, issue_offer
+from app.agents.tools import ALL_TOOLS, FORBIDDEN_ARG_NAMES, Tool, check_offer, issue_offer
 from app.agents.audit import execute_tool
 from app.agents import runtime as agent_runtime
 from app.db.repositories import checkouts as checkouts_repo
@@ -250,3 +251,63 @@ class TestMaxIterations:
         assert result.ok is True
         assert result.degraded is True
         assert result.output["reason"] == "no_llm_api_key_configured"
+
+
+class _CallsSlowMoneyToolClient:
+    """Fakes the model asking for the slow money tool, once."""
+
+    class _Chat:
+        class _Completions:
+            async def create(self, **kwargs):
+                return _FakeResponse(
+                    _FakeMessage(
+                        content=None,
+                        tool_calls=[_FakeToolCall(f"call_{uuid.uuid4().hex[:6]}", "issue_offer", "{}")],
+                    )
+                )
+
+        completions = _Completions()
+
+    chat = _Chat()
+
+
+class TestMoneyActionsSurviveTheDeadline:
+    """A live call proved this one. issue_offer created a real Razorpay
+    payment link, and 1.5s later asyncio.wait_for's deadline cancelled the
+    agent mid-tool: the link existed but was never recorded, no email went
+    out, and the customer was told "someone will follow up by email" - the
+    exact opposite of what had just happened.
+
+    A money action that has started must always finish, and must always be
+    reported, even when the conversation turn runs out of time.
+    """
+
+    async def test_money_action_completes_and_is_reported_after_deadline(self, monkeypatch, real_merchant_id):
+        applied = []
+
+        async def _slow_money_move(ctx, **kwargs):
+            await asyncio.sleep(1.0)          # outlives the deadline below
+            applied.append("applied")
+            return {"status": "APPLIED"}
+
+        slow_tool = Tool(
+            name="issue_offer",
+            description="test double for a slow money action",
+            parameters={}, required=[], fn=_slow_money_move, mutating=True,
+        )
+        monkeypatch.setattr(agent_runtime, "_get_llm_client", lambda: _CallsSlowMoneyToolClient())
+
+        result = await agent_runtime.run_agent(
+            system_prompt="test",
+            user_message="go",
+            ctx=_ctx(real_merchant_id),
+            tools=[slow_tool],
+            max_iterations=2,
+            deadline_s=0.3,                   # fires while the tool is still running
+        )
+
+        assert applied == ["applied"], "the deadline cancelled a money action that had already started"
+        assert "issue_offer" in result.tool_calls_made, (
+            "a completed money action was not reported, so the caller would tell the customer "
+            f"nothing happened. got: {result.tool_calls_made}"
+        )
