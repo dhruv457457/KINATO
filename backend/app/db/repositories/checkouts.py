@@ -20,6 +20,15 @@ def create_checkout(
     source: str = "sdk",
     checkout_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Idempotent by checkout_id.
+
+    Razorpay retries a webhook on any non-2xx and fires several events for
+    the same payment, all of which derive the SAME checkout_id
+    (chk_wh_<payment_id>). Without ON CONFLICT the second delivery raised
+    UniqueViolation -> 500 -> Razorpay retried -> 500 again: a self-
+    reinforcing loop that also meant the webhook was never acknowledged.
+    Re-creating an existing checkout now simply returns the existing row.
+    """
     checkout_id = checkout_id or new_id("chk")
     with get_db() as conn:
         cursor = conn.cursor()
@@ -28,6 +37,7 @@ def create_checkout(
             INSERT INTO checkouts (checkout_id, merchant_id, customer_id, cart_id, amount_paise,
                                     currency, cogs_paise, line_items, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (checkout_id) DO NOTHING
             """,
             (checkout_id, merchant_id, customer_id, cart_id, amount_paise, currency,
              cogs_paise, json.dumps(line_items or []), source),

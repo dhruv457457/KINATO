@@ -37,7 +37,14 @@ from app.core.net import ipv4_client
 # cap on the WHOLE opportunistic-ElevenLabs attempt inside voice_block(),
 # regardless of how many retries happen inside it, so the Neural fallback
 # always has time to run and Twilio never has to guess.
-ELEVENLABS_BUDGET_S = 4.0
+# Lowered from 4.0 after a real call dropped: every second spent waiting on
+# ElevenLabs is a second charged against Twilio's ~15s webhook deadline, and
+# blowing that deadline ends the call. ElevenLabs has also been the least
+# reliable dependency in this system by a wide margin (see FINDINGS), so the
+# expected value of waiting longer is low while the cost of the timeout is a
+# dead call. Twilio's own Neural voice renders on Twilio's infrastructure
+# and cannot fail from our side.
+ELEVENLABS_BUDGET_S = 2.0
 
 logger = logging.getLogger(__name__)
 

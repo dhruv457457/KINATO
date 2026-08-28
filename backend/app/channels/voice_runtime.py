@@ -68,11 +68,22 @@ voice_router = APIRouter()
 # too tight for a full negotiation (cart -> policy -> check_offer is 3
 # sequential steps when the model doesn't batch them, which it often
 # doesn't), cutting the turn off before it could ever reach check_offer.
-# Twilio's own webhook-response deadline is ~15s; this leaves headroom
-# for both the reasoning budget and voice_block()'s own ELEVENLABS_BUDGET_S
-# (4s) afterward, with margin to spare.
+# Twilio's own webhook-response deadline is ~15s, and blowing it DROPS THE
+# CALL ("we can't reach your server"), which is exactly what happened on a
+# real call after a few turns.
+#
+# The old 8s reasoning budget plus voice_block()'s then-4s ElevenLabs budget
+# gave a 12s worst case, before network and DB time - too close to 15s once
+# a turn did two LLM round trips around a tool that itself took 2.5s
+# (check_offer, measured live).
+#
+# These are deliberately tight because the two failure modes are not
+# equally bad: exceeding Twilio's deadline kills the call outright, while
+# exhausting the reasoning budget just degrades that one turn and the
+# conversation continues. Always lose the reasoning, never the call.
+# Worst case is now ~6s + ~2s = 8s, leaving real headroom.
 VOICE_MAX_ITERATIONS = 4
-VOICE_DEADLINE_S = 8.0
+VOICE_DEADLINE_S = 6.0
 
 if not (settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN):
     logger.warning("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set - voice calling is disabled until backend/.env is configured.")
