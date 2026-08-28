@@ -18,10 +18,16 @@ from typing import Dict, Any
 
 from app.db.database import get_db, dialect
 from app.gateway.event_bus import bus
+from app.db.repositories import recovery_attempts as recovery_attempts_repo
 
 logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_SECONDS = 30
+
+# How long an attempt may sit in CALLING before we treat the call as dead.
+# Generous enough that a genuinely long conversation is never cut short,
+# short enough that a dropped call doesn't block that cart for hours.
+STALE_CALL_MINUTES = 10
 
 
 def _stale_started_checkouts() -> list:
@@ -91,7 +97,41 @@ async def sweep_once() -> int:
         fired += 1
         logger.info(f"Sweeper: checkout {checkout_id} abandoned (merchant {merchant_id}).")
 
+    await _expire_stale_calls()
     return fired
+
+
+async def _expire_stale_calls():
+    """Close out attempts stuck mid-call.
+
+    A call can end with no completion signal ever reaching us - Twilio gives
+    up waiting for TwiML and hangs up, the customer drops, the network dies
+    between turns. Nothing then moves the attempt out of CALLING, and since
+    an in-flight attempt blocks new recovery for that checkout, one dropped
+    call meant that cart could never be recovered again.
+    """
+    try:
+        closed = recovery_attempts_repo.expire_stale_calls(STALE_CALL_MINUTES)
+    except Exception as e:
+        logger.warning(f"Sweeper: could not expire stale calls: {e}")
+        return
+
+    for attempt in closed:
+        logger.info(
+            f"Sweeper: recovery {attempt['recovery_attempt_id']} was stuck mid-call for over "
+            f"{STALE_CALL_MINUTES}m - marking CALL_FAILED so the checkout can be retried."
+        )
+        await bus.publish(
+            event_type="recovery.call_failed",
+            payload={
+                "recovery_attempt_id": attempt["recovery_attempt_id"],
+                "checkout_id": attempt["checkout_id"],
+                "reason": "call_never_completed",
+            },
+            correlation_id=attempt["checkout_id"],
+            merchant_id=attempt["merchant_id"],
+            idempotency_key=f"stale_call_{attempt['recovery_attempt_id']}",
+        )
 
 
 async def run_sweeper_loop(interval_seconds: int = SWEEP_INTERVAL_SECONDS):

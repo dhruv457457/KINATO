@@ -25,6 +25,7 @@ from app.gateway.event_bus import bus
 from app.db.repositories import merchants as merchants_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import consents as consents_repo
+from app.db.repositories import checkouts as checkouts_repo
 from tests.conftest import wait_until
 
 
@@ -141,3 +142,59 @@ async def test_summary_stats_returns_real_ints_not_decimals(real_merchant_id):
     for key in ("recovered_paise", "revenue_at_risk_paise", "total_attempts", "recovered_count", "abandoned_count"):
         assert not isinstance(stats[key], Decimal), f"{key} leaked a Decimal to the API boundary"
         assert isinstance(stats[key], int), f"{key} is {type(stats[key]).__name__}, expected int"
+
+
+async def test_stuck_calls_are_expired_and_stop_blocking_retries(real_merchant_id, unique_checkout_id):
+    """A call can end with no completion signal ever reaching us: Twilio gives
+    up waiting for TwiML and hangs up, the customer drops, the network dies
+    between turns. Nothing then moves the attempt out of CALLING.
+
+    That matters far more than a stale dashboard number: an in-flight attempt
+    BLOCKS new recovery for that checkout, so one dropped call meant the cart
+    could never be recovered again. Seven such rows accumulated during live
+    testing, the oldest stuck for over an hour.
+    """
+    from app.db.database import get_db
+    from app.db.repositories import recovery_attempts as ra_repo
+
+    checkouts_repo.create_checkout(
+        real_merchant_id, amount_paise=299000, checkout_id=unique_checkout_id, source="test"
+    )
+    attempt = ra_repo.create_recovery_attempt(
+        merchant_id=real_merchant_id, checkout_id=unique_checkout_id, customer_id=None
+    )
+    ra_repo.update_state(attempt["recovery_attempt_id"], "CALLING")
+
+    # While it looks in-flight, the checkout is correctly protected from a
+    # second concurrent attempt.
+    assert len(ra_repo.list_active_for_checkout(unique_checkout_id)) == 1
+
+    # Backdate it past the staleness threshold, as a dropped call would be.
+    with get_db() as conn:
+        conn.cursor().execute(
+            "UPDATE recovery_attempts SET updated_at = NOW() - INTERVAL '30 minutes' "
+            "WHERE recovery_attempt_id = %s",
+            (attempt["recovery_attempt_id"],),
+        )
+
+    closed_ids = {a["recovery_attempt_id"] for a in ra_repo.expire_stale_calls(older_than_minutes=10)}
+    assert attempt["recovery_attempt_id"] in closed_ids
+
+    reloaded = ra_repo.get_recovery_attempt(attempt["recovery_attempt_id"])
+    assert reloaded["state"] == "CALL_FAILED"
+    assert ra_repo.list_active_for_checkout(unique_checkout_id) == [], (
+        "a dead call must stop blocking recovery for its checkout"
+    )
+
+
+def test_terminal_states_match_what_the_code_actually_writes():
+    """The terminal list once read ('RECOVERED','FAILED','OPTED_OUT') while
+    the code writes CALL_FAILED and CONSENT_REVOKED - so even a correctly
+    failed call counted as in-flight and blocked its checkout forever."""
+    from app.db.repositories.recovery_attempts import TERMINAL_STATES
+
+    assert "CALL_FAILED" in TERMINAL_STATES
+    assert "CONSENT_REVOKED" in TERMINAL_STATES
+    assert "RECOVERED" in TERMINAL_STATES
+    for phantom in ("FAILED", "OPTED_OUT"):
+        assert phantom not in TERMINAL_STATES, f"{phantom} is never written by any code path"

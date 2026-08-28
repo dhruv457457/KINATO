@@ -48,15 +48,56 @@ def update_state(recovery_attempt_id: str, state: str, **fields) -> None:
         )
 
 
+# The states an attempt can END in. Anything else counts as still in
+# flight, and an in-flight attempt BLOCKS a new recovery for that checkout
+# (see recovery_eligibility._check_active_recovery).
+#
+# This list previously read ('RECOVERED', 'FAILED', 'OPTED_OUT') - but
+# nothing in the codebase ever writes 'FAILED' or 'OPTED_OUT'. The real
+# states are CALL_FAILED and CONSENT_REVOKED, so a correctly-failed call
+# never counted as finished and permanently blocked that checkout from
+# being retried.
+TERMINAL_STATES = ("RECOVERED", "CALL_FAILED", "CONSENT_REVOKED")
+
+
 def list_active_for_checkout(checkout_id: str) -> list:
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT * FROM recovery_attempts WHERE checkout_id = %s "
-            "AND state NOT IN ('RECOVERED', 'FAILED', 'OPTED_OUT')",
-            (checkout_id,),
+            "AND state NOT IN %s",
+            (checkout_id, TERMINAL_STATES),
         )
         return cursor.fetchall()
+
+
+def expire_stale_calls(older_than_minutes: int = 10) -> list:
+    """Closes out attempts stuck mid-call.
+
+    A call can end without any completion signal reaching us at all: Twilio
+    exceeds its webhook deadline and hangs up, the customer drops, the
+    network dies mid-turn. Nothing then moves the attempt out of CALLING, so
+    it sits in flight forever - and because an in-flight attempt blocks new
+    recovery for that checkout, a single dropped call meant that cart could
+    NEVER be recovered again. Seven such rows accumulated during live
+    testing, the oldest stuck for over an hour.
+
+    Returns the attempts it closed so the caller can publish
+    recovery.call_failed for each.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE recovery_attempts
+            SET state = 'CALL_FAILED', updated_at = NOW()
+            WHERE state IN ('CALLING', 'OUTREACH_APPROVED')
+              AND updated_at < NOW() - (%s || ' minutes')::interval
+            RETURNING recovery_attempt_id, merchant_id, checkout_id
+            """,
+            (str(older_than_minutes),),
+        )
+        return [dict(r) for r in cursor.fetchall()]
 
 
 def list_for_merchant(merchant_id: str, limit: int = 100) -> list:
