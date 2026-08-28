@@ -27,11 +27,18 @@ class EmailService:
         payload = event.get("payload", {})
         to_email = payload.get("customer_email") or DEFAULT_CUSTOMER_EMAIL
         link_url = payload.get("payment_url", "")
-        item_name = payload.get("item_name", "Handcrafted Bamboo Lamp")
-        amount = float(payload.get("amount", 3149.0))
-        discount_pct = float(payload.get("discount", 10.0))
-        base_price = float(payload.get("base_price", 3499.0))
-        merchant_id = event.get("merchant_id", "jiva_demo")
+        # No fabricated fallbacks. These used to default to the deleted demo
+        # product ("Handcrafted Bamboo Lamp"), its prices (3149/3499) and its
+        # merchant ("jiva_demo"), which meant a real Loomwork customer was
+        # emailed about a bamboo lamp they had never seen. If a field is
+        # missing now the email says less, rather than saying something false.
+        item_name = (payload.get("item_name") or "").strip()
+        business_name = (payload.get("business_name") or "").strip()
+        customer_name = (payload.get("customer_name") or "").strip()
+        amount = float(payload.get("amount") or 0.0)
+        discount_pct = float(payload.get("discount") or 0.0)
+        base_price = float(payload.get("base_price") or amount)
+        merchant_id = event.get("merchant_id", "")
         correlation_id = event.get("correlation_id", "")
         recovery_attempt_id = payload.get("recovery_attempt_id", "")
 
@@ -41,6 +48,8 @@ class EmailService:
             to_email=to_email,
             link_url=link_url,
             item_name=item_name,
+            business_name=business_name,
+            customer_name=customer_name,
             final_amount=amount,
             discount_pct=discount_pct,
             base_price=base_price
@@ -68,9 +77,41 @@ class EmailService:
         item_name: str,
         final_amount: float,
         discount_pct: float,
-        base_price: float = 3499.0
+        base_price: float = 0.0,
+        business_name: str = "",
+        customer_name: str = ""
     ) -> tuple[str, str]:
-        discount_amount = base_price - final_amount
+        discount_amount = max(0.0, base_price - final_amount)
+        has_discount = discount_pct > 0 and discount_amount > 0
+
+        # Every line below degrades to saying LESS when a fact is missing,
+        # never to saying something invented. The previous template asserted
+        # a "negotiated discount unlocked" even at 0% off, which was simply
+        # untrue on a full-price recovery.
+        store_line = business_name.upper() if business_name else "YOUR ORDER"
+        greeting = f"Hi {customer_name.split()[0]}! " if customer_name else ""
+        intro = (
+            "Great speaking with you. As promised, here's your checkout link with the discount we agreed."
+            if has_discount
+            else "Great speaking with you. Here's the link to finish your order at the price we discussed."
+        )
+        item_html = (
+            f'<h3 style="margin: 0 0 6px 0; color: #0f172a; font-size: 16px;">{item_name}</h3>'
+            if item_name else ""
+        )
+        price_extra = (
+            f'<span class="strike">₹{int(base_price):,}</span>'
+            f'<span style="color: #059669; font-size: 13px; font-weight: 700; margin-left: 10px; '
+            f'background: #ecfdf5; padding: 3px 8px; border-radius: 6px;">'
+            f'{int(discount_pct)}% OFF (-₹{int(discount_amount):,})</span>'
+            if has_discount else ""
+        )
+        subject = (
+            f"{business_name}: your {int(discount_pct)}% discount is ready (₹{int(final_amount):,})"
+            if business_name and has_discount
+            else (f"{business_name}: complete your order (₹{int(final_amount):,})" if business_name
+                  else f"Complete your order (₹{int(final_amount):,})")
+        )
         html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -87,18 +128,14 @@ class EmailService:
 </head>
 <body>
     <div class="card">
-        <span class="badge">✨ Kinato AI Concierge VIP Deal</span>
-        <h2 style="margin: 0 0 4px 0; color: #0f172a; font-size: 22px; letter-spacing: -0.5px;">JIVA LIFESTYLE</h2>
-        <p style="color: #64748b; font-size: 13px; margin: 0 0 16px 0;">Artisan Masterpiece Collection</p>
-        <p style="color: #334155; font-size: 14px; line-height: 1.5;">Hey Dhruv! Great speaking with you on the phone. As promised, your exclusive negotiated discount has been unlocked and secured.</p>
-        
+        <h2 style="margin: 0 0 16px 0; color: #0f172a; font-size: 22px; letter-spacing: -0.5px;">{store_line}</h2>
+        <p style="color: #334155; font-size: 14px; line-height: 1.5;">{greeting}{intro}</p>
+
         <div class="product-box">
-            <h3 style="margin: 0 0 6px 0; color: #0f172a; font-size: 16px;">🎋 {item_name}</h3>
-            <p style="color: #64748b; font-size: 12px; margin: 0 0 14px 0;">Handcrafted in Assam • Direct from Rural Master Artisans</p>
+            {item_html}
             <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; margin-top: 12px;">
                 <span class="price">₹{int(final_amount):,}</span>
-                <span class="strike">₹{int(base_price):,}</span>
-                <span style="color: #059669; font-size: 13px; font-weight: 700; margin-left: 10px; background: #ecfdf5; padding: 3px 8px; border-radius: 6px;">{int(discount_pct)}% OFF (-₹{int(discount_amount):,})</span>
+                {price_extra}
             </div>
         </div>
 
@@ -106,7 +143,7 @@ class EmailService:
         
         <p style="text-align: center; color: #94a3b8; font-size: 11px; margin-top: 24px; line-height: 1.6;">
             🔒 Secured by Razorpay • Instant UPI (GPay, PhonePe, Paytm), Cards & NetBanking<br>
-            🚚 Free Express Artisan Delivery & 30-Day Authenticity Guarantee
+            This link was sent because you asked for it on our call.
         </p>
     </div>
 </body>
@@ -120,7 +157,7 @@ class EmailService:
                     json={
                         "from": EMAIL_FROM,
                         "to": [to_email],
-                        "subject": f"✨ Jiva Lifestyle: Your VIP Discount is Ready (₹{int(final_amount):,})",
+                        "subject": subject,
                         "html": html_content
                     }
                 )

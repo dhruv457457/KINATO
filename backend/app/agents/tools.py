@@ -32,6 +32,7 @@ from app.db.database import run_db_async
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import offer_tokens as offer_tokens_repo
 from app.db.repositories import customers as customers_repo
+from app.db.repositories import merchants as merchants_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.services.policy_engine import policy_engine
 from app.services.payment_execution import payment_execution, PaymentExecutionError
@@ -251,6 +252,15 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
     approved_percent = token["approved_percent"] or 0.0
     original_amount = token["base_amount_paise"] / 100.0
 
+    # Real cart + real store name for the email that follows.
+    checkout_row = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id) if ctx.checkout_id else None
+    business_name = ""
+    try:
+        merchant_row = await run_db_async(merchants_repo.get_merchant, ctx.merchant_id)
+        business_name = ((merchant_row or {}).get("name") or "").strip()
+    except Exception:
+        business_name = ""
+
     # This runs INSIDE a live phone call, where every sequential DB round
     # trip costs ~2-2.8s from Railway to Supabase and the whole turn must
     # finish before Twilio's ~15s deadline. The customer lookup does not
@@ -302,12 +312,28 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
             logger.warning(f"issue_offer: customer lookup failed ({e}); link created, email skipped.")
 
     if customer_email and channel == "email":
+        # Real identity for the email. Without these the template fell back
+        # to hardcoded demo values and sent a customer of "Loomwork" an
+        # email branded "JIVA LIFESTYLE" about a "Handcrafted Bamboo Lamp"
+        # they had never looked at - leftovers of the deleted demo product.
+        item_name = ""
+        try:
+            line_items = json.loads(checkout_row.get("line_items") or "[]") if checkout_row else []
+            names = [li.get("name") or li.get("product_id") for li in line_items if isinstance(li, dict)]
+            names = [n for n in names if n]
+            item_name = ", ".join(names[:3])
+        except (TypeError, ValueError):
+            item_name = ""
+
         await bus.publish(
             event_type="email.send_requested",
             payload={
                 "recovery_attempt_id": ctx.recovery_attempt_id,
                 "checkout_id": ctx.checkout_id,
                 "customer_email": customer_email,
+                "customer_name": (customer or {}).get("name", "") if ctx.customer_id else "",
+                "business_name": business_name,
+                "item_name": item_name,
                 "payment_url": payment_result["url"],
                 "amount": payment_result["final_amount"],
                 "base_price": original_amount,
