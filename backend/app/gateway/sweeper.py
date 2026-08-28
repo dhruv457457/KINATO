@@ -98,7 +98,45 @@ async def sweep_once() -> int:
         logger.info(f"Sweeper: checkout {checkout_id} abandoned (merchant {merchant_id}).")
 
     await _expire_stale_calls()
+    await _remind_lapsed_promises()
     return fired
+
+
+async def _remind_lapsed_promises():
+    """A promise pauses outreach; a lapsed promise earns exactly one nudge.
+
+    "I'll pay on Friday" is a commitment, and continuing to call before
+    Friday is harassment. But a promise that quietly lapses is just a lost
+    sale, so once the date passes we send ONE reminder and then stop for
+    good. promise_reminded_at is what enforces the "one" - a customer who
+    committed and still didn't pay has been chased once already, and chasing
+    them again is how a recovery tool becomes a complaint.
+    """
+    try:
+        lapsed = recovery_attempts_repo.list_lapsed_promises()
+    except Exception as e:
+        logger.warning(f"Sweeper: could not check lapsed promises: {e}")
+        return
+
+    for attempt in lapsed:
+        recovery_attempts_repo.mark_promise_reminded(attempt["recovery_attempt_id"])
+        logger.info(
+            f"Sweeper: promise lapsed for {attempt['recovery_attempt_id']} "
+            f"(promised {attempt['promised_at']}) - sending one reminder, then stopping."
+        )
+        await bus.publish(
+            event_type="recovery.promise_lapsed",
+            payload={
+                "recovery_attempt_id": attempt["recovery_attempt_id"],
+                "checkout_id": attempt["checkout_id"],
+                "customer_id": attempt["customer_id"],
+                "promised_at": str(attempt["promised_at"]),
+                "reminder": "final",
+            },
+            correlation_id=attempt["checkout_id"],
+            merchant_id=attempt["merchant_id"],
+            idempotency_key=f"promise_reminder_{attempt['recovery_attempt_id']}",
+        )
 
 
 async def _expire_stale_calls():

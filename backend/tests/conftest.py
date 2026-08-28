@@ -158,3 +158,31 @@ async def wait_until(predicate, timeout: float = 3.0, interval: float = 0.05):
         await asyncio.sleep(interval)
         elapsed += interval
     return predicate()
+
+
+@pytest.fixture(autouse=True)
+def _calling_hours_always_open(request, monkeypatch):
+    """Stops the wall clock from deciding whether the suite passes.
+
+    call_orchestrator now enforces merchant calling hours before dialling
+    (app/services/outreach_guards.py). That is correct in production and
+    wrong in a test suite: run the tests after 20:00 IST and every pipeline
+    test fails with "call.started was never published", for no reason other
+    than the time of day. A test that passes at noon and fails at nine is
+    worse than no test - it teaches you to ignore red.
+
+    Quiet-hours behaviour itself is covered properly in
+    tests/test_outreach_guards.py, which passes an explicit clock instead of
+    depending on when you happen to run it.
+
+    Tests that exercise the guard ITSELF opt out with @pytest.mark.real_clock -
+    otherwise this fixture would neuter the very checks they assert on.
+    """
+    if request.node.get_closest_marker("real_clock"):
+        return
+
+    import app.services.outreach_guards as guards_module
+
+    monkeypatch.setattr(
+        guards_module, "within_calling_hours", lambda merchant_id, now=None: (True, "")
+    )

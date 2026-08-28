@@ -62,12 +62,27 @@ def not_already_paid(checkout_id: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def no_active_promise(checkout_id: str) -> Tuple[bool, str]:
+    """A customer who said "I'll pay Friday" must not be called before Friday.
+
+    Recording a promise is only meaningful if it actually stops outreach -
+    otherwise it is a note in a database while the phone keeps ringing, which
+    is worse than not asking at all.
+    """
+    with_promise = recovery_attempts_repo.active_promise_for_checkout(checkout_id)
+    if with_promise:
+        due = with_promise.get("promised_at")
+        return False, f"promise_to_pay (customer committed to pay by {due})"
+    return True, ""
+
+
 def check_all(merchant_id: str, checkout_id: str, max_calls: int = DEFAULT_MAX_CALLS_PER_CASE) -> Tuple[bool, str]:
     """Every pre-dial hard stop, in one call. Returns (allowed, reason)."""
     for check in (
         lambda: not_already_paid(checkout_id),
         lambda: within_calling_hours(merchant_id),
         lambda: under_call_cap(checkout_id, max_calls),
+        lambda: no_active_promise(checkout_id),
     ):
         ok, reason = check()
         if not ok:

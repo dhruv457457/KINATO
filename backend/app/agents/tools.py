@@ -373,6 +373,45 @@ issue_offer = Tool(
 )
 
 
+
+def _parse_promise_date(raw: str):
+    """Turns what a person says on the phone into a real date.
+
+    Speech-to-text gives us "tomorrow" or "in 3 days" far more often than an
+    ISO string, so accept both rather than rejecting a valid promise on
+    formatting. Anything in the past, or beyond a sensible horizon, is
+    refused - a promise for last Tuesday is a transcription error, not a
+    commitment.
+    """
+    from datetime import datetime, timedelta, timezone as _tz
+    import re as _re
+
+    if not raw:
+        return None
+    text = str(raw).strip().lower()
+    now = datetime.now(_tz.utc)
+
+    if text in ("today", "tonight"):
+        return now + timedelta(hours=8)
+    if text in ("tomorrow", "tmrw"):
+        return now + timedelta(days=1)
+
+    m = _re.search(r"(\d+)\s*day", text)
+    if m:
+        days = int(m.group(1))
+        return now + timedelta(days=days) if 0 < days <= 60 else None
+
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_tz.utc)
+        # A date in the past, or absurdly far out, is a mishearing.
+        if parsed < now - timedelta(days=1) or parsed > now + timedelta(days=60):
+            return None
+        return parsed
+    except ValueError:
+        return None
+
 async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
     if not ctx.customer_id:
         return {"status": "REJECTED", "reason": "no_customer_in_context"}
@@ -387,6 +426,62 @@ async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
     return {"status": "RECORDED"}
 
 
+
+async def _record_promise_to_pay(ctx: AgentContext, pay_date: str, amount_inr: float = 0.0, customer_words: str = "") -> Dict[str, Any]:
+    """The customer said they will pay, just not now.
+
+    This is a STOPPING rule, not a soft outcome. "I'll pay on Friday" means
+    stop selling, stop calling, and wait until Friday - continuing to chase
+    someone who has already committed is how a recovery call becomes
+    harassment. The date they named is stored, their exact words are stored
+    (so the merchant can see what was actually said rather than our summary
+    of it), and the sweeper leaves them alone until that date passes.
+    """
+    if not ctx.recovery_attempt_id:
+        return {"status": "REJECTED", "reason": "no_recovery_attempt_in_context"}
+
+    parsed = _parse_promise_date(pay_date)
+    if parsed is None:
+        return {"status": "REJECTED", "reason": f"unparseable_date: {pay_date!r}"}
+
+    await run_db_async(
+        lambda: recovery_attempts_repo.update_state(
+            ctx.recovery_attempt_id,
+            "PROMISED",
+            promised_at=parsed,
+            promised_amount_paise=int(round(amount_inr * 100)) if amount_inr else None,
+            promise_words=(customer_words or "")[:500],
+        )
+    )
+    logger.info(f"Promise to pay recorded for {ctx.recovery_attempt_id}: {parsed.date()} - outreach paused until then.")
+    return {
+        "status": "RECORDED",
+        "promised_date": parsed.date().isoformat(),
+        "outreach_paused_until": parsed.date().isoformat(),
+    }
+
+
+record_promise_to_pay = Tool(
+    name="record_promise_to_pay",
+    description=(
+        "Record that the customer has committed to paying on a specific date, and STOP selling. "
+        "Call this the moment they name a time ('I'll pay tomorrow', 'after payday on the 1st'). "
+        "Do not keep negotiating or offer a discount after this - they have already said yes, just "
+        "not yet. Still send them the payment link so it is waiting for them."
+    ),
+    parameters={
+        "pay_date": {
+            "type": "string",
+            "description": "When they said they will pay: an ISO date (2026-09-01), or 'today', 'tomorrow', or a number of days ('in 3 days').",
+        },
+        "amount_inr": {"type": "number", "description": "Amount they said they would pay, if they named one. 0 if not."},
+        "customer_words": {"type": "string", "description": "Their own words, quoted as closely as you heard them."},
+    },
+    required=["pay_date"],
+    fn=_record_promise_to_pay,
+    mutating=True,
+)
+
 record_opt_out = Tool(
     name="record_opt_out",
     description="Record that the customer asked not to be contacted again. Call this the moment they say so.",
@@ -397,7 +492,10 @@ record_opt_out = Tool(
 )
 
 
-ALL_TOOLS: List[Tool] = [get_cart, get_policy_limits, check_offer, issue_offer, record_opt_out]
+ALL_TOOLS: List[Tool] = [
+    get_cart, get_policy_limits, check_offer, issue_offer,
+    record_promise_to_pay, record_opt_out,
+]
 TOOLS_BY_NAME: Dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
 

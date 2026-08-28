@@ -22,6 +22,7 @@ from app.db.repositories import recovery_attempts as ra_repo
 IST = outreach_guards.IST
 
 
+@pytest.mark.real_clock
 class TestQuietHours:
     def test_call_inside_calling_hours_is_allowed(self, real_merchant_id):
         policies_repo.update_policy(real_merchant_id, {"calling_start_hour": 10, "calling_end_hour": 20})

@@ -194,3 +194,62 @@ def count_calls_for_checkout(checkout_id: str) -> int:
             (checkout_id,),
         )
         return int(dict(cursor.fetchone())["n"])
+
+
+def list_lapsed_promises(limit: int = 50) -> list:
+    """Promises whose date has passed while the checkout is still unpaid.
+
+    A promise pauses outreach - that is the whole point of recording it. But
+    a promise that lapses silently is just a lost sale, so once the date
+    passes we allow exactly ONE reminder. promise_reminded_at is what makes
+    it one and not a campaign: a customer who committed and then didn't pay
+    has already been chased once, and chasing them repeatedly is how a
+    recovery tool becomes the thing merchants get complaints about.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT ra.recovery_attempt_id, ra.merchant_id, ra.checkout_id, ra.customer_id,
+                   ra.promised_at, ra.promised_amount_paise
+            FROM recovery_attempts ra
+            JOIN checkouts c ON c.checkout_id = ra.checkout_id
+            WHERE ra.state = 'PROMISED'
+              AND ra.promised_at IS NOT NULL
+              AND ra.promised_at < NOW()
+              AND ra.promise_reminded_at IS NULL
+              AND c.status != 'paid'
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def mark_promise_reminded(recovery_attempt_id: str) -> None:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE recovery_attempts SET promise_reminded_at = NOW(), updated_at = NOW() "
+            "WHERE recovery_attempt_id = %s",
+            (recovery_attempt_id,),
+        )
+
+
+def active_promise_for_checkout(checkout_id: str) -> Optional[Dict[str, Any]]:
+    """A promise whose date has NOT yet passed. While one exists, outreach
+    for that checkout is paused - that is what makes recording a promise a
+    stopping rule rather than a note in a database."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT recovery_attempt_id, promised_at FROM recovery_attempts
+            WHERE checkout_id = %s AND state = 'PROMISED'
+              AND promised_at IS NOT NULL AND promised_at > NOW()
+            LIMIT 1
+            """,
+            (checkout_id,),
+        )
+        row = cursor.fetchone()
+    return dict(row) if row else None

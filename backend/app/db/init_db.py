@@ -294,6 +294,23 @@ def init_db(force_reseed: bool = False) -> None:
     except Exception:
         pass  # column already exists
 
+    # Promise-to-pay. A customer saying "I'll pay on Friday" is a STOPPING
+    # rule, not a soft outcome: the correct behaviour is to stop selling,
+    # stop calling, and wait until the date they named. Stored as its own
+    # columns (added via ALTER for the same reason as above - real deployed
+    # databases already have this table).
+    for ddl in (
+        "ALTER TABLE recovery_attempts ADD COLUMN promised_at TIMESTAMPTZ",
+        "ALTER TABLE recovery_attempts ADD COLUMN promised_amount_paise BIGINT",
+        "ALTER TABLE recovery_attempts ADD COLUMN promise_words TEXT",
+        "ALTER TABLE recovery_attempts ADD COLUMN promise_reminded_at TIMESTAMPTZ",
+    ):
+        try:
+            with get_db() as alter_conn:
+                alter_conn.cursor().execute(ddl)
+        except Exception:
+            pass  # column already exists
+
 
 if __name__ == "__main__":
     init_db()

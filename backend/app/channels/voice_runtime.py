@@ -176,6 +176,8 @@ Sending a payment link is not a risk worth stalling over: nothing is charged, no
 customer decides at their own leisure. Refusing to send when they meant yes costs the merchant a sale they \
 had already won, which is the more expensive mistake.
 
+If they say they WILL pay but not right now - "I'll pay tomorrow", "after payday", "end of the week" - call record_promise_to_pay with the date they named and their own words. Then STOP selling: they have already agreed, so do not negotiate further and do not offer a discount. Still send the link so it is waiting for them. Continuing to push someone who has just committed is how a helpful call turns into harassment.
+
 record_opt_out REVOKES CONSENT PERMANENTLY - that customer can never be contacted again, about this order \
 or any future one. Call it ONLY when they actually ask not to be contacted: "don't call me again", "take \
 me off your list", "stop contacting me". Declining THIS purchase is not opting out. "I changed my mind", \
