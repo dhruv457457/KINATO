@@ -23,6 +23,7 @@ export const STATE_LABELS: Record<string, string> = {
   CREATED: "Created",
   CONSENT_REVOKED: "Opted out",
   CALL_FAILED: "Call failed",
+  PROMISED: "Promised to pay",
 };
 
 export function RecoveryState({ state }: { state: string }) {

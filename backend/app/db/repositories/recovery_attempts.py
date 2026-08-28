@@ -141,7 +141,9 @@ def summary_stats(merchant_id: str) -> Dict[str, Any]:
                 COALESCE(SUM(attributed_revenue_paise) FILTER (WHERE state = 'RECOVERED'), 0) AS recovered_paise,
                 COUNT(*) FILTER (WHERE state IN ('CALLING', 'OUTREACH_APPROVED', 'PAYMENT_LINK_SENT')) AS active_count,
                 COUNT(*) FILTER (WHERE state = 'CONSENT_REVOKED') AS opted_out_count,
-                COUNT(*) FILTER (WHERE state = 'CALL_FAILED') AS call_failed_count
+                COUNT(*) FILTER (WHERE state = 'CALL_FAILED') AS call_failed_count,
+                COUNT(*) FILTER (WHERE state = 'PROMISED') AS promised_count,
+                COALESCE(SUM(promised_amount_paise) FILTER (WHERE state = 'PROMISED'), 0) AS promised_paise
             FROM recovery_attempts
             WHERE merchant_id = %s
             """,

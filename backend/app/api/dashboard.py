@@ -50,6 +50,11 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
         "call_failed_count": stats["call_failed_count"],
         "abandoned_count": stats["abandoned_count"],
         "recovery_rate_pct": stats["recovery_rate_pct"],
+        # Customers who committed to a date. Outreach is paused for them -
+        # they are neither lost nor recovered, and lumping them into either
+        # would misrepresent both numbers.
+        "promised_count": stats["promised_count"],
+        "promised_paise": stats["promised_paise"],
         # Why recoveries never started: real `recovery.blocked` events. A
         # payment failed (so there IS money on the table) but Kinato
         # deliberately stayed silent - no contact details on file, or

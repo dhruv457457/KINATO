@@ -93,6 +93,11 @@ export interface DashboardOverview {
    *  quiet hours, discount over ceiling). Not a metric to optimise — any
    *  non-zero value means a guarantee the merchant relies on was broken. */
   rule_breaks: number;
+  /** Customers who committed to pay on a date. Outreach is paused for them —
+   *  neither lost nor recovered, so they are reported separately rather than
+   *  folded into either number. */
+  promised_count: number;
+  promised_paise: number;
 }
 
 export interface RecoveryRow {

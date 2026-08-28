@@ -192,6 +192,10 @@ export function StatusPill({ tone, children }: { tone: Tone; children: ReactNode
 export function toneForRecoveryState(state: string): Tone {
   if (state === "RECOVERED") return "positive";
   if (state === "CALL_FAILED" || state === "CONSENT_REVOKED") return "negative";
+  // A promise is a good outcome in progress, not a problem - the customer
+  // committed and we are deliberately waiting, so it should not read as a
+  // warning next to genuine failures.
+  if (state === "PROMISED") return "positive";
   if (state === "CALLING" || state === "PAYMENT_LINK_SENT" || state === "OUTREACH_APPROVED") return "warning";
   return "neutral";
 }

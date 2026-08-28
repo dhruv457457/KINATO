@@ -145,13 +145,25 @@ export default function OverviewPage() {
               ))}
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-px" style={{ background: RULE }}>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-px" style={{ background: RULE }}>
               <div style={{ background: "#FDFCF7" }}>
                 <StatCard
                   label="Stopped, by request"
                   value={String(data.opted_out_count)}
                   sub="Customers who asked not to be contacted again — honored immediately, every time."
                   index={4}
+                />
+              </div>
+              <div style={{ background: "#FDFCF7" }}>
+                <StatCard
+                  label="Promised to pay"
+                  value={String(data.promised_count)}
+                  sub={
+                    data.promised_count
+                      ? `${formatInr(data.promised_paise)} committed — we've stopped calling them until the date they gave.`
+                      : "Customers who name a date are left alone until it passes."
+                  }
+                  index={6}
                 />
               </div>
               <div style={{ background: "#FDFCF7" }}>
