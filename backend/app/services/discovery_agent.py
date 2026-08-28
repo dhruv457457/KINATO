@@ -121,8 +121,7 @@ class RecoveryStrategist:
         greeting_name = f" Is this {customer_name}?" if customer_name else ""
         if not settings.OPENROUTER_API_KEY:
             return CallPlan(
-                opening_line=f"Hi there!{greeting_name} I noticed you were checking out {item_description} "
-                             f"and wanted to see if I could help you finish that up.",
+                opening_line=f"Hello! Can you hear me alright?{greeting_name}",
                 talking_point="",
                 degraded=True,
             )
@@ -159,8 +158,7 @@ class RecoveryStrategist:
             )
             parsed = json.loads(response.choices[0].message.content)
             safe_fallback = (
-                f"Hi there!{greeting_name} I noticed you were checking out {item_description} "
-                f"and wanted to see if I could help you finish that up."
+                f"Hello! Can you hear me alright?{greeting_name}"
             )
             line = parsed.get("opening_line") or safe_fallback
             if contains_placeholder(line):
@@ -176,8 +174,7 @@ class RecoveryStrategist:
         except Exception as e:
             logger.warning(f"RecoveryStrategist LLM call failed, using heuristic plan: {e}")
             return CallPlan(
-                opening_line=f"Hi there!{greeting_name} I noticed you were checking out {item_description} "
-                             f"and wanted to see if I could help you finish that up.",
+                opening_line=f"Hello! Can you hear me alright?{greeting_name}",
                 talking_point="",
                 degraded=True,
             )

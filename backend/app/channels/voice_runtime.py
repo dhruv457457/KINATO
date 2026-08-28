@@ -58,6 +58,7 @@ from app.services.tts import voice_block as tts_voice_block, TWILIO_NEURAL_VOICE
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
+from app.db.repositories import merchants as merchants_repo
 
 logger = logging.getLogger(__name__)
 voice_router = APIRouter()
@@ -99,26 +100,53 @@ else:
 # simultaneous calls work correctly, not a shared/global session.
 CALL_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-SYSTEM_PROMPT_TEMPLATE = """You are a warm, professional shopping concierge on a real phone call with \
-{customer_label} about {item_description}, which they started buying but didn't finish.
+SYSTEM_PROMPT_TEMPLATE = """You are a warm, professional sales representative {from_business}making an \
+OUTBOUND phone call to {customer_label} about {item_description}, which they started buying but didn't finish.
 
-Sound like a genuine, friendly person - natural phrasing, brief warm acknowledgements, no corporate script \
-reading. Keep every reply to 1-2 short sentences (this is a live phone call, not an email).
+YOU called THEM. They are not expecting this call and have no idea who you are yet. So never open with \
+"how can I help you?" or "what can I do for you?" - that is what an inbound support line says, and it will \
+confuse them. You are the one with a reason for calling; give it.
 
-You have tools to look up the real cart, the real discount policy, and to check and issue a discount. \
-NEVER state a specific discount percent or price unless it came from check_offer's response - you do not \
-know the merchant's real limits until you ask. If the customer hesitates on price, call get_policy_limits \
-and check_offer before offering anything. Only call issue_offer after the customer has clearly agreed to a \
-specific offer you already proposed via check_offer.
+Work through this sequence, ONE step per turn, waiting for their reply each time. Do not rush ahead, and do \
+not deliver several steps in a single breath:
 
-If the customer asks not to be contacted again, or clearly wants to end the conversation permanently, call \
-record_opt_out immediately and end the call politely - do not keep negotiating.
+1. Make sure they can hear you and confirm who you are speaking to. ("Hello - can you hear me alright? \
+Am I speaking with {customer_label}?")
+2. Say who you are and why you are calling{business_intro}. Mention that you noticed they were looking at \
+{item_description} on the site and didn't finish checking out.
+3. Ask, openly, what stopped them. Do not guess the reason and do not lead with a discount - the real \
+barrier might be shipping, size, timing, or trust, and offering money to someone who was worried about \
+delivery just wastes margin.
+4. Respond to the barrier they actually name. ONLY if price is genuinely the issue, call get_policy_limits \
+and then check_offer, and propose exactly what check_offer approved.
+5. Ask them plainly whether they would like you to send it. Accept a clear yes or a clear no.
+
+Sound like a real person on a real phone: natural phrasing, brief warm acknowledgements, no script reading. \
+Keep every reply to 1-2 short sentences - this is a live call, not an email. Never say a discount percent \
+or price that did not come from check_offer's response; you do not know the merchant's real limits until \
+you ask. Only call issue_offer once the customer has clearly agreed to a specific offer you already \
+proposed. A vague "okay" or "hmm" is not agreement - ask once more to be sure.
+
+If they ask not to be contacted again, or clearly want to end the conversation for good, call \
+record_opt_out immediately and close politely. Do not keep selling.
 """
 
 
-def _build_system_prompt(customer_name: str, item_description: str) -> str:
-    customer_label = customer_name if customer_name else "a customer"
-    return SYSTEM_PROMPT_TEMPLATE.format(customer_label=customer_label, item_description=item_description)
+def _build_system_prompt(customer_name: str, item_description: str, business_name: str = "") -> str:
+    """Builds the live-call system prompt.
+
+    business_name is threaded through so the agent can say who is calling.
+    When the merchant has no usable name on file it is omitted entirely
+    rather than filled with a placeholder - an earlier version left the
+    model to invent one and it read "[Your Company]" aloud to a customer.
+    """
+    customer_label = customer_name if customer_name else "the customer"
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        customer_label=customer_label,
+        item_description=item_description,
+        from_business=f"from {business_name} " if business_name else "",
+        business_intro=f" - you are calling from {business_name}" if business_name else "",
+    )
 
 
 def _describe_cart(checkout: Dict[str, Any]) -> str:
@@ -141,6 +169,16 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
     except (TypeError, ValueError):
         plan = {}
 
+    # The store name the agent introduces itself with. Empty when the
+    # merchant has no usable name on file - the prompt then omits it
+    # entirely rather than inviting the model to invent one.
+    business_name = ""
+    try:
+        merchant = merchants_repo.get_merchant(attempt["merchant_id"])
+        business_name = ((merchant or {}).get("name") or "").strip()
+    except Exception:
+        business_name = ""
+
     ctx = AgentContext(
         merchant_id=attempt["merchant_id"],
         correlation_id=recovery_attempt_id,
@@ -157,6 +195,10 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
         "opening_voice_block": plan.get("voice_block") or "",
         "customer_name": (customer or {}).get("name", ""),
         "item_description": _describe_cart(checkout) if checkout else "their order",
+        # Who the agent says it is. Empty when the merchant has no usable
+        # business name, in which case the prompt omits it entirely rather
+        # than letting the model invent one.
+        "business_name": business_name,
         "turns": 0,
     }
 
@@ -259,7 +301,9 @@ async def twilio_voice_respond(request: Request):
     logger.info(f"[CALL {call_id}] Customer: '{customer_speech}'")
 
     result = await agent_runtime.run_agent(
-        system_prompt=_build_system_prompt(session["customer_name"], session["item_description"]),
+        system_prompt=_build_system_prompt(
+            session["customer_name"], session["item_description"], session.get("business_name", "")
+        ),
         user_message=customer_speech,
         ctx=session["ctx"],
         tools=ALL_TOOLS,
@@ -310,6 +354,7 @@ async def get_call_sessions():
         call_id: {
             "customer_name": s["customer_name"],
             "item_description": s["item_description"],
+            "business_name": s.get("business_name", ""),
             "turns": s["turns"],
             "recovery_attempt_id": s["ctx"].recovery_attempt_id,
         }
