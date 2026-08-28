@@ -1,118 +1,151 @@
 # KINATO
 
-> **Razorpay AI Buildathon 2026 — Track 03: AI Revenue Recovery**  
+> **Razorpay AI Buildathon 2026 — Track 03: AI Revenue Recovery**
 > *"Don't just identify the problem. Show measured money recovered across a batch, with compliant escalation, stopping rules, and an audit trail."*
 
-**Kinato turns a merchant's existing website into an autonomous revenue surface for both humans and AI buyers.**
+**Kinato is a recovery layer that sits on top of the Razorpay account a merchant already has.**
 
-For humans, Kinato recovers revenue through context-aware voice and messaging. For AI buyers, Kinato exposes the merchant's catalog and checkout as machine-readable commerce infrastructure.
+When a payment fails or a checkout is abandoned, an AI agent calls or emails the customer, finds out what actually stopped them, and — if and only if a deterministic policy engine approves — sends a real Razorpay payment link. Every money decision it makes is written to an audit trail the merchant can read.
 
-Rather than acting as a standalone marketplace, Kinato integrates directly via a lightweight SDK (`Kinato.init()`), transforming passive merchant websites into intelligent systems capable of real-time human recovery and external AI commerce.
+Setup is one webhook URL. No code on the storefront.
 
 ---
 
-## 🏗 The Architecture
+## The one idea everything hangs on
 
-We strictly separate **AI Reasoning** (Supervisors/Intelligence) from **Deterministic Services** (Safety, Policy, Execution) and the **Real-Time Runtime** (Audio transport).
+**A tool call from the model is a request, never an effect.**
+
+1. The model calls `check_offer(discount_percent=40)`. This **applies nothing**. It loads the real cart and the real policy, runs a deterministic engine, and returns an opaque `offer_token` — plus what was *actually* approved, which may be 10%.
+2. The only tool that can act is `issue_offer(offer_token=…)`.
+3. `issue_offer` reads the money terms **from the server-side token row** — never from any argument the model passed.
+
+A hallucinating or prompt-injected model can only hand back an opaque string whose amounts were computed by code it never touched. A unit test asserts no tool schema accepts `merchant_id`, `amount`, `phone`, or `email` from the model.
+
+"Bounded" is structural here, not a promise in a prompt.
+
+---
+
+## Architecture
+
+AI reasoning is separated from deterministic services. The agent decides *what to say*; code decides *what money moves*.
 
 ```text
-                 MERCHANT
-                     │
-                     ▼
-             MERCHANT SUPERVISOR
-                     │
-          ┌──────────┴──────────┐
-          ▼                     ▼
-    REVENUE INTEL        MERCHANT QUERIES
-          │
-          ▼
- RECOVERY OPPORTUNITY
-          │
-          ▼
-   IDENTITY RESOLUTION
-          │
-          ▼
-     CONSENT GATE
-          │
-          ▼
-   CALL ORCHESTRATOR
-          │
-     ┌────┴────┐
-     ▼         ▼
-VOICE RUNTIME  CUSTOMER INTEL
-     │         │
-     │    STRUCTURED STATE
-     │         │
-     └────┬────┘
-          ▼
-     NEXT ACTION
-          │
-     ┌────┴───────────┐
-     ▼                ▼
-POLICY ENGINE    COMMUNICATION
-     │           CONSENT CHECK
-     ▼                │
- OFFER             WhatsApp
-     │                │
-     └───────┬────────┘
-             ▼
-      PAYMENT EXECUTION
-             │
-             ▼
-          RAZORPAY
-             │
-          WEBHOOK
-             │
-             ▼
-          EVENT BUS
-        ┌────┼─────┐
-        ▼    ▼     ▼
-      AUDIT MEMORY ATTRIBUTION
+  payment.failed / checkout.abandoned          ← Razorpay webhook, or DB sweeper
+                 │
+                 ▼
+       RECOVERY ELIGIBILITY                    ← stopping rules live here
+       ├─ already paid?                          (consent, rail health,
+       ├─ consent granted?                        contactable, in-flight)
+       ├─ Razorpay rail degraded?
+       └─ already being recovered?
+                 │
+                 ▼
+       RECOVERY STRATEGIST                     ← LLM: opening line only
+                 │
+                 ▼
+       CALL ORCHESTRATOR ──────────► TWILIO (outbound voice)
+                 │                          │
+                 ▼                          ▼
+          AGENT RUNTIME  ◄─────── customer speech, per turn
+          (LangGraph, bounded)
+                 │
+        ┌────────┴─────────┐
+        ▼                  ▼
+   check_offer         record_opt_out         ← the only mutating tools
+        │                  │
+        ▼                  ▼
+  POLICY ENGINE      CONSENT LEDGER           ← deterministic, append-only
+  (ceiling, margin    (revocation is a
+   floor, exclusions)  new row, never
+        │              an UPDATE)
+        ▼
+   issue_offer ──────► RAZORPAY PAYMENT LINK ──► email
+                              │
+                        webhook (HMAC verified)
+                              │
+                              ▼
+                    ATTRIBUTION + AUDIT LOG
 ```
+
+Every agent tool call — its arguments, decision, latency, and whether it ran degraded — is written to `audit_log` and visible in the dashboard's recovery drawer.
 
 ---
 
-## 🚀 The Two WOW Demos (Core Loops)
+## What's real, and what isn't
 
-### 1. Human Revenue Recovery (Priority 1)
-A customer abandons a cart on Jiva's store. 10 seconds later, the Abandonment Detector fires (ensuring the cart wasn't already paid). Revenue Intel scores the opportunity, Identity resolves the phone number, and the Consent Gate approves outreach. The Call Orchestrator initiates a real outbound voice call via the **Voice Runtime (Twilio)**. 
+| Capability | Status |
+|---|---|
+| Merchant signup, session auth, per-merchant Razorpay keys (validated live, Fernet-encrypted) | **Real** |
+| `payment.failed` webhooks, HMAC-verified per merchant | **Real** |
+| Abandoned-checkout sweeper (DB-backed, survives restarts) | **Real** |
+| Agent runtime (LangGraph), bounded iterations + deadline, never raises | **Real** |
+| Two-phase money gate (`check_offer` → `issue_offer`) | **Real** |
+| Deterministic policy engine: discount ceiling, margin floor, product exclusions | **Real** |
+| Real Razorpay Payment Links, with `offer_token` in `notes` | **Real** |
+| Outbound voice over Twilio (Gather + Play, turn-based) | **Real** |
+| Append-only consent ledger; "don't call me again" honoured immediately | **Real** |
+| Merchant Q&A grounded strictly in that merchant's own rows | **Real** |
+| Batch recovery report | **Real pipeline, simulated customer speech** — see `docs/JUDGE-DEMO.md` |
+| AI-buyer commerce (MCP) | **Not multi-tenant.** `create_purchase_intent` returns `REJECTED: catalog_not_yet_multi_tenant` rather than guessing a merchant. The dashboard marks it "soon" instead of faking it. |
+| WhatsApp | **Not built.** Offers go by email. |
 
-The customer says, *"It's too expensive yaar."*  
-**Customer Intel** parses the structured state: `Intent: purchase`, `Barrier: price`, and crucially stores the immutable `customer_words: "It's too expensive yaar"`.  
-The LLM selects `next_action: request_offer(12%)`.  
-The **Policy Engine** deterministically evaluates merchant rules (margins, max discounts) and counters: `{"decision": "MODIFY", "approved_discount": 8}`.  
-The **Communication Consent** is re-checked, then a WhatsApp checkout payload is dispatched **during the live call**.  
-The customer pays via Razorpay. The webhook hits the Event Bus, and the dashboard instantly displays the `Kinato-Attributed Revenue`.
-
-### 2. AI-Buyer Commerce — *partially built, and honest about it*
-An external AI buyer can search a catalog, receive a **Quote**, and have that
-quote strictly revalidated (price changed, quote expired, inventory gone) before
-any purchase is allowed. **That revalidation boundary is real and tested.**
-
-What is **not** built: the catalog behind it is not yet multi-tenant, so
-`create_purchase_intent` deliberately returns
-`REJECTED: catalog_not_yet_multi_tenant` rather than guessing which merchant to
-bill. There is no Agent Catalog manifest and no MCP transport shipped — earlier
-drafts of this README advertised both; neither existed, so the claims have been
-removed rather than left pointing at 404s. The dashboard marks this surface
-"soon" instead of faking it.
+Speech-to-text is Twilio's built-in `Gather` transcription and is the weakest link in the live demo — accents and line noise degrade it noticeably. `docs/JUDGE-DEMO.md` lists the known weaknesses in full.
 
 ---
 
-## 🎯 Quick Start
+## Quick start
 
-### 1. Backend (FastAPI + Event Bus + Services)
 ```bash
-cd backend
-pip install -r requirements.txt
-cp .env.example .env
-python -m uvicorn app.main:app --port 8000 --reload
+cd backend && pip install -r requirements.txt
+cp .env.example .env      # fill in what you have; the app boots without Twilio/ElevenLabs
+python run_backend.py
 ```
 
-### 2. Frontend (Next.js - Merchant Command Center)
 ```bash
-cd frontend
-npm install
-npm run dev
+cd frontend && npm install && npm run dev
 ```
-Open `http://localhost:3000` to access the Merchant Control Plane.
+
+Open `http://localhost:3000`.
+
+```bash
+cd backend && python -m pytest tests/ -q
+```
+
+Tests run against a real database — no mocked repositories. Test doubles are used only where a test must not place a real phone call or spend real money.
+
+---
+
+## Integration
+
+**Zero code (recommended).** Paste one webhook URL into the Razorpay dashboard:
+
+```
+https://<your-kinato-host>/webhooks/razorpay/<merchant_id>
+```
+
+Enable `payment.failed` and `payment.captured`. `payment.failed` is the primary trigger — it carries the customer's real email and phone, so recovery starts in seconds with no timer and nothing on the storefront.
+
+**With the SDK** (adds abandoned-cart coverage):
+
+```html
+<script src="https://<your-kinato-host>/sdk/kinato.js" data-key="pk_test_..."></script>
+```
+
+Exposes exactly three methods: `Kinato.init`, `Kinato.identify`, `Kinato.track`.
+
+---
+
+## Stopping rules
+
+- **Consent revoked** → recorded as a new append-only row; checked before every outreach.
+- **Razorpay rail down** → `payment.downtime.started` sets a durable flag; no customer is called about a failure that may be Razorpay's outage rather than their card.
+- **No contact details** → recovery blocked, and the reason surfaced on the dashboard rather than silently dropped.
+- **Degraded agent** → an agent running without its LLM cannot call any mutating tool at all.
+- **Duplicate webhooks** → deduplicated against a database UNIQUE constraint, so a redeploy landing between Razorpay's retries cannot double-count revenue.
+- **The sale comes first** → a customer ready to buy is sent a full-price link. The agent never volunteers a discount, and a declined card is treated as a broken checkout, not a price objection.
+
+---
+
+## Documentation
+
+- **`docs/JUDGE-DEMO.md`** — verification guide, real-vs-simulated table, known weaknesses.
