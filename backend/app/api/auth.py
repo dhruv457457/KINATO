@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Response, Depends, HTTPException, status
+from fastapi import APIRouter, Request, Response, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
 
 from app.core.auth import (
@@ -12,15 +12,31 @@ from app.db.repositories import merchants as merchants_repo
 logger = logging.getLogger(__name__)
 auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-# httpOnly cookie, 7 days by default (settings.JWT_EXPIRE_MINUTES). `secure`
-# only in non-development so local http:// testing still works.
-_COOKIE_KWARGS = dict(
-    httponly=True,
-    samesite="lax",
-    secure=settings.ENVIRONMENT != "development",
-    max_age=settings.JWT_EXPIRE_MINUTES * 60,
-    path="/",
-)
+def _cookie_kwargs(request: Request) -> dict:
+    """Session cookie attributes, decided per request.
+
+    The dashboard and the API do not necessarily share a site: the frontend
+    can run on Vercel (or localhost during development) while the API runs
+    on Railway. That makes the session cookie CROSS-SITE, and a browser will
+    silently refuse to store a cross-site cookie unless it is
+    `SameSite=None; Secure`. The previous fixed `SameSite=lax` meant login
+    returned 200, the browser dropped the cookie on the floor, the next
+    /auth/me came back 401, and the app bounced straight back to the login
+    page - an infinite redirect with no error anywhere to explain it.
+
+    So: over HTTPS use None+Secure, which is what any deployed split-origin
+    setup needs. Over plain HTTP (local development, same-site) keep Lax,
+    because browsers reject `SameSite=None` without `Secure` and a local
+    http:// login would then break instead.
+    """
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+    return dict(
+        httponly=True,
+        samesite="none" if is_https else "lax",
+        secure=is_https,
+        max_age=settings.JWT_EXPIRE_MINUTES * 60,
+        path="/",
+    )
 
 
 class SignupRequest(BaseModel):
@@ -49,7 +65,7 @@ def _public_merchant(merchant: dict) -> dict:
 
 
 @auth_router.post("/signup")
-async def signup(payload: SignupRequest, response: Response):
+async def signup(payload: SignupRequest, response: Response, request: Request):
     if merchants_repo.get_merchant_by_email(payload.email):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists.")
 
@@ -64,12 +80,12 @@ async def signup(payload: SignupRequest, response: Response):
     except AuthNotConfiguredError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    response.set_cookie(SESSION_COOKIE_NAME, token, **_COOKIE_KWARGS)
+    response.set_cookie(SESSION_COOKIE_NAME, token, **_cookie_kwargs(request))
     return {"merchant": _public_merchant(merchant)}
 
 
 @auth_router.post("/login")
-async def login(payload: LoginRequest, response: Response):
+async def login(payload: LoginRequest, response: Response, request: Request):
     merchant = merchants_repo.get_merchant_by_email(payload.email)
     if not merchant or not verify_password(payload.password, merchant["password_hash"]):
         # Same error for "no such email" and "wrong password" - don't leak
@@ -81,7 +97,7 @@ async def login(payload: LoginRequest, response: Response):
     except AuthNotConfiguredError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    response.set_cookie(SESSION_COOKIE_NAME, token, **_COOKIE_KWARGS)
+    response.set_cookie(SESSION_COOKIE_NAME, token, **_cookie_kwargs(request))
     return {"merchant": _public_merchant(merchant)}
 
 
