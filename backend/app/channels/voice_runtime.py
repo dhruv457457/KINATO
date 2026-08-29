@@ -40,10 +40,12 @@ on a server-computed offer_token (see app/agents/tools.py). "Opt-out" is
 the model calling record_opt_out, which revokes real consent immediately.
 The discount ladder lives entirely in merchant_policies, never in a prompt.
 """
+import dataclasses
 import json
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from xml.sax.saxutils import escape
 
@@ -53,13 +55,16 @@ from fastapi.responses import Response
 from app.core.config import settings
 from app.gateway.event_bus import bus
 from app.agents.state import AgentContext
-from app.agents.tools import ALL_TOOLS
+from app.agents.tools import ALL_TOOLS, record_opt_out, LOW_CONFIDENCE_FLOOR
+from app.agents.audit import execute_tool
 from app.agents import runtime as agent_runtime
 from app.services.tts import voice_block as tts_voice_block, TWILIO_NEURAL_VOICE
+from app.db.repositories import conversation_turns as turns_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
+from app.services import failure_diagnosis
 from app.services.discovery_agent import contains_placeholder
 from app.services import outreach_guards
 from app.db.database import run_db_async
@@ -100,6 +105,45 @@ voice_router = APIRouter()
 VOICE_MAX_ITERATIONS = 4
 VOICE_DEADLINE_S = 9.0
 
+# --- Surviving speech-to-text ------------------------------------------
+# Twilio posts a `Confidence` float (0.0-1.0) with every SpeechResult, and
+# for the whole life of this project nothing read it. Accents and line
+# noise degrade Gather's transcription badly, and - this is the dangerous
+# part - they degrade it SILENTLY: it returns a fluent, confident-looking
+# sentence that is simply not what the customer said. The agent then
+# reasons perfectly about words nobody spoke.
+#
+# Two thresholds, because there are two different mistakes to avoid:
+#
+#   Below STT_TRUST_FLOOR the turn may still be answered - the agent can
+#   acknowledge, confirm, close warmly - but NO money tool may run. That is
+#   enforced in tools.py (see LOW_CONFIDENCE_FLOOR, which this mirrors),
+#   not by asking the prompt to be careful.
+#
+#   Below STT_UNUSABLE_FLOOR we do not spend an LLM call at all. There is
+#   nothing to reason about; the honest move is to say the line broke up
+#   and ask them to repeat it. This also saves ~2-6s of the turn budget on
+#   exactly the turns most likely to run out of it.
+STT_TRUST_FLOOR = LOW_CONFIDENCE_FLOOR
+STT_UNUSABLE_FLOOR = 0.3
+
+# After this many consecutive unusable turns, stop asking them to repeat
+# themselves. Being asked "sorry, could you say that again?" three times in
+# a row is the point at which a recovery call becomes an irritation, and
+# the customer is very likely on a bad line rather than being unclear. We
+# close by offering the link instead, which needs no transcription at all.
+MAX_MISHEARD_STREAK = 2
+
+# The keypad. This is the ONLY input path in the system that speech
+# recognition cannot corrupt - a DTMF digit arrives as a digit, at
+# confidence 1.0 by construction. That is precisely why opt-out lives here
+# as well as on speech: "take me off your list" is the one instruction a
+# customer must never have to repeat because we misheard it.
+DTMF_OPT_OUT = "9"
+DTMF_YES = "1"
+DTMF_NO = "2"
+DTMF_CALLBACK = "0"
+
 if not (settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN):
     logger.warning("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set - voice calling is disabled until backend/.env is configured.")
     twilio_client = None
@@ -121,16 +165,23 @@ YOU called THEM. They are not expecting this call and have no idea who you are y
 "how can I help you?" or "what can I do for you?" - that is what an inbound support line says, and it will \
 confuse them. You are the one with a reason for calling; give it.
 
-Work through this sequence, ONE step per turn, waiting for their reply each time. Do not rush ahead, and do \
-not deliver several steps in a single breath:
+THE SALE COMES FIRST. This sequence exists to rescue a sale, never to delay one. The moment the customer \
+says they want to buy, or asks you to send the link/checkout, STOP the sequence and send it - call \
+check_offer, then issue_offer, skipping any remaining steps.
 
-1. Make sure they can hear you and confirm who you are speaking to. ("Hello - can you hear me alright? \
-Am I speaking with {customer_label}?")
+You have ALREADY greeted them and they have replied - that is what you are responding to. If they have not \
+yet said what they want, work through this sequence, ONE step per turn, waiting for their reply each time, \
+and never deliver several steps in one breath. SKIP any step they have already answered: someone who opens \
+by asking for the link has answered all of them, and repeating a step back at them loses the sale.
+
+1. Only if you cannot tell whether they heard you, check. Do not re-introduce yourself - you already did.
 2. Say why you are calling{business_intro}. Do NOT give yourself a personal name - you have not been given \
 one, and inventing one (or emitting anything in brackets) is worse than simply not having one. Name the \
 business and move on. Mention that you noticed they were looking at {item_description} on the site and \
 didn't finish checking out.
-3. Ask, openly, what stopped them. Do not guess the reason and do not lead with a discount - the real \
+3. Ask, openly, what stopped them - but ONLY if they have not already told you and have not asked you to \
+send the link. If they have, do not ask - call check_offer with requested_discount_percent=0 and then issue_offer with the token it gives you. Asking this of someone who just said "send me the link"\
+is the single worst thing you can do on this call. Do not guess the reason and do not lead with a discount - the real \
 barrier might be shipping, size, timing, or trust, and offering money to someone who was worried about \
 delivery just wastes margin.
 4. Respond to the barrier they actually name. ONLY if price is genuinely the issue, call check_offer \
@@ -138,10 +189,6 @@ DIRECTLY and propose exactly what it approved. check_offer already loads the rea
 itself - calling get_cart or get_policy_limits first is wasted time on a live call and can run the turn out \
 of budget before any offer is made.
 5. Ask them plainly whether they would like you to send it. Accept a clear yes or a clear no.
-
-THE SALE COMES FIRST. This sequence exists to rescue a sale, never to delay one. The moment the customer \
-says they want to buy, or asks you to send the link/checkout, STOP the sequence and send it - call \
-check_offer, then issue_offer, skipping any remaining steps.
 
 At what price? If they have NOT raised price as their reason, send FULL PRICE: check_offer with \
 requested_discount_percent=0. But if they HAVE said the price is too high, or asked for a discount, do NOT \
@@ -171,6 +218,13 @@ are supposed to say a particular phrase. "Okay", "sure", "yeah", "haan", "theek 
 imperfect phone transcription, so it may be garbled or clipped; judge intent, not wording. Only ask again \
 if you genuinely cannot tell whether they said yes or no, or if they sound confused about what you offered \
 - and if so ask once, simply ("Shall I send it across?"), never repeatedly.
+
+If a tool refuses you, it will say why in a REJECTED_ code, and the code tells you what to do next: ask them \
+to repeat themselves, read the barrier back, or send full price. Do exactly that - never argue with it and never \
+guess your way past it.
+
+They can also press 1 for yes, 2 for no, 9 to be removed from the list, or 0 for a callback. Mention it only \
+if the line is clearly bad.
 
 Sending a payment link is not a risk worth stalling over: nothing is charged, no money moves, and the \
 customer decides at their own leisure. Refusing to send when they meant yes costs the merchant a sale they \
@@ -206,7 +260,13 @@ def _strip_placeholder_identity(text: str) -> str:
     return cleaned or "Hello - I'm calling about the order you started with us."
 
 
-def _build_system_prompt(customer_name: str, item_description: str, business_name: str = "") -> str:
+def _build_system_prompt(
+    customer_name: str,
+    item_description: str,
+    business_name: str = "",
+    failure_class: Optional[str] = None,
+    memory_brief: str = "",
+) -> str:
     """Builds the live-call system prompt.
 
     business_name is threaded through so the agent can say who is calling.
@@ -215,12 +275,29 @@ def _build_system_prompt(customer_name: str, item_description: str, business_nam
     model to invent one and it read "[Your Company]" aloud to a customer.
     """
     customer_label = customer_name if customer_name else "the customer"
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(
         customer_label=customer_label,
         item_description=item_description,
         from_business=f"from {business_name} " if business_name else "",
         business_intro=f" - you are calling from {business_name}" if business_name else "",
     )
+    # One plain sentence about why the payment failed, never the raw
+    # Razorpay error object. Appended rather than interpolated so that when
+    # there is nothing useful to say the prompt simply does not mention it,
+    # instead of asserting something hollow - the same rule the email
+    # templates follow. The hard behaviour still lives in check_offer's
+    # REJECTED_FULL_PRICE_FIRST; this only stops the agent sounding
+    # ignorant of something it is being held to.
+    diagnosis_line = failure_diagnosis.describe(failure_class)
+    if diagnosis_line:
+        prompt = f"{prompt}\n{diagnosis_line}\n"
+    # What we already know about this person, from earlier attempts. Bounded
+    # and omitted entirely when there is nothing to say - see
+    # app/services/customer_memory.py. Appended last so it is the freshest
+    # thing in context without displacing any rule above it.
+    if memory_brief:
+        prompt = f"{prompt}\n{memory_brief}\n"
+    return prompt
 
 
 def _describe_cart(checkout: Dict[str, Any]) -> str:
@@ -253,12 +330,18 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
     except Exception:
         business_name = ""
 
+    # Classified once, by the webhook, and read from the checkout row here
+    # - so a second recovery attempt days later diagnoses from the same
+    # evidence rather than guessing again from nothing.
+    failure_class = (checkout or {}).get("failure_class")
+
     ctx = AgentContext(
         merchant_id=attempt["merchant_id"],
         correlation_id=recovery_attempt_id,
         customer_id=attempt.get("customer_id"),
         checkout_id=attempt["checkout_id"],
         recovery_attempt_id=recovery_attempt_id,
+        failure_class=failure_class,
     )
     return {
         "ctx": ctx,
@@ -273,22 +356,61 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
         # business name, in which case the prompt omits it entirely rather
         # than letting the model invent one.
         "business_name": business_name,
+        "failure_class": failure_class,
+        # Pre-computed by call_orchestrator BEFORE dialling and carried in
+        # the plan, for exactly the reason the opening voice_block is:
+        # this webhook answers inside Twilio's ~15s deadline, and blowing
+        # that deadline does not degrade the call, it ENDS it. Building the
+        # brief here would have added a DB round trip (~2-2.8s from Railway
+        # to Supabase, per policies.py's measurement) to the single most
+        # deadline-sensitive request in the system, to save nothing.
+        "memory_brief": plan.get("memory_brief") or "",
         "turns": 0,
+        # Where the next persisted turn goes. Zero for a fresh call, which
+        # is the overwhelmingly common case and costs no query;
+        # _rehydrate_session overrides it with the real value read from the
+        # transcript, which is the only path where it can be non-zero.
+        "turn_index": 0,
+        # Consecutive turns we could not make out at all. Reset by any
+        # usable turn; MAX_MISHEARD_STREAK ends the attempt gracefully
+        # instead of asking a third time.
+        "misheard_streak": 0,
+        # Set once check_offer has bounced a discount with
+        # REJECTED_UNCONFIRMED_BARRIER. The agent's very next turn IS the
+        # confirming question, so the customer's reply to it is, by
+        # construction, an answer to that question - which is what unlocks
+        # the discount path. Deriving this from the refusal rather than by
+        # scanning the customer's words for "yes" is deliberate: keyword-
+        # matching agreement is the exact pattern this file's own rewrite
+        # deleted, and it is no more trustworthy here than it was there.
+        "discount_bounced": False,
     }
 
 
 def _gather_twiml(voice_block: str, retry_message: str = "Are you still there?") -> str:
+    """Every Gather accepts speech AND a keypad digit.
+
+    `input="speech dtmf"` costs nothing when the customer just talks, and
+    gives them a path that transcription cannot corrupt when it is not
+    working. numDigits="1" means a single press submits immediately rather
+    than waiting for a terminating key nobody knows to press.
+    """
+    attrs = (
+        f'input="speech dtmf" numDigits="1" action="{settings.NGROK_URL}/voice/respond" '
+        f'method="POST" speechTimeout="auto" timeout="5" language="en-IN"'
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
-        f'    <Gather input="speech" action="{settings.NGROK_URL}/voice/respond" method="POST" speechTimeout="auto" timeout="5" language="en-IN">\n'
+        f'    <Gather {attrs}>\n'
         f'        {voice_block}\n'
         '    </Gather>\n'
-        f'    <Gather input="speech" action="{settings.NGROK_URL}/voice/respond" method="POST" speechTimeout="auto" timeout="5" language="en-IN">\n'
+        f'    <Gather {attrs}>\n'
         f'        <Say voice="{TWILIO_NEURAL_VOICE}">{escape(retry_message)}</Say>\n'
         '    </Gather>\n'
         '</Response>'
     )
+
 
 
 def _escalation_twiml(message: str) -> str:
@@ -345,34 +467,356 @@ async def twilio_outbound_twiml(request: Request):
         )
 
     CALL_SESSIONS[call_id] = session
+    # The only identifier a later mid-call webhook carries. Recorded now,
+    # while we still have both halves of the mapping.
+    try:
+        await run_db_async(
+            recovery_attempts_repo.update_state,
+            recovery_attempt_id,
+            "CALLING",
+            twilio_call_sid=call_id,
+        )
+    except Exception as e:
+        logger.warning(f"[CALL {call_id}] Could not record the Twilio CallSid (non-fatal): {e}")
+    await _record_turn(session, turns_repo.AGENT, session["opening_line"])
+    # And tell the AGENT it said it, not just the transcript. Twilio plays
+    # this line; the model never saw it, so it introduced itself again on
+    # the very next turn.
+    agent_runtime.seed_opening(
+        call_id,
+        _build_system_prompt(
+            session["customer_name"],
+            session["item_description"],
+            session.get("business_name", ""),
+            session.get("failure_class"),
+            session.get("memory_brief", ""),
+        ),
+        session["opening_line"],
+    )
+
     # Prefer the pre-generated block (see call_orchestrator.py) - only
     # synthesize live here if pre-generation wasn't done. voice_block()
     # always returns something playable (ElevenLabs, or Twilio's own
     # Neural voice) - see tts.py's module docstring.
     block = session["opening_voice_block"] or await tts_voice_block(session["opening_line"])
 
+    # One short, spoken mention of the keypad, on the opening turn only.
+    # It is here rather than in the prompt because it is a promise the code
+    # keeps, not a line the model may or may not remember to say: the
+    # keypad is the only route out of this call that transcription cannot
+    # swallow, and a customer who is being misheard is exactly the customer
+    # most likely to want out. Deliberately one sentence and no menu - a
+    # recited IVR list on a sales call is its own kind of failure. Rendered
+    # by Twilio itself, so it costs no ElevenLabs budget.
+    keypad_note = (
+        f'<Say voice="{TWILIO_NEURAL_VOICE}">'
+        "Just so you know, you can press 9 at any time to be removed from our list."
+        "</Say>"
+    )
+
+    return Response(content=_gather_twiml(block + keypad_note), media_type="text/xml")
+
+
+async def _record_turn(
+    session: Dict[str, Any],
+    speaker: str,
+    text: str,
+    stt_confidence: Optional[float] = None,
+    input_mode: str = "speech",
+) -> None:
+    """Persist one side of one exchange.
+
+    Never fatal. A transcript is evidence about a call, not a precondition
+    for one - failing the customer's turn because the write failed would
+    trade a real conversation for a record of it. Same rule the audit log
+    and the event bus already follow.
+    """
+    ctx = session["ctx"]
+    if not ctx.recovery_attempt_id or not (text or "").strip():
+        return
+    try:
+        index = session["turn_index"]
+        session["turn_index"] = index + 1
+        await run_db_async(
+            turns_repo.record_turn,
+            merchant_id=ctx.merchant_id,
+            recovery_attempt_id=ctx.recovery_attempt_id,
+            turn_index=index,
+            speaker=speaker,
+            text=text,
+            customer_id=ctx.customer_id,
+            channel="voice",
+            stt_confidence=stt_confidence,
+            input_mode=input_mode,
+        )
+    except Exception as e:
+        logger.warning(f"conversation_turns write failed (non-fatal): {e}")
+
+
+def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
+    """Rebuild a lost call session from the database.
+
+    A mid-call Twilio webhook carries the CallSid and nothing else, so when
+    CALL_SESSIONS has no entry - after a restart, or on a second worker
+    that never handled this call's /voice/outbound - the CallSid recorded
+    on the recovery attempt is the way back. Before this existed the only
+    possible answer was "Sorry, I lost track of our order details", said to
+    a customer who was mid-sentence.
+    """
+    attempt = recovery_attempts_repo.get_by_call_sid(call_id)
+    if not attempt:
+        return None
+    session = _load_session_for_call(attempt["recovery_attempt_id"])
+    if not session:
+        return None
+
+    turns = turns_repo.list_for_attempt(attempt["recovery_attempt_id"])
+    session["turn_index"] = turns_repo.next_turn_index(attempt["recovery_attempt_id"])
+    session["turns"] = sum(1 for t in turns if t["speaker"] == turns_repo.CUSTOMER)
+    agent_runtime.restore_thread(
+        call_id,
+        _build_system_prompt(
+            session["customer_name"],
+            session["item_description"],
+            session.get("business_name", ""),
+            session.get("failure_class"),
+            session.get("memory_brief", ""),
+        ),
+        turns,
+    )
+    CALL_SESSIONS[call_id] = session
+    logger.warning(
+        f"[CALL {call_id}] Session was missing and has been rebuilt from the database "
+        f"({len(turns)} turn(s)) - the conversation continues instead of ending."
+    )
+    return session
+
+
+def _parse_confidence(raw: Any) -> Optional[float]:
+    """Twilio's Gather `Confidence`, clamped to 0..1.
+
+    Returns None when the field is absent or unparseable, which means "this
+    input did not come from speech recognition" - a keypad press, or a
+    payload shape we do not recognise. None is NOT "assume it was fine":
+    the money tools treat None as not-applicable, so every path that can
+    produce None must be a path where speech was not the input.
+    """
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _run_agent_turn(
+    call_id: str,
+    session: Dict[str, Any],
+    user_message: str,
+    confidence: Optional[float],
+    from_speech: bool,
+) -> Response:
+    """One conversational turn, shared by the speech path and the keypad
+    path. `confidence` is None for keypad input - a pressed digit is not
+    something we can mishear - and `from_speech` says which path we are on
+    independently of whether Twilio sent a Confidence field."""
+    ctx = session["ctx"]
+    await _record_turn(
+        session,
+        turns_repo.CUSTOMER,
+        user_message,
+        stt_confidence=confidence,
+        input_mode="speech" if from_speech else "dtmf",
+    )
+
+    # A fresh per-turn context. AgentContext is frozen, and that matters
+    # here: what we heard, and whether the barrier has been confirmed, are
+    # facts about THIS turn, not about the call. Mutating one shared
+    # context would let a clearly-heard turn silently vouch for a later
+    # garbled one.
+    turn_ctx = dataclasses.replace(
+        ctx,
+        stt_confidence=confidence,
+        # A keypad turn arrives with confidence None and is not speech; a
+        # spoken turn is speech whether or not Twilio troubled itself to
+        # send a Confidence field with it.
+        input_is_speech=confidence is not None or from_speech,
+        barrier_confirmed=session["discount_bounced"],
+    )
+
+    result = await agent_runtime.run_agent(
+        system_prompt=_build_system_prompt(
+            session["customer_name"],
+            session["item_description"],
+            session.get("business_name", ""),
+            session.get("failure_class"),
+            session.get("memory_brief", ""),
+        ),
+        user_message=user_message,
+        ctx=turn_ctx,
+        tools=ALL_TOOLS,
+        thread_id=call_id,
+        max_iterations=VOICE_MAX_ITERATIONS,
+        deadline_s=VOICE_DEADLINE_S,
+    )
+
+    # The discount was refused for want of a confirmed barrier. The agent's
+    # reply to this turn is therefore the confirming question, so the
+    # customer's NEXT turn is an answer to it and the discount path opens.
+    # This is a state machine over real tool refusals, not an inference
+    # about what the customer meant.
+    if any(r.get("reason") == "REJECTED_UNCONFIRMED_BARRIER" for r in result.refusals):
+        session["discount_bounced"] = True
+        logger.info(
+            f"[CALL {call_id}] Discount bounced pending barrier confirmation - "
+            "the agent asks the confirming question this turn."
+        )
+
+    # Checked BEFORE the degraded/no-content fallback, deliberately: a
+    # timeout or dropped final response can still follow real, already-
+    # executed tool calls (see app/agents/runtime.py's tool_calls_tracker -
+    # a confirmed live bug where a real issue_offer had already sent a
+    # real payment link, but the generic "technical difficulty" message
+    # played anyway because the wrapping result looked degraded). The
+    # customer must never be told "we'll follow up" when something real
+    # already happened this turn.
+    if "issue_offer" in result.tool_calls_made:
+        reply_text = result.output.get("content") if (result.output or {}).get("content") else (
+            "Great news - I've sent that offer to your email, you should see it any moment."
+        )
+    elif "record_opt_out" in result.tool_calls_made:
+        reply_text = result.output.get("content") if (result.output or {}).get("content") else (
+            "Understood, I won't contact you about this again. Take care."
+        )
+    elif not result.ok or result.degraded or not (result.output or {}).get("content"):
+        # Never fabricate a scripted line here - a short, honest, generic
+        # reply is what "degraded" means for a live call.
+        reply_text = "I hear you - let me have someone from our team follow up with you by email on this."
+        await _publish_escalation(call_id, ctx, result.error or "agent_degraded_or_empty_reply")
+    else:
+        reply_text = result.output["content"]
+
+    # A reply is SPOKEN ALOUD. The opening line has been guarded against
+    # template slots since a call read "[Your Name] from [Your Company]" to a
+    # customer - but that guard only covered the opening. A live turn later
+    # said "This is [Your Name] from Dhruv", proving the guard was on the
+    # wrong layer alone. Every spoken line goes through it now.
+    if contains_placeholder(reply_text):
+        logger.warning(
+            f"[CALL {call_id}] Model reply contained a placeholder ({reply_text!r}) - "
+            "replacing it rather than reading brackets aloud."
+        )
+        reply_text = _strip_placeholder_identity(reply_text)
+
+    logger.info(
+        f"[CALL {call_id}] Agent ({'degraded' if result.degraded else 'ok'}): {reply_text!r} | "
+        f"tools: {result.tool_calls_made} | refusals: {[r['reason'] for r in result.refusals]}"
+    )
+
+    await _record_turn(session, turns_repo.AGENT, reply_text)
+
+    if "record_opt_out" in result.tool_calls_made:
+        agent_runtime.discard_thread(call_id)
+        return Response(content=_escalation_twiml(reply_text), media_type="text/xml")
+
+    block = await tts_voice_block(reply_text)
+    return Response(content=_gather_twiml(block), media_type="text/xml")
+
+
+async def _handle_keypad(call_id: str, session: Dict[str, Any], digit: str) -> Response:
+    """The one input path speech recognition cannot corrupt.
+
+    Opt-out and callback are handled here WITHOUT the model: a customer who
+    presses 9 has given an unambiguous instruction, and routing it through
+    an LLM turn can only add latency and ways to get it wrong. They still
+    produce real audit rows, because they go through the same execute_tool
+    choke point every other tool call does.
+    """
+    ctx = session["ctx"]
+    session["misheard_streak"] = 0
+    await _record_turn(session, turns_repo.CUSTOMER, f"[pressed {digit}]", input_mode="dtmf")
+
+    if digit == DTMF_OPT_OUT:
+        logger.info(f"[CALL {call_id}] Keypad {DTMF_OPT_OUT} - opting out, no model involved.")
+        await execute_tool(record_opt_out, {}, ctx)
+        agent_runtime.discard_thread(call_id)
+        return Response(
+            content=_escalation_twiml(
+                "Understood - I've taken you off our list, and you won't hear from us again. Take care."
+            ),
+            media_type="text/xml",
+        )
+
+    if digit == DTMF_CALLBACK:
+        logger.info(f"[CALL {call_id}] Keypad {DTMF_CALLBACK} - callback requested.")
+        if ctx.recovery_attempt_id:
+            await run_db_async(
+                recovery_attempts_repo.update_state,
+                ctx.recovery_attempt_id,
+                "CALLBACK_REQUESTED",
+                callback_requested_at=datetime.now(timezone.utc),
+            )
+        await bus.publish(
+            event_type="recovery.callback_requested",
+            payload={"recovery_attempt_id": ctx.recovery_attempt_id, "checkout_id": ctx.checkout_id},
+            correlation_id=ctx.correlation_id,
+            merchant_id=ctx.merchant_id,
+        )
+        agent_runtime.discard_thread(call_id)
+        return Response(
+            content=_escalation_twiml(
+                "No problem at all - I'll arrange for someone to call you back at a better time. "
+                "Thanks for your time."
+            ),
+            media_type="text/xml",
+        )
+
+    if digit in (DTMF_YES, DTMF_NO):
+        # Turned into speech the agent can reason about, at confidence None
+        # - a pressed key is not a transcription, so the mishearing gate
+        # does not apply to it and a money tool may run on this turn.
+        synthetic = "Yes, please go ahead." if digit == DTMF_YES else "No, thank you."
+        logger.info(f"[CALL {call_id}] Keypad {digit} -> {synthetic!r}")
+        return await _run_agent_turn(call_id, session, synthetic, confidence=None, from_speech=False)
+
+    block = await tts_voice_block(
+        "Sorry, I didn't catch that. You can just tell me, or press 1 for yes, 2 for no, "
+        "or 9 to be removed from our list."
+    )
     return Response(content=_gather_twiml(block), media_type="text/xml")
 
 
 @voice_router.api_route("/voice/respond", methods=["GET", "POST"])
 async def twilio_voice_respond(request: Request):
-    """Twilio posts live speech transcriptions here - one LLM turn per
-    exchange, through the Day 5 agent runtime, with real tools."""
+    """Twilio posts live speech transcriptions - and keypad digits - here.
+    One agent turn per exchange, through the Day 5 agent runtime, with real
+    tools."""
     if request.method == "POST":
-        form_data = await request.form()
-        customer_speech = form_data.get("SpeechResult", "")
-        call_id = form_data.get("CallSid", "unknown")
+        source: Any = await request.form()
     else:
-        customer_speech = request.query_params.get("SpeechResult", "")
-        call_id = request.query_params.get("CallSid", "unknown")
+        source = request.query_params
+    customer_speech = (source.get("SpeechResult") or "").strip()
+    call_id = source.get("CallSid", "unknown")
+    digits = (source.get("Digits") or "").strip()
+    # Twilio has sent this on every speech turn since the first call this
+    # project ever placed. It is finally read.
+    confidence = _parse_confidence(source.get("Confidence"))
 
     session = CALL_SESSIONS.get(call_id)
     if not session:
-        logger.error(f"voice/respond: no session for call_id={call_id!r} (outbound webhook never ran?).")
-        return Response(content=_escalation_twiml("Sorry, I lost track of our order details. We'll follow up by email."), media_type="text/xml")
+        # The in-memory cache is no longer the only copy - see
+        # _rehydrate_session. This branch used to be the end of the call.
+        session = await run_db_async(_rehydrate_session, call_id)
+    if not session:
+        logger.error(f"voice/respond: no session and no persisted call for call_id={call_id!r}.")
+        return Response(
+            content=_escalation_twiml("Sorry, I lost track of our order details. We'll follow up by email."),
+            media_type="text/xml",
+        )
 
     session["turns"] += 1
-    logger.info(f"[CALL {call_id}] Customer: '{customer_speech}'")
+    logger.info(
+        f"[CALL {call_id}] Customer: {customer_speech!r} "
+        f"(confidence={confidence if confidence is not None else 'n/a'}, digits={digits!r})"
+    )
 
     # Paid-while-talking. The pre-dial guard checks this once, before the
     # phone rings - but a customer can pay from the earlier link, or on
@@ -407,62 +851,40 @@ async def twilio_voice_respond(request: Request):
                 media_type="text/xml",
             )
 
-    result = await agent_runtime.run_agent(
-        system_prompt=_build_system_prompt(
-            session["customer_name"], session["item_description"], session.get("business_name", "")
-        ),
-        user_message=customer_speech,
-        ctx=session["ctx"],
-        tools=ALL_TOOLS,
-        thread_id=call_id,
-        max_iterations=VOICE_MAX_ITERATIONS,
-        deadline_s=VOICE_DEADLINE_S,
-    )
+    # The keypad wins over speech. If both arrived, the digit is the
+    # deliberate act and the transcription is whatever noise accompanied it.
+    if digits:
+        return await _handle_keypad(call_id, session, digits)
 
-    # Checked BEFORE the degraded/no-content fallback, deliberately: a
-    # timeout or dropped final response can still follow real, already-
-    # executed tool calls (see app/agents/runtime.py's tool_calls_tracker -
-    # a confirmed live bug where a real issue_offer had already sent a
-    # real payment link, but the generic "technical difficulty" message
-    # played anyway because the wrapping result looked degraded). The
-    # customer must never be told "we'll follow up" when something real
-    # already happened this turn.
-    if "issue_offer" in result.tool_calls_made:
-        reply_text = result.output.get("content") if (result.output or {}).get("content") else (
-            "Great news - I've sent that offer to your email, you should see it any moment."
-        )
-    elif "record_opt_out" in result.tool_calls_made:
-        reply_text = result.output.get("content") if (result.output or {}).get("content") else (
-            "Understood, I won't contact you about this again. Take care."
-        )
-    elif not result.ok or result.degraded or not (result.output or {}).get("content"):
-        # Never fabricate a scripted line here - a short, honest, generic
-        # reply is what "degraded" means for a live call.
-        reply_text = "I hear you - let me have someone from our team follow up with you by email on this."
-        await _publish_escalation(call_id, session["ctx"], result.error or "agent_degraded_or_empty_reply")
-    else:
-        reply_text = result.output["content"]
+    # Twilio heard silence. Re-prompt rather than handing an empty string
+    # to the model, which will confidently reply to something nobody said.
+    if not customer_speech:
+        block = await tts_voice_block("Sorry, I didn't hear anything there - are you still with me?")
+        return Response(content=_gather_twiml(block), media_type="text/xml")
 
-    # A reply is SPOKEN ALOUD. The opening line has been guarded against
-    # template slots since a call read "[Your Name] from [Your Company]" to a
-    # customer - but that guard only covered the opening. A live turn later
-    # said "This is [Your Name] from Dhruv", proving the guard was on the
-    # wrong layer alone. Every spoken line goes through it now.
-    if contains_placeholder(reply_text):
+    # Too garbled to reason about. Do not spend an LLM call on it, and do
+    # not let the agent form an opinion about words probably never spoken.
+    if confidence is not None and confidence < STT_UNUSABLE_FLOOR:
+        session["misheard_streak"] += 1
         logger.warning(
-            f"[CALL {call_id}] Model reply contained a placeholder ({reply_text!r}) - "
-            "replacing it rather than reading brackets aloud."
+            f"[CALL {call_id}] Unusable transcription (confidence={confidence:.2f} < {STT_UNUSABLE_FLOOR}), "
+            f"streak={session['misheard_streak']} - not calling the model."
         )
-        reply_text = _strip_placeholder_identity(reply_text)
+        if session["misheard_streak"] >= MAX_MISHEARD_STREAK:
+            # Asking a third time is where this stops being a bad line and
+            # starts being an irritating call. Hand them the one input
+            # channel that still works instead.
+            block = await tts_voice_block(
+                "I'm really struggling to hear you - the line isn't great. Press 1 and I'll email you "
+                "the checkout link, or press 9 if you'd rather we didn't contact you again."
+            )
+            return Response(content=_gather_twiml(block), media_type="text/xml")
+        block = await tts_voice_block("Sorry, the line broke up there - could you say that again?")
+        return Response(content=_gather_twiml(block), media_type="text/xml")
 
-    logger.info(f"[CALL {call_id}] Agent ({'degraded' if result.degraded else 'ok'}): '{reply_text}' | tools: {result.tool_calls_made}")
+    session["misheard_streak"] = 0
+    return await _run_agent_turn(call_id, session, customer_speech, confidence, from_speech=True)
 
-    if "record_opt_out" in result.tool_calls_made:
-        agent_runtime.discard_thread(call_id)
-        return Response(content=_escalation_twiml(reply_text), media_type="text/xml")
-
-    block = await tts_voice_block(reply_text)
-    return Response(content=_gather_twiml(block), media_type="text/xml")
 
 
 @voice_router.get("/api/call-sessions")

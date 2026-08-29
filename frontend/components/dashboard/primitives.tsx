@@ -36,7 +36,7 @@ export function PageHeader({
 }) {
   return (
     <header
-      className="border-b px-14 py-10 flex items-end justify-between gap-6 anim-rise"
+      className="border-b px-6 lg:px-14 py-7 lg:py-10 flex items-end justify-between gap-6 anim-rise"
       style={{ borderColor: RULE }}
     >
       <div>
@@ -52,7 +52,13 @@ export function PageHeader({
 
 /** Standard page body wrapper - consistent gutters on every dashboard page. */
 export function PageBody({ children, narrow = false }: { children: ReactNode; narrow?: boolean }) {
-  return <div className={`flex-1 px-14 py-10 w-full${narrow ? " max-w-2xl" : ""}`}>{children}</div>;
+  // Gutters are responsive because px-14 is a desktop margin: on a 375px
+  // screen it spends 30% of the width on whitespace, which is generosity
+  // in the wrong place. The Vignelli discipline is about proportion, not
+  // about a fixed number of pixels.
+  return (
+    <div className={`flex-1 px-6 lg:px-14 py-7 lg:py-10 w-full${narrow ? " max-w-2xl" : ""}`}>{children}</div>
+  );
 }
 
 /**
@@ -196,6 +202,10 @@ export function toneForRecoveryState(state: string): Tone {
   // committed and we are deliberately waiting, so it should not read as a
   // warning next to genuine failures.
   if (state === "PROMISED") return "positive";
+  // A rule stopping us is neither a failure nor a win - it is the system
+  // doing exactly what the merchant configured. Colouring it red next to
+  // real dial failures is how a compliance success gets read as a fault.
+  if (state === "BLOCKED") return "neutral";
   if (state === "CALLING" || state === "PAYMENT_LINK_SENT" || state === "OUTREACH_APPROVED") return "warning";
   return "neutral";
 }

@@ -74,7 +74,13 @@ def _get_llm_client():
     return AsyncOpenAI(base_url=settings.LLM_BASE_URL, api_key=settings.OPENROUTER_API_KEY, http_client=ipv4_client())
 
 
-def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: List[str], inflight_mutations: list):
+def _build_graph(
+    tools: List[Tool],
+    max_iterations: int,
+    tool_calls_tracker: List[str],
+    inflight_mutations: list,
+    refusals_tracker: List[Dict[str, str]],
+):
     """tool_calls_tracker is a plain list owned by the caller (run_agent),
     appended to directly here rather than only through the graph's own
     state - a real, confirmed bug: when the overall deadline_s wrapper in
@@ -173,6 +179,14 @@ def _build_graph(tools: List[Tool], max_iterations: int, tool_calls_tracker: Lis
                     result = await execute_tool(tool, args, ctx)
                 state["tool_calls_made"].append(tool.name)
                 tool_calls_tracker.append(tool.name)  # survives even if the overall run later times out
+                # A structured refusal is information the CALLER needs, not
+                # just the model: voice_runtime decides whether to run a
+                # barrier-confirmation turn from this, rather than by
+                # reading the model's own prose back. Same survives-a-
+                # timeout reasoning as tool_calls_tracker above.
+                _reason = result.get("reason") if isinstance(result, dict) else None
+                if isinstance(_reason, str) and _reason.startswith("REJECTED_"):
+                    refusals_tracker.append({"tool": tool.name, "reason": _reason})
             return {"tool_call_id": tc["id"], "role": "tool", "name": name, "content": json.dumps(result)}
 
         # Read-only tools run concurrently; mutating tools run strictly
@@ -248,7 +262,8 @@ async def run_agent(
     # tell the customer nothing happened while a real payment link was being
     # created behind them. That exact contradiction happened on a live call.
     inflight_mutations: list = []
-    graph = _build_graph(tools, max_iterations, tool_calls_tracker, inflight_mutations)
+    refusals_tracker: List[Dict[str, str]] = []
+    graph = _build_graph(tools, max_iterations, tool_calls_tracker, inflight_mutations, refusals_tracker)
 
     async def _settle_inflight_mutations(grace_s: float = 6.0) -> None:
         pending = [(n, t) for n, t in inflight_mutations if not t.done()]
@@ -273,14 +288,20 @@ async def run_agent(
         )
     except asyncio.TimeoutError:
         await _settle_inflight_mutations()
-        return AgentResult(ok=False, error="deadline_exceeded", degraded=True, tool_calls_made=list(tool_calls_tracker))
+        return AgentResult(
+            ok=False, error="deadline_exceeded", degraded=True,
+            tool_calls_made=list(tool_calls_tracker), refusals=list(refusals_tracker),
+        )
     except GraphRecursionError:
-        return AgentResult(ok=False, error="recursion_limit_reached", degraded=True, tool_calls_made=list(tool_calls_tracker))
+        return AgentResult(
+            ok=False, error="recursion_limit_reached", degraded=True,
+            tool_calls_made=list(tool_calls_tracker), refusals=list(refusals_tracker),
+        )
     except Exception as e:
         logger.error(f"Agent run raised unexpectedly: {e}", exc_info=True)
         return AgentResult(
             ok=False, error=f"unexpected_error: {e.__class__.__name__}", degraded=True,
-            tool_calls_made=list(tool_calls_tracker),
+            tool_calls_made=list(tool_calls_tracker), refusals=list(refusals_tracker),
         )
 
     if thread_id:
@@ -293,7 +314,57 @@ async def run_agent(
         degraded=bool(final.get("degraded") or final_state["ctx"].degraded),
         iterations=final_state["iterations"],
         tool_calls_made=final_state["tool_calls_made"],
+        refusals=list(refusals_tracker),
     )
+
+
+def has_thread(thread_id: str) -> bool:
+    return thread_id in _conversation_store
+
+
+def restore_thread(thread_id: str, system_prompt: str, turns: List[Dict[str, Any]]) -> None:
+    """Rebuild an in-memory conversation thread from persisted turns.
+
+    This is what makes a mid-call restart survivable. The store is still a
+    plain in-process dict - that has not changed, and for a single turn it
+    is the right shape - but it is no longer the only copy. When it is
+    empty for a call that is demonstrably in progress, the transcript in
+    the database is the source of truth and the cache is rebuilt from it.
+
+    Tool calls are deliberately NOT replayed. What matters for the next
+    turn is what was said; re-injecting old tool-call/tool-result message
+    pairs would invite the model to treat a completed action as still
+    pending - and one of those actions creates real payment links.
+    """
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for turn in turns:
+        role = "assistant" if turn.get("speaker") == "agent" else "user"
+        text = (turn.get("text") or "").strip()
+        if text:
+            messages.append({"role": role, "content": text})
+    _conversation_store[thread_id] = messages
+    logger.info(f"Restored conversation thread {thread_id!r} from {len(turns)} persisted turn(s).")
+
+
+def seed_opening(thread_id: str, system_prompt: str, opening_line: str) -> None:
+    """Tell the agent what it has already said.
+
+    The opening line is generated before dialling and played to the
+    customer by Twilio, so by the time the first reply arrives the agent
+    HAS spoken - but nothing put that in its message thread. The model
+    therefore opened every call by introducing itself a second time,
+    immediately after the customer had answered the first introduction.
+
+    On a short conversation this was not merely awkward, it was fatal: the
+    agent spent its turns on a greeting it had already given while the
+    customer asked to buy, and never reached a tool at all.
+    """
+    if not thread_id or not (opening_line or "").strip():
+        return
+    _conversation_store[thread_id] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": opening_line},
+    ]
 
 
 def discard_thread(thread_id: str) -> None:

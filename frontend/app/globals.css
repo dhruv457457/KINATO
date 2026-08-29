@@ -217,3 +217,29 @@ body {
   }
   .anim-fade, .anim-rise, .anim-row, .anim-drawer { opacity: 1; transform: none; }
 }
+
+/* ---------------------------------------------------------------------
+ * Dashboard rail, responsive.
+ *
+ * The rail is signage, and signage stays visible - so below lg it lies
+ * down into a horizontal strip rather than collapsing into a drawer. A
+ * drawer would introduce an interaction language this dashboard uses
+ * nowhere else, for eight destinations that fit on one line.
+ *
+ * The active marker rotates with it: a 2px left rule when the nav is
+ * vertical, a 2px underline when it is horizontal. Same hairline weight,
+ * same ink, same idea - only the edge changes.
+ * ------------------------------------------------------------------- */
+.nav-item {
+  border-bottom: 2px solid var(--active-rule, transparent);
+  padding-bottom: 6px;
+}
+@media (min-width: 1024px) {
+  .nav-item {
+    border-bottom: none;
+    border-left: 2px solid var(--active-rule, transparent);
+    padding-bottom: 0;
+    padding-left: 10px;
+    margin-left: -12px;
+  }
+}

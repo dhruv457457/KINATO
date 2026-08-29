@@ -190,7 +190,7 @@ async def test_product_excluded_from_discounts_is_denied_gracefully(connected_me
 
     checked = await execute_tool(check_offer, {"requested_discount_percent": 5.0}, ctx)
     assert checked["decision"] == "DENY"
-    assert checked["reason"] == "product_excluded"
+    assert checked["reason"] == "REJECTED_SKU_EXCLUDED"
 
 
 async def test_watchdog_proceeds_with_generic_line_if_plan_never_arrives(

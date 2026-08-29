@@ -155,7 +155,7 @@ tool schema accepts `merchant_id`, `amount`, `phone`, or `email` from the model.
 
 Listed because pretending they do not exist is worse than having them.
 
-* **Speech-to-text is the weakest link.** Twilio's `Gather` transcription struggles with accents and background noise. The agent's own reasoning is far more reliable than its ears.
+* **Speech-to-text is still the weakest link, but it can no longer move money.** Twilio's `Gather` transcription struggles with accents and background noise, and it fails *silently* — returning a fluent sentence the customer never said. Twilio reports a confidence score on every turn, and it is now read: below 0.6 no money tool will run at all (`REJECTED_LOW_CONFIDENCE`), and below 0.3 the model is not called and the agent asks them to repeat it. Every prompt also accepts the keypad, which transcription cannot corrupt — 9 opts out immediately with no model involved. The agent's ears are still worse than its reasoning; they are no longer trusted with the merchant's margin.
 * **AI Commerce is not multi-tenant.** It refuses clearly instead of guessing a merchant.
 * **The spend-mandate layer is a Kinato-enforced daily cap on top of real Razorpay Orders** — not an NPCI/RBI UPI Autopay settlement. Real UPI Autopay needs the customer's own in-app approval, which a headless agent cannot complete. `app/payments/spend_mandate.py` says so in its own docstring.
 * **ElevenLabs is best-effort.** When it is slow or unreachable the call falls back to Twilio's neural voice, which is rendered on Twilio's infrastructure and cannot fail from our side.

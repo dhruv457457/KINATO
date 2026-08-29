@@ -1,8 +1,14 @@
+import json
 import logging
 import os
 import httpx
 from typing import Dict, Any, Optional
 from app.gateway.event_bus import bus
+from app.db.repositories import checkouts as checkouts_repo
+from app.db.repositories import consents as consents_repo
+from app.db.repositories import customers as customers_repo
+from app.db.repositories import merchants as merchants_repo
+from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -171,5 +177,104 @@ class EmailService:
             logger.warning(f"Resend Email dispatch exception: {e}")
         return "failed", ""
 
+    @staticmethod
+    async def handle_promise_lapsed(event: Dict[str, Any]):
+        """The one reminder a lapsed promise earns.
+
+        `recovery.promise_lapsed` has been published by the sweeper on a
+        carefully-designed once-only schedule - guarded by
+        promise_reminded_at so a customer who committed and then didn't pay
+        is chased exactly once and never again - and until now **nothing
+        subscribed to it**. The event fired, the row was marked reminded,
+        and no reminder was ever sent to anybody. The restraint was real
+        and the reminder was imaginary.
+
+        Three refusals here, each of which would otherwise turn a helpful
+        nudge into the thing merchants get complaints about:
+
+          * They have paid. The sweeper's query already excludes paid
+            checkouts, but this is the last moment before an email leaves,
+            and a payment landing in between is exactly the race worth
+            losing safely.
+          * They have opted out - on ANY channel. Someone who said "don't
+            contact me again" on the call did not mean "except by email".
+          * We have no link to remind them of, in which case the honest
+            thing is to send nothing rather than an email that just asks
+            for money with no way to pay it.
+        """
+        payload = event.get("payload", {})
+        merchant_id = event.get("merchant_id", "")
+        recovery_attempt_id = payload.get("recovery_attempt_id", "")
+        attempt = recovery_attempts_repo.get_recovery_attempt(recovery_attempt_id)
+        if not attempt:
+            return
+
+        checkout = checkouts_repo.get_checkout(attempt["checkout_id"]) if attempt.get("checkout_id") else None
+        if not checkout or checkout.get("status") == "paid":
+            logger.info(f"Promise reminder for {recovery_attempt_id} skipped: already paid.")
+            return
+
+        customer_id = attempt.get("customer_id")
+        if customer_id and consents_repo.has_opted_out(merchant_id, customer_id):
+            logger.info(f"Promise reminder for {recovery_attempt_id} skipped: customer has opted out.")
+            return
+
+        link_url = attempt.get("rzp_payment_link_url") or ""
+        if not link_url:
+            logger.info(f"Promise reminder for {recovery_attempt_id} skipped: no payment link on file to remind them of.")
+            return
+
+        customer = customers_repo.get_customer(customer_id) if customer_id else None
+        to_email = (customer or {}).get("email") or ""
+        if not to_email:
+            logger.info(f"Promise reminder for {recovery_attempt_id} skipped: no email address.")
+            return
+
+        merchant = merchants_repo.get_merchant(merchant_id)
+        business_name = ((merchant or {}).get("name") or "").strip()
+
+        item_name = ""
+        try:
+            line_items = json.loads(checkout.get("line_items") or "[]")
+            names = [li.get("name") for li in line_items if isinstance(li, dict) and li.get("name")]
+            item_name = ", ".join(names[:3])
+        except (TypeError, ValueError):
+            item_name = ""
+
+        # The terms they actually promised against, where we have them.
+        # final_amount_paise is what was quoted; falling back to the cart
+        # total would mean reminding them of a number nobody agreed to.
+        final_paise = attempt.get("final_amount_paise") or checkout.get("amount_paise") or 0
+        discount_pct = float(attempt.get("approved_discount_percent") or 0.0)
+        base_paise = checkout.get("amount_paise") or final_paise
+
+        logger.info(f"Sending the one promise reminder for {recovery_attempt_id} to {to_email}.")
+        status, msg_id = await EmailService.send_checkout_email(
+            to_email=to_email,
+            link_url=link_url,
+            item_name=item_name,
+            business_name=business_name,
+            customer_name=(customer or {}).get("name", ""),
+            final_amount=final_paise / 100.0,
+            discount_pct=discount_pct,
+            base_price=base_paise / 100.0,
+        )
+
+        await bus.publish(
+            event_type="recovery.promise_reminder_sent" if status == "delivered" else "recovery.promise_reminder_failed",
+            payload={
+                "recovery_attempt_id": recovery_attempt_id,
+                "customer_email": to_email,
+                "payment_url": link_url,
+                "resend_id": msg_id,
+            },
+            correlation_id=event.get("correlation_id", ""),
+            merchant_id=merchant_id,
+        )
+
 email_service = EmailService()
 bus.subscribe("email.send_requested", EmailService.handle_send_requested)
+# recovery.promise_lapsed was published by the sweeper to NO subscriber at
+# all - the reminder the code is visibly careful to send only once had
+# never actually been sent to anyone. See handle_promise_lapsed.
+bus.subscribe("recovery.promise_lapsed", EmailService.handle_promise_lapsed)

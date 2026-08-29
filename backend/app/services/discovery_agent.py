@@ -126,8 +126,15 @@ class RecoveryStrategist:
                 degraded=True,
             )
 
+        # The caller has no personal name, and that is the whole problem.
+        # Told only that it may say the business name, the model reaches for
+        # a self-introduction anyway and invents a slot for the name it was
+        # never given. So the shape of the sentence is specified instead of
+        # a fact being withheld: say the business, never a person.
         who = (
-            f"You are calling on behalf of {business_name}. You may say that name."
+            f"You are calling on behalf of {business_name}. Refer to yourself only as "
+            f"{business_name} - as an organisation, never as a named individual. "
+            f'Say "I am calling from {business_name}", never "this is <somebody> from {business_name}".'
             if business_name
             else "You do NOT know the caller's name or the business name. Do not state either one - "
                  "open with the reason for the call instead."
@@ -138,10 +145,13 @@ class RecoveryStrategist:
             f"{who} "
             f"Customer name: {customer_name or 'unknown - do not guess a name'}. "
             f"Item(s): {item_description}. Cart total: INR {amount:.2f}. "
-            f"This text is SPOKEN ALOUD to a real customer. NEVER output a placeholder, bracket, or template "
-            f"slot such as [Your Name], [Your Company], {{name}} or XYZ - there is no later step that fills "
-            f"them in. If you do not know a fact, leave it out entirely. "
-            f"Do not invent product details you weren't given. Output JSON with keys: opening_line, talking_point."
+            f"This text is SPOKEN ALOUD to a real customer, exactly as written, by a system that fills in "
+            f"nothing afterwards. Every word must be one you would say out loud. If you do not know a fact, "
+            f"leave it out of the sentence entirely rather than gesturing at it. "
+            f"Do not invent product details you weren't given. "
+            f'A good opening line looks like: "Hi Asha, I am calling from Loomwork about the table runner you '
+            f'were looking at earlier." '
+            f"Output JSON with keys: opening_line, talking_point."
         )
         try:
             from openai import AsyncOpenAI

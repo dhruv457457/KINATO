@@ -33,11 +33,13 @@ from typing import Any, Dict, Optional
 
 from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
+from app.services import customer_memory
 from app.services import outreach_guards
 from app.services.voice_dispatch import place_outbound_call, VoiceDispatchError
 from app.services.tts import voice_block as tts_voice_block
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import customers as customers_repo
+from app.db.database import run_db_async
 
 logger = logging.getLogger(__name__)
 
@@ -123,14 +125,23 @@ class CallOrchestrator:
         # and is counted as such on the dashboard.
         allowed, stop_reason = outreach_guards.check_all(merchant_id, checkout_id)
         if not allowed:
-            logger.warning(f"Orchestrator halting {recovery_attempt_id}: STOP_{stop_reason.split()[0].upper()}")
-            recovery_attempts_repo.update_state(recovery_attempt_id, "CALL_FAILED")
+            code = outreach_guards.stop_code(stop_reason)
+            logger.warning(f"Orchestrator halting {recovery_attempt_id}: STOP_{code.upper()}")
+            # BLOCKED, not CALL_FAILED. A guard stopping us is the system
+            # working: nobody was dialled, nothing failed, and a rule the
+            # merchant configured held. Recording it as a dial failure was
+            # wrong three times over - it told the merchant on the
+            # dashboard that these were "real dial failures (no phone on
+            # file, carrier issue)", it burned the customer's contact cap
+            # for a call that never happened, and it filed a compliance
+            # success under the same heading as a broken phone number.
+            recovery_attempts_repo.update_state(recovery_attempt_id, "BLOCKED")
             await bus.publish(
                 event_type="recovery.blocked",
                 payload={
                     "checkout_id": checkout_id,
                     "recovery_attempt_id": recovery_attempt_id,
-                    "reason": stop_reason.split()[0],
+                    "reason": code,
                     "detail": stop_reason,
                 },
                 correlation_id=correlation_id,
@@ -146,7 +157,28 @@ class CallOrchestrator:
         opening_line = plan.get("opening_line") or "Hi there! I wanted to help you finish your order."
         # voice_block() always returns something playable (ElevenLabs or
         # Twilio's own Neural voice - see tts.py) - no failure branch needed.
-        plan = {**plan, "voice_block": await tts_voice_block(opening_line)}
+        #
+        # The memory brief is built here for the same reason the voice block
+        # is: everything on this side of the dial has no deadline, and
+        # everything after it answers inside Twilio's ~15s webhook window,
+        # where an extra DB round trip is not a latency cost but a dropped
+        # call. What this customer said on a previous attempt cannot change
+        # while the phone is ringing, so there is nothing to gain by asking
+        # later.
+        memory_brief = ""
+        try:
+            memory_brief = await run_db_async(
+                customer_memory.build_brief, customer_id, recovery_attempt_id
+            )
+        except Exception as e:
+            # Memory is an improvement, never a precondition - a call must
+            # not fail because we could not remember the last one.
+            logger.warning(f"Could not build the customer memory brief (non-fatal): {e}")
+        plan = {
+            **plan,
+            "voice_block": await tts_voice_block(opening_line),
+            "memory_brief": memory_brief,
+        }
         recovery_attempts_repo.update_state(recovery_attempt_id, "OUTREACH_APPROVED", plan=_to_json(plan))
 
         try:

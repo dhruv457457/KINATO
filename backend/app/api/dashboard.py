@@ -7,6 +7,8 @@ from app.services.merchant_intelligence import merchant_intel
 from app.payments.spend_mandate import spend_mandate_service
 from app.core.auth import get_current_merchant
 from app.db.database import run_db_async
+from app.db.repositories import checkouts as checkouts_repo
+from app.db.repositories import conversation_turns as turns_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import audit as audit_repo
 from app.db.repositories import customers as customers_repo
@@ -54,6 +56,9 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
     stats = recovery_attempts_repo.summary_stats(merchant_id)
     blocked_reasons = events_repo.count_blocked_reasons(merchant_id)
     rule_breaks = events_repo.count_rule_breaks(merchant_id)
+    # Two more sequential reads, for the same measured reason as above.
+    daily = recovery_attempts_repo.daily_series(merchant_id)
+    breakdown = recovery_attempts_repo.channel_breakdown(merchant_id)
 
     return {
         "revenue_at_risk_paise": stats["revenue_at_risk_paise"],
@@ -63,6 +68,10 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
         "total_attempts": stats["total_attempts"],
         "opted_out_count": stats["opted_out_count"],
         "call_failed_count": stats["call_failed_count"],
+        # Recoveries a hard stop refused before dialling. Reported apart
+        # from dial failures because they are the opposite thing: a rule
+        # the merchant configured doing its job, not a broken phone number.
+        "blocked_count": stats["blocked_count"],
         "abandoned_count": stats["abandoned_count"],
         "recovery_rate_pct": stats["recovery_rate_pct"],
         # Customers who committed to a date. Outreach is paused for them -
@@ -81,6 +90,14 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
         # optimise - any non-zero value means a guarantee the merchant
         # relies on was broken.
         "rule_breaks": rule_breaks,
+        # Recovered money per day for the last fortnight, one row per day
+        # including the empty ones - a gap in a chart and a zero in a chart
+        # say different things, and only one of them is true.
+        "daily_series": daily,
+        # Outreach is not one thing. A single recovery count cannot tell a
+        # phone operation from an email one, and they cost very differently.
+        "by_channel": breakdown["by_channel"],
+        "by_state": breakdown["by_state"],
     }
 
 
@@ -115,7 +132,27 @@ async def get_recovery_detail(recovery_attempt_id: str, current_merchant: dict =
     except (TypeError, ValueError):
         pass
 
-    return {"recovery_attempt": attempt, "audit_trail": audit_rows}
+    # What was actually SAID, alongside what the agent DID. The drawer
+    # called itself "the screen the whole product is judged on" while
+    # showing every tool call and none of the conversation those calls were
+    # a response to - "check_offer returned MODIFY 10%" means very little
+    # until you can read the sentence that prompted it.
+    transcript = turns_repo.list_for_attempt(recovery_attempt_id)
+
+    # Why the payment failed is a fact about the CHECKOUT, not about any
+    # one attempt at recovering it - a second attempt days later diagnoses
+    # from the same evidence. The drawer still needs it here, though, so it
+    # is joined on rather than duplicated into recovery_attempts: the
+    # alternative is two rows that can disagree about the same payment.
+    checkout = checkouts_repo.get_checkout(attempt["checkout_id"]) if attempt.get("checkout_id") else None
+    attempt["failure_class"] = (checkout or {}).get("failure_class")
+    attempt["error_description"] = (checkout or {}).get("error_description")
+
+    return {
+        "recovery_attempt": attempt,
+        "audit_trail": audit_rows,
+        "transcript": transcript,
+    }
 
 
 @router.get("/dashboard/activity")

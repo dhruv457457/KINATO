@@ -96,3 +96,111 @@ def list_stale_started(older_than_seconds_expr: str, limit: int = 200) -> List[D
             (limit,),
         )
         return cursor.fetchall()
+
+
+def record_failure(checkout_id: str, failure: Dict[str, Any], failure_class: str) -> None:
+    """Persist why this payment failed, and what we concluded from it.
+
+    Written once, from the webhook, so that every later reader - the agent
+    building its opening line, a second recovery attempt days afterwards,
+    the dashboard explaining a refusal to a merchant - diagnoses from the
+    same evidence rather than re-deriving it or, as before, not having it
+    at all.
+    """
+    with get_db() as conn:
+        conn.cursor().execute(
+            """
+            UPDATE checkouts SET error_code = %s, error_reason = %s, error_description = %s,
+                                 error_source = %s, error_step = %s, payment_method = %s,
+                                 failure_class = %s
+            WHERE checkout_id = %s
+            """,
+            (
+                failure.get("error_code"),
+                failure.get("error_reason"),
+                failure.get("error_description"),
+                failure.get("error_source"),
+                failure.get("error_step"),
+                failure.get("method"),
+                failure_class,
+                checkout_id,
+            ),
+        )
+
+
+def queue_for_rail_recovery(checkout_id: str) -> None:
+    """Hold this case until Razorpay is healthy again."""
+    with get_db() as conn:
+        conn.cursor().execute(
+            "UPDATE checkouts SET recovery_queued_at = NOW() WHERE checkout_id = %s",
+            (checkout_id,),
+        )
+
+
+def list_queued_for_rail(merchant_id: str, max_age_hours: int = 24) -> List[Dict[str, Any]]:
+    """Cases held during an outage, still unpaid and still worth a call.
+
+    The age cap is a judgement, not a technicality: a payment that failed
+    two days ago has almost certainly been resolved, abandoned, or
+    forgotten by the customer, and phoning them about it reads as
+    incompetence rather than service.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT * FROM checkouts
+            WHERE merchant_id = %s
+              AND recovery_queued_at IS NOT NULL
+              AND status != 'paid'
+              AND recovery_queued_at > NOW() - INTERVAL '{int(max_age_hours)} hours'
+            ORDER BY recovery_queued_at ASC
+            LIMIT 200
+            """,
+            (merchant_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def clear_rail_queue(merchant_id: str) -> None:
+    """Drop the queue flag for this merchant, drained or expired alike."""
+    with get_db() as conn:
+        conn.cursor().execute(
+            "UPDATE checkouts SET recovery_queued_at = NULL WHERE merchant_id = %s "
+            "AND recovery_queued_at IS NOT NULL",
+            (merchant_id,),
+        )
+
+
+def find_by_order_id(merchant_id: str, order_id: str) -> Optional[Dict[str, Any]]:
+    """Find a checkout this merchant already tracked for a Razorpay order.
+
+    The SDK records a cart under the merchant's own identifier - in
+    practice the Razorpay order id - long before any payment fails. The
+    webhook then arrives carrying that same order id, and if it only looks
+    at notes.checkout_id it finds nothing and opens a SECOND checkout for
+    the same cart.
+
+    Observed in production: one abandoned cart produced order_TVd3XEkPFeE9VI
+    from the SDK and chk_wh_pay_TVd3g0Qckljb1S from the webhook, then two
+    recovery attempts, and would have produced two phone calls to one
+    person about one order.
+
+    Matches on the checkout_id itself and on rzp_order_id, because which of
+    the two holds the order id depends on how the merchant integrated, and
+    a customer should not be called twice over that detail.
+    """
+    if not order_id:
+        return None
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM checkouts
+            WHERE merchant_id = %s AND (checkout_id = %s OR rzp_order_id = %s)
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            (merchant_id, order_id, order_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None

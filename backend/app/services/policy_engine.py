@@ -76,46 +76,64 @@ class OfferPolicyEngine:
 
         logger.info(f"🛡️ [PolicyEngine] Evaluating requested discount: {requested_discount}%")
 
+        max_discount = float(merchant_policy.get("max_discount_percent", 10.0))
+        min_margin = float(merchant_policy.get("minimum_margin_percent", 15.0))
+
+        # Every decision below carries the numbers it was made from. A
+        # refusal a merchant cannot check is just an assertion, and this is
+        # the one screen where the policy engine is visibly overruling the
+        # model - "asked 40%, ceiling 10%" explains itself; a bare
+        # "constraint" does not.
+        def _decide(decision: str, reason: str, approved: float) -> Dict[str, Any]:
+            return {
+                "decision": decision,
+                "reason": reason,
+                "requested_discount": requested_discount,
+                "approved_discount": approved,
+                "ceiling_percent": max_discount,
+                "margin_floor_percent": min_margin,
+            }
+
         # 1. Check Product Exclusions
         excluded = merchant_policy.get("excluded_products", [])
         product_ids = cart_details.get("product_ids", [])
         if any(pid in excluded for pid in product_ids):
             logger.warning("Policy DENY: Cart contains excluded product.")
-            return {"decision": "DENY", "reason": "product_excluded", "approved_discount": 0.0}
+            return _decide("DENY", "REJECTED_SKU_EXCLUDED", 0.0)
 
         # 2. Check Margin Constraints
-        max_discount = float(merchant_policy.get("max_discount_percent", 10.0))
-        min_margin = float(merchant_policy.get("minimum_margin_percent", 15.0))
-
         cart_total = float(cart_details.get("amount", 3499.0))
         cogs = float(cart_details.get("cogs", cart_total * 0.5))
 
         if cart_total <= 0:
-            return {"decision": "DENY", "reason": "invalid_cart_total", "approved_discount": 0.0}
+            return _decide("DENY", "REJECTED_INVALID_CART_TOTAL", 0.0)
 
         max_allowed_by_margin = ((cart_total - cogs) / cart_total) * 100 - min_margin
 
         if max_allowed_by_margin <= 0:
             logger.warning("Policy DENY: Margin too low to offer any discount.")
-            return {"decision": "DENY", "reason": "margin_too_low", "approved_discount": 0.0}
+            return _decide("DENY", "REJECTED_MARGIN_FLOOR", 0.0)
 
         # 3. Calculate Final Approved Discount
-        effective_max_discount = min(max_discount, max_allowed_by_margin)
-        effective_max_discount = max(0.0, effective_max_discount)
+        #
+        # Which of the two limits actually bound is recorded rather than
+        # discarded. `min(max_discount, max_allowed_by_margin)` computes
+        # both and then throws away the answer to the only question a
+        # merchant asks when they see a reduced offer - "was that my
+        # discount cap, or my margin floor?" The old code returned the
+        # single string "merchant_max_discount_or_margin_constraint" for
+        # both, so REJECTED_CEILING and REJECTED_MARGIN_FLOOR were
+        # indistinguishable despite being one line apart from being known.
+        ceiling_binds = max_discount <= max_allowed_by_margin
+        effective_max_discount = max(0.0, min(max_discount, max_allowed_by_margin))
 
         if requested_discount <= effective_max_discount:
-            return {
-                "decision": "ALLOW",
-                "requested_discount": requested_discount,
-                "approved_discount": requested_discount,
-                "reason": "within_margin_and_discount_limits"
-            }
-        else:
-            return {
-                "decision": "MODIFY",
-                "requested_discount": requested_discount,
-                "approved_discount": effective_max_discount,
-                "reason": "merchant_max_discount_or_margin_constraint"
-            }
+            return _decide("ALLOW", "APPROVED", requested_discount)
+
+        return _decide(
+            "MODIFY",
+            "REJECTED_CEILING" if ceiling_binds else "REJECTED_MARGIN_FLOOR",
+            effective_max_discount,
+        )
 
 policy_engine = OfferPolicyEngine()
