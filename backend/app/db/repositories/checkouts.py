@@ -96,3 +96,77 @@ def list_stale_started(older_than_seconds_expr: str, limit: int = 200) -> List[D
             (limit,),
         )
         return cursor.fetchall()
+
+
+def record_failure(checkout_id: str, failure: Dict[str, Any], failure_class: str) -> None:
+    """Persist why this payment failed, and what we concluded from it.
+
+    Written once, from the webhook, so that every later reader - the agent
+    building its opening line, a second recovery attempt days afterwards,
+    the dashboard explaining a refusal to a merchant - diagnoses from the
+    same evidence rather than re-deriving it or, as before, not having it
+    at all.
+    """
+    with get_db() as conn:
+        conn.cursor().execute(
+            """
+            UPDATE checkouts SET error_code = %s, error_reason = %s, error_description = %s,
+                                 error_source = %s, error_step = %s, payment_method = %s,
+                                 failure_class = %s
+            WHERE checkout_id = %s
+            """,
+            (
+                failure.get("error_code"),
+                failure.get("error_reason"),
+                failure.get("error_description"),
+                failure.get("error_source"),
+                failure.get("error_step"),
+                failure.get("method"),
+                failure_class,
+                checkout_id,
+            ),
+        )
+
+
+def queue_for_rail_recovery(checkout_id: str) -> None:
+    """Hold this case until Razorpay is healthy again."""
+    with get_db() as conn:
+        conn.cursor().execute(
+            "UPDATE checkouts SET recovery_queued_at = NOW() WHERE checkout_id = %s",
+            (checkout_id,),
+        )
+
+
+def list_queued_for_rail(merchant_id: str, max_age_hours: int = 24) -> List[Dict[str, Any]]:
+    """Cases held during an outage, still unpaid and still worth a call.
+
+    The age cap is a judgement, not a technicality: a payment that failed
+    two days ago has almost certainly been resolved, abandoned, or
+    forgotten by the customer, and phoning them about it reads as
+    incompetence rather than service.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT * FROM checkouts
+            WHERE merchant_id = %s
+              AND recovery_queued_at IS NOT NULL
+              AND status != 'paid'
+              AND recovery_queued_at > NOW() - INTERVAL '{int(max_age_hours)} hours'
+            ORDER BY recovery_queued_at ASC
+            LIMIT 200
+            """,
+            (merchant_id,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def clear_rail_queue(merchant_id: str) -> None:
+    """Drop the queue flag for this merchant, drained or expired alike."""
+    with get_db() as conn:
+        conn.cursor().execute(
+            "UPDATE checkouts SET recovery_queued_at = NULL WHERE merchant_id = %s "
+            "AND recovery_queued_at IS NOT NULL",
+            (merchant_id,),
+        )

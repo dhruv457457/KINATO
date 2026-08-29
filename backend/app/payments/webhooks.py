@@ -23,7 +23,11 @@ from fastapi import APIRouter, Request, HTTPException
 
 from app.core.security import verify_razorpay_webhook_signature
 from app.core.crypto import decrypt_secret
-from app.db.repositories.merchants import get_merchant, set_rail_degraded, MerchantNotFoundError
+from app.db.repositories.merchants import (
+    get_merchant, set_rail_degraded, is_rail_degraded, MerchantNotFoundError,
+)
+from app.services.failure_diagnosis import diagnose
+from app.services.identity_service import identity_service
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
 from app.gateway.event_bus import bus
@@ -66,9 +70,35 @@ async def razorpay_webhook(merchant_id: str, request: Request):
         contact = payment_entity.get("contact", "")
         amount_paise = payment_entity.get("amount", 0)
 
+        # Everything Razorpay tells us about WHY it failed. Previously only
+        # error_reason was lifted, it travelled no further than the event
+        # payload, and nothing read it - so a bank timeout, an abandoned
+        # 3DS step and a stolen-card block all produced the identical sales
+        # call. See app/services/failure_diagnosis.py for what these turn
+        # into, and why that classification lives in code rather than in
+        # the agent's prompt.
+        failure = {
+            "error_code": payment_entity.get("error_code"),
+            "error_reason": payment_entity.get("error_reason"),
+            "error_description": payment_entity.get("error_description"),
+            "error_source": payment_entity.get("error_source"),
+            "error_step": payment_entity.get("error_step"),
+            "method": payment_entity.get("method"),
+        }
+        diagnosis = diagnose(failure, rail_degraded=is_rail_degraded(merchant_id))
+
         customer = None
         if email or contact:
             customer = customers_repo.upsert_by_contact(merchant_id, email=email, phone=contact)
+            # Without this the zero-code path - the one the README leads
+            # with - recovered nothing at all. The customer was created,
+            # no consent was recorded, and the eligibility gate refused
+            # them silently. See identity_service.grant_transactional_consent
+            # for why this is defensible and for the revocation it will
+            # never overwrite.
+            await identity_service.grant_transactional_consent(
+                merchant_id, customer["customer_id"], email=email, phone=contact
+            )
 
         if not checkout_id:
             # No prior SDK/API integration ever tracked this checkout (the
@@ -80,6 +110,12 @@ async def razorpay_webhook(merchant_id: str, request: Request):
                 customer_id=customer["customer_id"] if customer else None,
                 source="razorpay_webhook", checkout_id=checkout_id,
             )
+
+        checkouts_repo.record_failure(checkout_id, failure, diagnosis.failure_class)
+        logger.info(
+            f"payment.failed for {checkout_id} classified as {diagnosis.failure_class} "
+            f"(code={failure['error_code']!r}, step={failure['error_step']!r})."
+        )
 
         if not customer:
             logger.info(f"payment.failed for {checkout_id} carried no contactable customer - recovery blocked.")
@@ -98,7 +134,8 @@ async def razorpay_webhook(merchant_id: str, request: Request):
                 "amount": amount_paise / 100.0,
                 "amount_paise": amount_paise,
                 "currency": payment_entity.get("currency", "INR"),
-                "error_reason": payment_entity.get("error_reason"),
+                "failure": failure,
+                "failure_class": diagnosis.failure_class,
                 "recovery_attempt_id": recovery_attempt_id,
             },
             correlation_id=correlation_id,
