@@ -31,6 +31,7 @@ from app.db.repositories import conversation_turns as turns_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import recovery_attempts as ra_repo
 from app.services import customer_memory
+from tests.conftest import wait_until
 
 
 @pytest.fixture
@@ -101,6 +102,15 @@ class TestTheTranscriptIsWrittenDown:
             data={"CallSid": "CAmem1", "SpeechResult": "can you send me the link", "Confidence": "0.91"},
         )
 
+        # Transcript writes are fire-and-forget so they cannot spend the
+        # call's Twilio budget, which means they land shortly AFTER the
+        # response rather than before it. Eventually-persisted is the real
+        # contract now, so the test waits for it instead of assuming the
+        # write finished inside the request.
+        await wait_until(
+            lambda: len(turns_repo.list_for_attempt(call_case["recovery_attempt_id"])) >= 3,
+            timeout=8.0,
+        )
         turns = turns_repo.list_for_attempt(call_case["recovery_attempt_id"])
         speakers = [t["speaker"] for t in turns]
         texts = [t["text"] for t in turns]
@@ -128,6 +138,11 @@ class TestTheTranscriptIsWrittenDown:
             data={"CallSid": "CAmem2", "SpeechResult": "it is a bit pricey", "Confidence": "0.64"},
         )
 
+        await wait_until(
+            lambda: any(t["text"] == 'it is a bit pricey' for t in
+                        turns_repo.list_for_attempt(call_case["recovery_attempt_id"])),
+            timeout=8.0,
+        )
         turns = turns_repo.list_for_attempt(call_case["recovery_attempt_id"])
         spoken = next(t for t in turns if t["text"] == "it is a bit pricey")
         assert spoken["stt_confidence"] == pytest.approx(0.64)
@@ -144,6 +159,11 @@ class TestTheTranscriptIsWrittenDown:
         )
         await client.post("/voice/respond", data={"CallSid": "CAmem3", "Digits": "1"})
 
+        await wait_until(
+            lambda: any(t["text"] == '[pressed 1]' for t in
+                        turns_repo.list_for_attempt(call_case["recovery_attempt_id"])),
+            timeout=8.0,
+        )
         turns = turns_repo.list_for_attempt(call_case["recovery_attempt_id"])
         pressed = next(t for t in turns if t["text"] == "[pressed 1]")
         assert pressed["input_mode"] == "dtmf"

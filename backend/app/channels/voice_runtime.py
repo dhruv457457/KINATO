@@ -43,6 +43,7 @@ The discount ladder lives entirely in merchant_policies, never in a prompt.
 import asyncio
 import dataclasses
 import json
+import time
 import logging
 import re
 import uuid
@@ -104,7 +105,17 @@ voice_router = APIRouter()
 # trips. 9s covers that, and with voice_block capped at 2s the worst case is
 # ~11s, still inside Twilio's ~15s deadline.
 VOICE_MAX_ITERATIONS = 4
-VOICE_DEADLINE_S = 9.0
+# Cut from 9.0 after a live call died on the turn where check_offer ran.
+#
+# That turn is the expensive one by construction - two model round trips
+# around a tool that itself reads the cart and the policy - and it is also
+# the turn that matters most, because it is where money is discussed. The
+# arithmetic that has to hold is: reasoning + one TTS attempt + the guard
+# read, all inside Twilio's ~15s. At 9.0 the worst case had no margin left
+# for a slow database, and the customer heard Twilio's error instead of an
+# offer. Losing a little reasoning degrades one turn; losing the deadline
+# ends the call.
+VOICE_DEADLINE_S = 7.5
 
 # --- Surviving speech-to-text ------------------------------------------
 # Twilio posts a `Confidence` float (0.0-1.0) with every SpeechResult, and
@@ -135,6 +146,20 @@ STT_UNUSABLE_FLOOR = 0.3
 # close by offering the link instead, which needs no transcription at all.
 MAX_MISHEARD_STREAK = 2
 
+# What Twilio actually allows a webhook before it gives up and plays "we
+# cannot reach your server" to the customer. Not configurable by us - it is
+# their clock - which is exactly why every budget below has to fit inside
+# it with room to spare.
+TWILIO_WEBHOOK_DEADLINE_S = 15.0
+# Log loudly past this. Two thirds of the deadline is the point where a
+# turn is working but has stopped having any margin.
+TURN_BUDGET_WARN_S = 10.0
+# The whole turn, cut off here whatever it is doing. Comfortably inside
+# Twilio's deadline so there is still time to render and return a spoken
+# line after the cut - a timeout that fires at the deadline is worth
+# nothing, because answering late is the same as not answering.
+TURN_HARD_TIMEOUT_S = 11.0
+
 # The keypad. This is the ONLY input path in the system that speech
 # recognition cannot corrupt - a DTMF digit arrives as a digit, at
 # confidence 1.0 by construction. That is precisely why opt-out lives here
@@ -158,6 +183,21 @@ else:
 # concurrent calls never share state - this is what makes multiple
 # simultaneous calls work correctly, not a shared/global session.
 CALL_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+# Strong references to fire-and-forget writes.
+#
+# asyncio only holds a WEAK reference to a running task, so a bare
+# create_task whose result nobody keeps can be garbage collected before it
+# finishes - the write simply vanishes, occasionally, under load, with no
+# error. Bookkeeping moved off the critical path must still actually
+# happen; "off the critical path" is not "optional".
+_BACKGROUND_WRITES: set = set()
+
+
+def _spawn_write(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_WRITES.add(task)
+    task.add_done_callback(_BACKGROUND_WRITES.discard)
 
 SYSTEM_PROMPT_TEMPLATE = """You are a warm, professional sales representative {from_business}making an \
 OUTBOUND phone call to {customer_label} about {item_description}, which they started buying but didn't finish.
@@ -498,7 +538,7 @@ async def _outbound(request: Request):
         except Exception as e:
             logger.warning(f"[CALL {call_id}] Post-answer bookkeeping failed (non-fatal): {e}")
 
-    asyncio.create_task(_persist_opening())
+    _spawn_write(_persist_opening())
     # And tell the AGENT it said it, not just the transcript. Twilio plays
     # this line; the model never saw it, so it introduced itself again on
     # the very next turn.
@@ -586,7 +626,7 @@ async def _record_turn(
     # 2-2.8s each, sitting between the customer speaking and hearing a
     # reply, is the whole budget spent on bookkeeping. Same mistake as the
     # opening webhook, one layer down.
-    asyncio.create_task(_safe_write())
+    _spawn_write(_safe_write())
 
 
 def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
@@ -831,8 +871,45 @@ async def twilio_voice_respond(request: Request):
     agent runtime already promises never to raise; this is the promise for
     everything around it.
     """
+    started = time.monotonic()
     try:
-        return await _respond(request)
+        # A hard ceiling on the whole turn, not just on the reasoning.
+        #
+        # The agent runtime has its own deadline and the TTS has its own
+        # budget, but that only bounds the parts we thought to bound. A live
+        # call died with no response line and no traceback - meaning
+        # something took longer than Twilio was willing to wait, or stopped
+        # returning entirely, in a part of the turn nobody had put a clock
+        # on. This is the clock on everything.
+        #
+        # Set below Twilio's own deadline on purpose: answering late is the
+        # same as not answering, so the only useful timeout is one that
+        # leaves time to say something afterwards.
+        response = await asyncio.wait_for(_respond(request), timeout=TURN_HARD_TIMEOUT_S)
+        # Twilio hangs up at roughly 15s. Logging where each turn actually
+        # lands turns "the call died" into a number: a turn at 4s and a
+        # turn at 14s look identical from the outside and are nothing alike.
+        elapsed = time.monotonic() - started
+        if elapsed > TURN_BUDGET_WARN_S:
+            logger.warning(
+                "voice/respond took %.1fs - Twilio gives about %.0fs before it "
+                "hangs up on the customer.", elapsed, TWILIO_WEBHOOK_DEADLINE_S,
+            )
+        else:
+            logger.info("voice/respond answered in %.1fs", elapsed)
+        return response
+    except asyncio.TimeoutError:
+        logger.error(
+            "voice/respond exceeded %.1fs and was cut off - answering anyway so the "
+            "customer hears a person rather than Twilio's error.", TURN_HARD_TIMEOUT_S,
+        )
+        return Response(
+            content=_gather_twiml(
+                f'<Say voice="{TWILIO_NEURAL_VOICE}">Sorry, I lost my train of thought there. '
+                "Could you say that again?</Say>"
+            ),
+            media_type="text/xml",
+        )
     except Exception as e:
         # Deliberately broad. There is no failure here worth converting
         # into a dead call, and the alternative to a graceful line is
