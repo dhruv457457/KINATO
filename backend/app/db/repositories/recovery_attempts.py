@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional, Dict, Any
 from app.db.database import get_db
@@ -61,7 +62,14 @@ def update_state(recovery_attempt_id: str, state: str, **fields) -> None:
 # customer asked us to try again later, so this attempt is finished and
 # must stop blocking the checkout - the whole point is that a further
 # attempt becomes possible (see outreach_guards' callback exemption).
-TERMINAL_STATES = ("RECOVERED", "CALL_FAILED", "CONSENT_REVOKED", "CALLBACK_REQUESTED")
+TERMINAL_STATES = (
+    "RECOVERED", "CALL_FAILED", "CONSENT_REVOKED", "CALLBACK_REQUESTED",
+    # A guard stopped this one before dialling. Terminal for THIS attempt
+    # so it stops blocking the checkout - the case becomes eligible again
+    # the moment the reason expires (quiet hours end, a promise date
+    # passes), which is the whole point of stopping rather than failing.
+    "BLOCKED",
+)
 
 
 def list_active_for_checkout(checkout_id: str) -> list:
@@ -146,6 +154,7 @@ def summary_stats(merchant_id: str) -> Dict[str, Any]:
                 COUNT(*) FILTER (WHERE state IN ('CALLING', 'OUTREACH_APPROVED', 'PAYMENT_LINK_SENT')) AS active_count,
                 COUNT(*) FILTER (WHERE state = 'CONSENT_REVOKED') AS opted_out_count,
                 COUNT(*) FILTER (WHERE state = 'CALL_FAILED') AS call_failed_count,
+                COUNT(*) FILTER (WHERE state = 'BLOCKED') AS blocked_count,
                 COUNT(*) FILTER (WHERE state = 'PROMISED') AS promised_count,
                 COALESCE(SUM(promised_amount_paise) FILTER (WHERE state = 'PROMISED'), 0) AS promised_paise
             FROM recovery_attempts
@@ -379,3 +388,82 @@ def callback_requested(checkout_id: str) -> bool:
             (checkout_id,),
         )
         return cursor.fetchone() is not None
+
+
+def daily_series(merchant_id: str, days: int = 14) -> list:
+    """Recovered money per day, for the last `days` days.
+
+    Returns one row per day INCLUDING days with nothing, because a gap in a
+    chart and a zero in a chart say different things and only one of them
+    is true. Days are generated in Python rather than with a SQL series
+    join: the schema is written once and dialect-translated (see
+    app/db/database.py), and generate_series does not exist in SQLite.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT CAST(updated_at AS DATE) AS day,
+                   COUNT(*) AS recovered_count,
+                   COALESCE(SUM(attributed_revenue_paise), 0) AS recovered_paise
+            FROM recovery_attempts
+            WHERE merchant_id = %s
+              AND state = 'RECOVERED'
+              AND updated_at > NOW() - INTERVAL '{int(days)} days'
+            GROUP BY CAST(updated_at AS DATE)
+            """,
+            (merchant_id,),
+        )
+        by_day = {}
+        for r in cursor.fetchall():
+            d = dict(r)
+            by_day[str(d["day"])] = {
+                "recovered_count": int(d["recovered_count"] or 0),
+                "recovered_paise": int(d["recovered_paise"] or 0),
+            }
+
+    today = datetime.now(timezone.utc).date()
+    out = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        found = by_day.get(str(day), {"recovered_count": 0, "recovered_paise": 0})
+        out.append({"day": str(day), **found})
+    return out
+
+
+def channel_breakdown(merchant_id: str) -> Dict[str, Any]:
+    """How recoveries were actually reached, and how they ended.
+
+    Outreach is not one thing. A merchant looking at a single recovery
+    count cannot tell a phone operation from an email one, and the two have
+    completely different costs.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COALESCE(channel, 'unknown') AS channel,
+                   COUNT(*) AS attempts,
+                   COUNT(*) FILTER (WHERE state = 'RECOVERED') AS recovered
+            FROM recovery_attempts
+            WHERE merchant_id = %s AND channel IS NOT NULL
+            GROUP BY COALESCE(channel, 'unknown')
+            """,
+            (merchant_id,),
+        )
+        by_channel = [
+            {k: (int(v) if isinstance(v, (Decimal, int)) and k != "channel" else v)
+             for k, v in dict(r).items()}
+            for r in cursor.fetchall()
+        ]
+
+        cursor.execute(
+            """
+            SELECT state, COUNT(*) AS n FROM recovery_attempts
+            WHERE merchant_id = %s GROUP BY state
+            """,
+            (merchant_id,),
+        )
+        by_state = {dict(r)["state"]: int(dict(r)["n"]) for r in cursor.fetchall()}
+
+    return {"by_channel": by_channel, "by_state": by_state}

@@ -56,6 +56,9 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
     stats = recovery_attempts_repo.summary_stats(merchant_id)
     blocked_reasons = events_repo.count_blocked_reasons(merchant_id)
     rule_breaks = events_repo.count_rule_breaks(merchant_id)
+    # Two more sequential reads, for the same measured reason as above.
+    daily = recovery_attempts_repo.daily_series(merchant_id)
+    breakdown = recovery_attempts_repo.channel_breakdown(merchant_id)
 
     return {
         "revenue_at_risk_paise": stats["revenue_at_risk_paise"],
@@ -65,6 +68,10 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
         "total_attempts": stats["total_attempts"],
         "opted_out_count": stats["opted_out_count"],
         "call_failed_count": stats["call_failed_count"],
+        # Recoveries a hard stop refused before dialling. Reported apart
+        # from dial failures because they are the opposite thing: a rule
+        # the merchant configured doing its job, not a broken phone number.
+        "blocked_count": stats["blocked_count"],
         "abandoned_count": stats["abandoned_count"],
         "recovery_rate_pct": stats["recovery_rate_pct"],
         # Customers who committed to a date. Outreach is paused for them -
@@ -83,6 +90,14 @@ async def get_dashboard_overview(current_merchant: dict = Depends(get_current_me
         # optimise - any non-zero value means a guarantee the merchant
         # relies on was broken.
         "rule_breaks": rule_breaks,
+        # Recovered money per day for the last fortnight, one row per day
+        # including the empty ones - a gap in a chart and a zero in a chart
+        # say different things, and only one of them is true.
+        "daily_series": daily,
+        # Outreach is not one thing. A single recovery count cannot tell a
+        # phone operation from an email one, and they cost very differently.
+        "by_channel": breakdown["by_channel"],
+        "by_state": breakdown["by_state"],
     }
 
 

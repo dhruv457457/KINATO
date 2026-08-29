@@ -83,6 +83,7 @@ export interface DashboardOverview {
   total_attempts: number;
   opted_out_count: number;
   call_failed_count: number;
+  blocked_count: number;
   abandoned_count: number;
   recovery_rate_pct: number | null;
   /** Real `recovery.blocked` counts, keyed by reason (e.g. "no_contact",
@@ -98,6 +99,9 @@ export interface DashboardOverview {
    *  folded into either number. */
   promised_count: number;
   promised_paise: number;
+  daily_series: DayPoint[];
+  by_channel: ChannelRow[];
+  by_state: Record<string, number>;
 }
 
 export interface RecoveryRow {
@@ -147,6 +151,21 @@ export interface TranscriptTurn {
   stt_confidence: number | null;
   input_mode: "speech" | "dtmf";
   created_at: string;
+}
+
+/** One day of recovered money. Every day in the window is present,
+ *  including the empty ones - a gap in a chart and a zero in a chart say
+ *  different things, and only one of them is true. */
+export interface DayPoint {
+  day: string;
+  recovered_count: number;
+  recovered_paise: number;
+}
+
+export interface ChannelRow {
+  channel: string;
+  attempts: number;
+  recovered: number;
 }
 
 export function getOverview(): Promise<DashboardOverview> {

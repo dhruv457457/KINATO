@@ -254,6 +254,41 @@ def main() -> None:
           "Understood - I'll leave it with you and send the link so it's waiting. "
           "We won't chase you before then."); j += 1
 
+    # --- A fortnight of recovered history, so the overview chart has a
+    # --- real shape to draw rather than an empty axis.
+    #
+    # These are ordinary RECOVERED rows written through the normal repo, on
+    # backdated timestamps. Uneven on purpose: a smooth curve would look
+    # designed, and the point of a preview is to see what real, lumpy data
+    # does to the layout - including the days with nothing in them.
+    pattern = [0, 2, 0, 1, 3, 0, 0, 2, 4, 1, 0, 2, 3, 1]
+    amounts = [129900, 249900, 189900, 349900, 99900]
+    seq = 0
+    for offset, count in enumerate(reversed(pattern)):
+        for _ in range(count):
+            seq += 1
+            amount = amounts[seq % len(amounts)]
+            hist_checkout = checkouts_repo.create_checkout(
+                merchant_id=merchant_id,
+                amount_paise=amount,
+                cogs_paise=int(amount * 0.42),
+                customer_id=customer_id,
+                line_items=[{"product_id": f"sku_h{seq}", "name": "Handwoven Table Runner"}],
+                source="razorpay_webhook",
+            )
+            hist = ra_repo.create_recovery_attempt(merchant_id, hist_checkout["checkout_id"], customer_id)
+            ra_repo.update_state(
+                hist["recovery_attempt_id"], "RECOVERED",
+                channel="voice" if seq % 3 else "email",
+                attributed_revenue_paise=amount,
+            )
+            with get_db() as conn:
+                conn.cursor().execute(
+                    "UPDATE recovery_attempts SET updated_at = NOW() - INTERVAL '%s days' "
+                    "WHERE recovery_attempt_id = %%s" % offset,
+                    (hist["recovery_attempt_id"],),
+                )
+
     token = create_session_token(merchant_id)
     print("\n" + "=" * 68)
     print("  Preview merchant seeded.")
