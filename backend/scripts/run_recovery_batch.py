@@ -18,6 +18,7 @@ What's real, and what's simulated, stated plainly (no seed/mock policy):
 Run: python scripts/run_recovery_batch.py
 """
 import asyncio
+import dataclasses
 import json
 import sys
 import uuid
@@ -129,6 +130,17 @@ from app.channels.voice_runtime import _build_system_prompt as build_live_system
 # A fixed 04:00 IST clock for the quiet-hours case, so the result does
 # not depend on what time the batch happens to be run.
 BUSINESS_NAME = "Loomwork"
+
+# Every scripted utterance in this file is treated as clearly heard. See
+# the note on AgentContext in run_scenario for why that is the honest
+# choice rather than a convenient one.
+BATCH_STT_CONFIDENCE = 0.95
+
+# The line the agent has already spoken when the customer's first scripted
+# utterance arrives. Deliberately the SAME fallback string production uses
+# when the strategist has not produced a plan (see call_orchestrator), so
+# the scoreboard starts the conversation where a real call starts it.
+BATCH_OPENING_LINE = "Hi there! I wanted to help you finish your order."
 
 QUIET_HOUR_CLOCK = datetime(2026, 8, 28, 4, 0, tzinfo=outreach_guards.IST)   # 04:00 - outside hours
 IN_HOURS_CLOCK = datetime(2026, 8, 28, 14, 0, tzinfo=outreach_guards.IST)    # 14:00 - inside hours
@@ -286,38 +298,47 @@ async def run_refusal_case(scenario: dict) -> dict:
     if pre == "paid":
         checkouts_repo.mark_paid(checkout_id, rzp_payment_id=f"pay_batch_{tag}")
     if pre == "call_cap":
-        for _ in range(outreach_guards.DEFAULT_MAX_CALLS_PER_CASE):
+        for _ in range(outreach_guards.DEFAULT_MAX_OUTREACH_PER_CASE):
             a = recovery_attempts_repo.create_recovery_attempt(MERCHANT_ID, checkout_id, customer_id)
             recovery_attempts_repo.update_state(a["recovery_attempt_id"], "CALL_FAILED")
 
-    # --- the real gates, in the order the orchestrator applies them ---
+    # --- the real gates, via the SAME function the orchestrator calls ---
+    #
+    # This used to walk the individual guards here, in an order written out
+    # by hand - a second copy of the rule deciding whether a customer may
+    # be contacted, free to drift from the one production uses. FINDINGS #6
+    # is the story of exactly that drift in the system prompt, and the
+    # lesson was to import the real thing rather than mirror it. So the
+    # ordering, the additions, and any future guard now reach the
+    # scoreboard automatically.
+    #
+    # Fixed clocks. Without these the whole batch is time-dependent: run it
+    # after 20:00 IST and every case fails on quiet hours instead of the
+    # rule it was written to exercise.
+    now = QUIET_HOUR_CLOCK if pre == "quiet_hours" else IN_HOURS_CLOCK
     outcome = None
+    stop = ""
     if customer_id is None:
-        outcome = "REFUSED_NO_CONTACT"
-    elif not await identity_service.check_consent(MERCHANT_ID, customer_id, channel="voice"):
-        outcome = "REFUSED_NO_CONSENT"
+        outcome, stop = "REFUSED_NO_CONTACT", "no_contact"
+    elif not await identity_service.reachable_channels(MERCHANT_ID, customer_id):
+        outcome, stop = "REFUSED_NO_CONSENT", "no_consent"
     else:
-        # Fixed clocks. Without these the whole batch is time-dependent: run
-        # it after 20:00 IST and every case fails on quiet hours instead of
-        # the rule it was written to exercise.
-        now = QUIET_HOUR_CLOCK if pre == "quiet_hours" else IN_HOURS_CLOCK
-        ok, reason = outreach_guards.not_already_paid(checkout_id)
-        if not ok:
-            outcome = "REFUSED_ALREADY_PAID"
-        else:
-            ok, reason = outreach_guards.within_calling_hours(MERCHANT_ID, now=now)
-            if not ok:
-                outcome = "REFUSED_QUIET_HOURS"
-            else:
-                ok, reason = outreach_guards.under_call_cap(checkout_id)
-                if not ok:
-                    outcome = "REFUSED_MAX_CALLS"
+        allowed, reason = outreach_guards.check_all(MERCHANT_ID, checkout_id, now=now)
+        if not allowed:
+            stop = outreach_guards.stop_code(reason)
+            outcome = {
+                "already_paid": "REFUSED_ALREADY_PAID",
+                "quiet_hours": "REFUSED_QUIET_HOURS",
+                "max_calls_reached": "REFUSED_MAX_CALLS",
+                "promise_to_pay": "REFUSED_ACTIVE_PROMISE",
+            }.get(stop, f"REFUSED_{stop.upper()}")
 
     return {
         "scenario": scenario["name"],
         "kind": "refusal",
         "expected": scenario["expect"],
         "outcome": outcome or "NOT_REFUSED",
+        "stop": stop,
         "contacted": outcome is None,
         "cart_value_inr": scenario["amount_paise"] / 100.0,
         "recovered_inr": 0.0,
@@ -363,17 +384,38 @@ async def run_scenario(scenario: dict) -> dict:
     recovery_attempt_id = recovery_attempt["recovery_attempt_id"]
     correlation_id = recovery_attempt_id
 
+    # The scripted utterances below stand in for Twilio speech-to-text, so
+    # this context must say so. input_is_speech=True is what subjects these
+    # cases to the barrier-confirmation rule a real spoken turn faces; a
+    # batch that quietly ran without it would score an agent production
+    # does not run, which is precisely the drift FINDINGS #6 is about.
+    #
+    # BATCH_STT_CONFIDENCE is above the money floor deliberately. The point
+    # of this scoreboard is to measure the money pipeline INDEPENDENTLY of
+    # speech recognition, so every case here is treated as clearly heard.
+    # Mishearing has its own coverage, against real webhook payloads, in
+    # tests/test_stt_confidence.py - it is not something to fold into a
+    # revenue number.
     ctx = AgentContext(
         merchant_id=MERCHANT_ID,
         correlation_id=correlation_id,
         customer_id=customer_id,
         checkout_id=checkout_id,
         recovery_attempt_id=recovery_attempt_id,
+        input_is_speech=True,
+        stt_confidence=BATCH_STT_CONFIDENCE,
     )
     system_prompt = build_live_system_prompt(
         scenario["customer_name"], scenario["item"], BUSINESS_NAME
     )
     thread_id = f"batch_{tag}"
+    # Production plays a pre-generated opening line before the customer
+    # ever speaks, and seeds the agent's thread with it. The batch has to
+    # do the same or it measures an agent starting from a different point
+    # than the live one - the drift FINDINGS #6 is about. Without this the
+    # agent re-introduced itself on turn one and short cases never reached
+    # a tool at all.
+    agent_runtime.seed_opening(thread_id, system_prompt, BATCH_OPENING_LINE)
 
     # Multiple turns on the same thread, exactly like a real call -
     # negotiation is inherently multi-turn (propose a number, then wait
@@ -382,16 +424,25 @@ async def run_scenario(scenario: dict) -> dict:
     # check_offer, never a real confirmed recovery.
     result = None
     all_tool_calls = []
+    # Mirrors voice_runtime's barrier-confirmation state machine exactly:
+    # a discount bounced for want of a confirmed barrier means the agent's
+    # reply IS the confirming question, so the next scripted utterance is
+    # the answer to it. Duplicated behaviour here would be drift, so this
+    # is deliberately the same rule expressed the same way - and it is the
+    # reason the scoreboard still reaches discounted recoveries at all.
+    discount_bounced = False
     for turn_text in scenario["turns"]:
         result = await agent_runtime.run_agent(
             system_prompt=system_prompt,
             user_message=turn_text,
-            ctx=ctx,
+            ctx=dataclasses.replace(ctx, barrier_confirmed=discount_bounced),
             tools=ALL_TOOLS,
             thread_id=thread_id,
             max_iterations=4,
             deadline_s=15.0,
         )
+        if any(r.get("reason") == "REJECTED_UNCONFIRMED_BARRIER" for r in result.refusals):
+            discount_bounced = True
         all_tool_calls.extend(result.tool_calls_made)
         if "record_opt_out" in result.tool_calls_made or "issue_offer" in result.tool_calls_made:
             break  # conversation naturally ends here, same as a real call would
@@ -410,12 +461,38 @@ async def run_scenario(scenario: dict) -> dict:
     # What the CUSTOMER asked for, versus what policy approved. The gap is
     # the margin the policy engine actually protected - a real measured
     # number, not a projection.
+    # Structured refusal codes, read back out of the real audit rows - the
+    # same rows the dashboard renders, so the scoreboard and the screen can
+    # never disagree about what was refused.
+    refusal_codes_seen = []
+    for row in audit_rows:
+        try:
+            reason = json.loads(row["result"]).get("reason")
+        except (TypeError, ValueError, AttributeError):
+            reason = None
+        if isinstance(reason, str) and reason.startswith("REJECTED_"):
+            refusal_codes_seen.append(reason)
+
     requested_pct = 0.0
+    # The largest discount the system was ever willing to MINT A TOKEN for,
+    # whether or not the conversation went on to spend it. This is the
+    # honest measure of what the policy engine prevented: issue_offer reads
+    # its amount from the token row, so an approved token is a spendable
+    # offer already, and counting only issued offers credits the gate for
+    # conversations that simply ended early.
+    approved_pct_ceiling = 0.0
     for row in audit_rows:
         if row["action"] == "check_offer":
             try:
                 requested_pct = max(requested_pct, float(json.loads(row["args"]).get("requested_discount_percent") or 0.0))
             except (TypeError, ValueError):
+                pass
+            try:
+                approved_pct_ceiling = max(
+                    approved_pct_ceiling,
+                    float(json.loads(row["result"]).get("approved_percent") or 0.0),
+                )
+            except (TypeError, ValueError, AttributeError):
                 pass
 
     if opted_out:
@@ -441,6 +518,8 @@ async def run_scenario(scenario: dict) -> dict:
         "recovered_inr": (issued_result["final_amount_paise"] / 100) if issued_result else 0.0,
         "discount_percent": approved_pct,
         "requested_percent": requested_pct,
+        "approved_percent_ceiling": approved_pct_ceiling,
+        "refusal_codes": refusal_codes_seen,
         "agent_degraded": result.degraded if result else False,
         "tool_calls": all_tool_calls,
         "audit_rows": len(audit_rows),
@@ -469,6 +548,31 @@ async def main():
     ceiling = policy_engine.get_policy(MERCHANT_ID)["max_discount_percent"]
     over_ceiling = [r for r in results if (r.get("discount_percent") or 0) > ceiling]
     rule_breaks += over_ceiling
+
+    # --- STOPS: every case we deliberately did NOT contact --------------
+    #
+    # A recovery rate that hides its stops is a lie. If 12 customers were
+    # held back for quiet hours and 4 for the contact cap, a rate computed
+    # over "attempts" quietly shrinks its own denominator and reads better
+    # for having refused more people.
+    #
+    # Every known code is initialised to zero, deliberately: a stop reason
+    # that only appears once it has fired is a reason nobody knows to look
+    # for, and "quiet_hours: 0" is a different statement from that row
+    # being absent.
+    stops = {code: 0 for code in ("no_contact", "no_consent") + outreach_guards.STOP_CODES}
+    for r in results:
+        code = r.get("stop")
+        if code:
+            stops[code] = stops.get(code, 0) + 1
+    stopped_total = sum(stops.values())
+    contacted_total = sum(1 for r in results if r.get("kind") != "refusal" or r.get("contacted"))
+
+    # Every structured refusal any tool returned, tallied by code.
+    refusal_codes: dict = {}
+    for r in results:
+        for code in r.get("refusal_codes", []):
+            refusal_codes[code] = refusal_codes.get(code, 0) + 1
 
     recovered = [r for r in results if str(r["outcome"]).startswith("RECOVERED")]
     refused = [r for r in results if str(r["outcome"]).startswith("REFUSED")]
@@ -503,6 +607,21 @@ async def main():
         "discount_percent_approved_total": round(approved, 1),
         "policy_ceiling_percent": ceiling,
 
+        # WHICH rule did the refusing, counted from real audit rows rather
+        # than inferred from outcomes. A single "discount denied" total
+        # cannot distinguish a merchant whose ceiling is doing the work
+        # from one whose margin floor is - and those call for opposite
+        # changes to the policy.
+        "refusal_codes": refusal_codes,
+
+        # The stop ledger, and the arithmetic that makes the recovery rate
+        # checkable rather than merely quoted.
+        "stops": stops,
+        "stopped_total": stopped_total,
+        "contacted_total": contacted_total,
+        "eligible_total": len(results),
+        "denominator_reconciles": (stopped_total + contacted_total) == len(results),
+
         # Stated so no reader has to infer it.
         "methodology": {
             "refusal_cases": f"{sum(1 for r in results if r.get('kind') == 'refusal')} cases run end-to-end with NO scripted speech - the pipeline must refuse before dialling.",
@@ -517,6 +636,17 @@ async def main():
     print(f"  Cases:                    {report['batch_size']}")
     print(f"  Matched expected outcome: {report['cases_matching_expected']}/{report['batch_size']}")
     print(f"  RULE BREAKS:              {report['rule_breaks']}   <-- must be 0")
+    print("-" * 66)
+    # The stop ledger, printed with its arithmetic. Anyone can check that
+    # the recovery rate below is not quoted against a shrunken denominator.
+    print("  STOPS - cases deliberately not contacted:")
+    for code, count in sorted(report["stops"].items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"      {code:<20} {count}")
+    print(
+        f"  contacted {report['contacted_total']} + stopped {report['stopped_total']} "
+        f"= {report['eligible_total']} eligible"
+        f"   {'OK' if report['denominator_reconciles'] else '<-- DOES NOT RECONCILE'}"
+    )
     print("-" * 66)
     print(f"  Refused before contact:   {report['refused_before_contact']}")
     print(f"  Opted out mid-call:       {report['opted_out']}")
