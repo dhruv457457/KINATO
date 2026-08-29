@@ -148,4 +148,6 @@ Exposes exactly three methods: `Kinato.init`, `Kinato.identify`, `Kinato.track`.
 
 ## Documentation
 
-- **`docs/JUDGE-DEMO.md`** — verification guide, real-vs-simulated table, known weaknesses.
+- **[`docs/JUDGE-DEMO.md`](docs/JUDGE-DEMO.md)** — verification guide, real-vs-simulated table, known weaknesses.
+- **[`FINDINGS.md`](FINDINGS.md)** — what broke, and what we did about it. Nine real failures hit against a live storefront and a real phone, each with the fix and the regression test. Start here if you only read one.
+- **[`DISCLOSURE.md`](DISCLOSURE.md)** — trade-offs, the security boundary, and an explicit list of what is *not* built.
