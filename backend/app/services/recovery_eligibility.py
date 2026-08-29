@@ -2,6 +2,7 @@ import logging
 from typing import Dict, Any
 from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
+from app.db.database import run_db_async
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories.merchants import is_rail_degraded
@@ -39,10 +40,21 @@ class RecoveryEligibilityService:
         # sweeper/webhook will re-fire once the rail recovers or the
         # customer's own next attempt succeeds.
         if merchant_id and is_rail_degraded(merchant_id):
-            logger.info(f"Eligibility Check Failed: Razorpay rail is degraded for merchant {merchant_id} - holding outreach.")
+            # QUEUED, not dropped. This used to publish `blocked` and
+            # return, and nothing anywhere ever re-fired the case: the
+            # sweeper only picks up checkouts still in `started`, and a
+            # payment.failed case was never in that status. So every
+            # customer whose payment failed during an outage was lost
+            # permanently - for a reason that was our problem, not theirs.
+            logger.info(f"Rail degraded for merchant {merchant_id} - queueing {checkout_id} until it clears.")
+            await run_db_async(checkouts_repo.queue_for_rail_recovery, checkout_id)
             await bus.publish(
                 event_type="recovery.blocked",
-                payload={"checkout_id": checkout_id, "reason": "rail_degraded"},
+                payload={
+                    "checkout_id": checkout_id,
+                    "reason": "rail_degraded",
+                    "detail": "held until Razorpay recovers, then re-evaluated from scratch",
+                },
                 correlation_id=correlation_id,
                 merchant_id=merchant_id,
             )
@@ -62,9 +74,32 @@ class RecoveryEligibilityService:
             return
 
         # 3. Identity/Consent Gate Check (Before Outreach)
-        consent_granted = await identity_service.check_consent(merchant_id, customer_id, channel="voice")
-        if not consent_granted:
-            logger.info(f"Eligibility Check Failed: No voice consent for customer {customer_id}.")
+        #
+        # Two things were wrong here, and they compounded.
+        #
+        # It asked only about VOICE, so a customer with an email address
+        # and no phone number was refused outright rather than recovered
+        # by another route. And it returned WITHOUT publishing
+        # recovery.blocked - unlike the two branches directly above it -
+        # so the refusal was invisible: no event, no error, nothing on the
+        # dashboard. A merchant saw revenue at risk and zero attempts
+        # against it, with nothing anywhere explaining why. That is the
+        # same silent-failure shape as FINDINGS #3, in the path the
+        # README leads with.
+        channels = await identity_service.reachable_channels(merchant_id, customer_id)
+        if not channels:
+            logger.info(f"Eligibility Check Failed: no consented channel for customer {customer_id}.")
+            await bus.publish(
+                event_type="recovery.blocked",
+                payload={
+                    "checkout_id": checkout_id,
+                    "customer_id": customer_id,
+                    "reason": "no_consent",
+                    "detail": "no channel has a granted consent record for this customer",
+                },
+                correlation_id=correlation_id,
+                merchant_id=merchant_id,
+            )
             return
 
         logger.info(f"Eligibility Check Passed. Generating Recovery Opportunity for {checkout_id}.")
@@ -77,12 +112,58 @@ class RecoveryEligibilityService:
                 "customer_id": customer_id,
                 "amount": payload.get("amount"),
                 "currency": payload.get("currency"),
+                # Which routes are actually open to this customer. Carried
+                # so the orchestrator does not have to ask again, and so a
+                # phone-less customer is visibly an email case rather than
+                # a mystery.
+                "consented_channels": channels,
                 "state_machine_status": "ELIGIBILITY_CHECKED"
             },
             correlation_id=correlation_id,
             merchant_id=merchant_id,
             idempotency_key=f"opportunity_v1_{checkout_id}"
         )
+
+
+
+    @staticmethod
+    async def drain_rail_queue(event: Dict[str, Any]):
+        """Razorpay is healthy again - reconsider what we held back.
+
+        Deliberately re-publishes `checkout.payment_failed` rather than
+        jumping straight to creating opportunities. That sends every queued
+        case back through THIS function from the top, so the paid check,
+        the active-attempt check, consent and every future guard all run
+        again on release. Nothing is grandfathered past a stop because it
+        happened to be queued when the stop was added.
+        """
+        if (event.get("payload") or {}).get("status") != "resolved":
+            return
+        merchant_id = event.get("merchant_id")
+        if not merchant_id:
+            return
+
+        queued = await run_db_async(checkouts_repo.list_queued_for_rail, merchant_id)
+        await run_db_async(checkouts_repo.clear_rail_queue, merchant_id)
+        if not queued:
+            return
+
+        logger.info(f"Rail recovered for {merchant_id} - re-evaluating {len(queued)} queued checkout(s).")
+        for checkout in queued:
+            await bus.publish(
+                event_type="checkout.payment_failed",
+                payload={
+                    "checkout_id": checkout["checkout_id"],
+                    "customer_id": checkout.get("customer_id"),
+                    "amount": (checkout.get("amount_paise") or 0) / 100.0,
+                    "amount_paise": checkout.get("amount_paise"),
+                    "currency": checkout.get("currency", "INR"),
+                    "requeued_after_outage": True,
+                },
+                correlation_id=checkout["checkout_id"],
+                merchant_id=merchant_id,
+                idempotency_key=f"rail_requeue_{checkout['checkout_id']}",
+            )
 
     @staticmethod
     async def _check_db_if_paid(checkout_id: str) -> bool:
@@ -100,3 +181,7 @@ class RecoveryEligibilityService:
 # (payment.failed, zero-code) abandonment signals feed the same eligibility gate.
 bus.subscribe("checkout.abandoned", RecoveryEligibilityService.evaluate_abandonment)
 bus.subscribe("checkout.payment_failed", RecoveryEligibilityService.evaluate_abandonment)
+# The other half of the rail stopping rule. `rail.degraded` was published
+# to nobody, so "resolved" meant nothing and the held cases stayed held
+# forever.
+bus.subscribe("rail.degraded", RecoveryEligibilityService.drain_rail_queue)

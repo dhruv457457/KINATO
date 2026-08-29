@@ -25,6 +25,31 @@ const BLOCKED_COPY: Record<string, { title: string; action: string }> = {
     action:
       "Razorpay sent us the failed payment, but it carried no email or phone — so there was nobody to reach. Collecting contact details at checkout turns these into recoverable carts.",
   },
+  no_consent: {
+    title: "no consent on file to contact them",
+    action:
+      "These customers have either asked not to be contacted, or arrived without an email or phone we could record consent against. Opt-outs are permanent by design and need no action; the rest usually means contact details were missing at checkout.",
+  },
+  quiet_hours: {
+    title: "outside your calling hours",
+    action:
+      "These came in when your configured calling window was closed, so nobody was phoned. Times are judged in IST, not server time. Widen the window on the Policies page if you want these reached.",
+  },
+  max_calls_reached: {
+    title: "already contacted the maximum number of times",
+    action:
+      "These customers have been called as often as the cap allows. Calling again is the point at which recovery becomes a nuisance, so the cap holds rather than bending for a large cart.",
+  },
+  already_paid: {
+    title: "the customer had already paid",
+    action:
+      "Payment landed before outreach started, so nothing was sent. No action needed — this is the system checking twice and finding the money already in.",
+  },
+  promise_to_pay: {
+    title: "the customer promised to pay by a date",
+    action:
+      "They committed to a date and outreach is paused until it passes. If it lapses unpaid, exactly one reminder goes out and then we stop for good.",
+  },
   rail_degraded: {
     title: "Razorpay reported a payment outage",
     action:
