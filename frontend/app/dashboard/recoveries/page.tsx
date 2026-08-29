@@ -12,11 +12,16 @@ import {
   AsyncSection,
 } from "@/components/dashboard/primitives";
 import { RecoveryDrawer, RecoveryState } from "@/components/dashboard/RecoveryDrawer";
+import { RowActions } from "@/components/dashboard/RowActions";
 
 export default function RecoveriesPage() {
   const [rows, setRows] = useState<RecoveryRow[] | null>(null);
   const [error, setError] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Set when the drawer was opened by the Explain button rather than by
+  // clicking the row, so the explanation is requested straight away and
+  // lands above the evidence it was written from.
+  const [explainOnOpen, setExplainOnOpen] = useState(false);
 
   useEffect(() => {
     getRecoveries()
@@ -39,9 +44,12 @@ export default function RecoveriesPage() {
           }
         >
           {(list) => (
-            <DataTable columns={["Customer", "Cart", "Status", "Discount", "Recovered", "When"]}>
+            <DataTable columns={["Customer", "Cart", "Status", "Discount", "Recovered", "When", ""]}>
               {list.map((r, i) => (
-                <Row key={r.recovery_attempt_id} index={i} onClick={() => setSelectedId(r.recovery_attempt_id)}>
+                <Row key={r.recovery_attempt_id} index={i} onClick={() => {
+                    setExplainOnOpen(false);
+                    setSelectedId(r.recovery_attempt_id);
+                  }}>
                   <Cell>{r.customer_name || r.customer_phone || "—"}</Cell>
                   <Cell numeric>{formatInr(r.cart_amount_paise)}</Cell>
                   <Cell>
@@ -54,6 +62,16 @@ export default function RecoveriesPage() {
                   <Cell muted numeric>
                     {new Date(r.created_at).toLocaleString("en-IN")}
                   </Cell>
+                  <Cell>
+                    <RowActions
+                      recoveryAttemptId={r.recovery_attempt_id}
+                      state={r.state}
+                      onExplain={() => {
+                        setExplainOnOpen(true);
+                        setSelectedId(r.recovery_attempt_id);
+                      }}
+                    />
+                  </Cell>
                 </Row>
               ))}
             </DataTable>
@@ -61,7 +79,13 @@ export default function RecoveriesPage() {
         </AsyncSection>
       </PageBody>
 
-      {selectedId && <RecoveryDrawer recoveryAttemptId={selectedId} onClose={() => setSelectedId(null)} />}
+      {selectedId && (
+        <RecoveryDrawer
+          recoveryAttemptId={selectedId}
+          explainOnOpen={explainOnOpen}
+          onClose={() => setSelectedId(null)}
+        />
+      )}
     </>
   );
 }

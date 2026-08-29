@@ -182,6 +182,29 @@ export function getRecoveryDetail(
   return apiFetch(`/api/dashboard/recoveries/${id}`);
 }
 
+/** Retry runs the SAME gates an automatic attempt runs, so it can refuse.
+ *  `started: false` with a reason is the normal, useful answer - not an
+ *  error - and the UI shows the reason rather than a failure toast. */
+export interface RetryResult {
+  started: boolean;
+  reason: string;
+  detail: string;
+}
+
+export function retryRecovery(id: string): Promise<RetryResult> {
+  return apiFetch(`/api/dashboard/recoveries/${id}/retry`, { method: "POST" });
+}
+
+export interface ExplainResult {
+  explanation: string;
+  degraded: boolean;
+  detail: string;
+}
+
+export function explainRecovery(id: string): Promise<ExplainResult> {
+  return apiFetch(`/api/dashboard/recoveries/${id}/explain`, { method: "POST" });
+}
+
 export function getActivity(): Promise<{ activity: AuditRow[] }> {
   return apiFetch("/api/dashboard/activity");
 }

@@ -20,7 +20,14 @@
  */
 
 import { useEffect, useState } from "react";
-import { getRecoveryDetail, formatInr, AuditRow, TranscriptTurn } from "@/lib/api";
+import {
+  getRecoveryDetail,
+  explainRecovery,
+  formatInr,
+  AuditRow,
+  TranscriptTurn,
+  ExplainResult,
+} from "@/lib/api";
 import {
   StatusPill,
   Tone,
@@ -233,11 +240,66 @@ type TimelineItem =
   | { kind: "turn"; at: number; turn: TranscriptTurn }
   | { kind: "tool"; at: number; row: AuditRow };
 
+/** The narration, sitting directly above the rows it was written from.
+ *
+ *  Deliberately not a popup. An explanation on its own is a "trust me";
+ *  an explanation with the transcript and the tool calls underneath it is
+ *  something a merchant can check line by line - which matters most when
+ *  it is describing why their customer was refused a discount.
+ */
+function Explanation({ recoveryAttemptId }: { recoveryAttemptId: string }) {
+  const [state, setState] = useState<ExplainResult | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setState(null);
+    setFailed(false);
+    explainRecovery(recoveryAttemptId)
+      .then((r) => !cancelled && setState(r))
+      .catch(() => !cancelled && setFailed(true));
+    return () => {
+      cancelled = true;
+    };
+  }, [recoveryAttemptId]);
+
+  const body = failed
+    ? "Could not write an explanation just now. The record below is unaffected."
+    : state?.degraded
+    ? state.detail
+    : state?.explanation;
+
+  return (
+    <div className="mb-8 border p-5" style={{ borderColor: RULE, background: WASH }}>
+      <div className="text-[10.5px] font-semibold uppercase tracking-widest mb-2" style={{ color: INK_MUTED }}>
+        What happened here
+      </div>
+      {!state && !failed ? (
+        <div className="space-y-2">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="anim-shimmer h-[10px] rounded-sm" style={{ width: `${92 - i * 16}%` }} />
+          ))}
+        </div>
+      ) : (
+        <p className="text-[13px] leading-relaxed" style={{ textWrap: "pretty" } as React.CSSProperties}>
+          {body}
+        </p>
+      )}
+      <div className="text-[11px] mt-3 pt-3 border-t" style={{ borderColor: RULE_SOFT, color: INK_MUTED }}>
+        Written from the rows below and nothing else — if a fact is not in this attempt&rsquo;s
+        record, it is not in the summary.
+      </div>
+    </div>
+  );
+}
+
 export function RecoveryDrawer({
   recoveryAttemptId,
+  explainOnOpen = false,
   onClose,
 }: {
   recoveryAttemptId: string;
+  explainOnOpen?: boolean;
   onClose: () => void;
 }) {
   const [detail, setDetail] = useState<{
@@ -353,6 +415,8 @@ export function RecoveryDrawer({
                   </Field>
                 )}
               </div>
+
+              {explainOnOpen && <Explanation recoveryAttemptId={recoveryAttemptId} />}
 
               <PromiseNote attempt={detail.recovery_attempt} />
 

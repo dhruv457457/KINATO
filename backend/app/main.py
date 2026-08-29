@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 import os
 
 from app.api.dashboard import router as dashboard_router
+from app.api.recovery_actions import actions_router
 from app.api.triggers import trigger_router
 from app.api.auth import auth_router
 from app.api.merchant_settings import merchant_router
@@ -87,6 +88,7 @@ app.middleware("http")(dynamic_cors_middleware)
 
 # Register routers
 app.include_router(dashboard_router, prefix="/api")
+app.include_router(actions_router, prefix="/api")
 app.include_router(trigger_router, prefix="/api")
 app.include_router(auth_router)
 app.include_router(merchant_router)
