@@ -78,7 +78,7 @@ class TestOfferTokenGate:
         token_row = offer_tokens_repo.create_offer_token(
             merchant_id=merchant_id,
             decision="ALLOW",
-            reason="within_margin_and_discount_limits",
+            reason="APPROVED",
             base_amount_paise=100_000,
             final_amount_paise=95_000,
             requested_percent=5,

@@ -198,3 +198,174 @@ def test_terminal_states_match_what_the_code_actually_writes():
     assert "RECOVERED" in TERMINAL_STATES
     for phantom in ("FAILED", "OPTED_OUT"):
         assert phantom not in TERMINAL_STATES, f"{phantom} is never written by any code path"
+
+
+class TestAlreadyPaidAtTheMoneyGate:
+    """"Already paid" was checked before dialling and once per conversation
+    turn, but never inside check_offer - so the one place that actually
+    mints spendable offers was the one place that never asked.
+
+    On a live voice call the per-turn check closes that in practice. It
+    does nothing for any other caller of the agent, and "whoever calls this
+    happens to check first" is not a property of the tool.
+    """
+
+    async def test_check_offer_refuses_on_a_paid_checkout(
+        self, connected_merchant_id, unique_checkout_id
+    ):
+        from app.agents import tools as tools_module
+        from app.agents.state import AgentContext
+        from app.db.repositories import checkouts as checkouts_repo
+
+        checkouts_repo.create_checkout(
+            merchant_id=connected_merchant_id,
+            amount_paise=249_900,
+            cogs_paise=100_000,
+            checkout_id=unique_checkout_id,
+            line_items=[{"product_id": "sku_1", "name": "Woven Table Runner"}],
+        )
+        ctx = AgentContext(
+            merchant_id=connected_merchant_id,
+            correlation_id="test",
+            checkout_id=unique_checkout_id,
+        )
+
+        # Unpaid: a normal offer.
+        assert (await tools_module._check_offer(ctx, 5, "price"))["decision"] in ("ALLOW", "MODIFY")
+
+        # Paid mid-conversation, exactly as a customer paying on another
+        # device would look.
+        checkouts_repo.mark_paid(unique_checkout_id, rzp_payment_id="pay_test_already")
+
+        result = await tools_module._check_offer(ctx, 5, "price")
+        assert result["decision"] == "DENY"
+        assert result["reason"] == "REJECTED_ALREADY_PAID"
+
+    async def test_full_price_is_refused_on_a_paid_checkout_too(
+        self, connected_merchant_id, unique_checkout_id
+    ):
+        """Full price is exempt from the discount gates, deliberately - but
+        not from this one. Sending anyone a link for something they have
+        already paid for is the single most damaging thing this agent could
+        do, and it does not become less damaging at 0% off."""
+        from app.agents import tools as tools_module
+        from app.agents.state import AgentContext
+        from app.db.repositories import checkouts as checkouts_repo
+
+        checkouts_repo.create_checkout(
+            merchant_id=connected_merchant_id,
+            amount_paise=99_900,
+            cogs_paise=40_000,
+            checkout_id=unique_checkout_id,
+        )
+        checkouts_repo.mark_paid(unique_checkout_id, rzp_payment_id="pay_test_already_2")
+
+        ctx = AgentContext(
+            merchant_id=connected_merchant_id,
+            correlation_id="test",
+            checkout_id=unique_checkout_id,
+        )
+        result = await tools_module._check_offer(ctx, 0, "ready to buy")
+        assert result["decision"] == "DENY"
+        assert result["reason"] == "REJECTED_ALREADY_PAID"
+
+
+class TestAnOutageDefersRecoveryRatherThanDestroyingIt:
+    """The rail check published `recovery.blocked` and returned - and
+    nothing anywhere ever re-fired the case. The sweeper only picks up
+    checkouts still in `started`, and a payment.failed case was never in
+    that status, so every customer whose payment failed during a Razorpay
+    outage was lost permanently. For a reason that was our problem, not
+    theirs.
+    """
+
+    async def test_a_case_held_during_an_outage_is_queued_not_dropped(
+        self, real_merchant_id
+    ):
+        from app.db.repositories import checkouts as checkouts_repo
+        from app.db.repositories import customers as customers_repo
+        from app.db.repositories.merchants import set_rail_degraded
+        from app.services.identity_service import identity_service
+        from tests.conftest import wait_until
+
+        customer = customers_repo.upsert_by_contact(
+            real_merchant_id, email="outage@example.com", phone="+919000000099"
+        )
+        await identity_service.grant_transactional_consent(
+            real_merchant_id, customer["customer_id"],
+            email="outage@example.com", phone="+919000000099",
+        )
+        checkout = checkouts_repo.create_checkout(
+            real_merchant_id, amount_paise=200_000, customer_id=customer["customer_id"]
+        )
+        cid = checkout["checkout_id"]
+
+        set_rail_degraded(real_merchant_id, True)
+        try:
+            await bus.publish(
+                event_type="checkout.payment_failed",
+                payload={"checkout_id": cid, "customer_id": customer["customer_id"], "amount": 2000.0},
+                correlation_id=cid,
+                merchant_id=real_merchant_id,
+            )
+            await wait_until(
+                lambda: any(
+                    e["event_type"] == "recovery.blocked"
+                    and e["payload"].get("reason") == "rail_degraded"
+                    for e in bus._event_log
+                )
+            )
+            assert checkouts_repo.get_checkout(cid)["recovery_queued_at"] is not None, (
+                "a case held for an outage must be recorded so it can be picked up again"
+            )
+        finally:
+            set_rail_degraded(real_merchant_id, False)
+
+    async def test_the_queue_drains_when_the_outage_clears(self, real_merchant_id):
+        """And it drains back through the FULL eligibility gate, so nothing
+        is grandfathered past a stop just because it was queued."""
+        from app.db.repositories import checkouts as checkouts_repo
+        from app.db.repositories import customers as customers_repo
+        from tests.conftest import wait_until
+
+        customer = customers_repo.upsert_by_contact(
+            real_merchant_id, email="drain@example.com", phone="+919000000098"
+        )
+        checkout = checkouts_repo.create_checkout(
+            real_merchant_id, amount_paise=300_000, customer_id=customer["customer_id"]
+        )
+        cid = checkout["checkout_id"]
+        checkouts_repo.queue_for_rail_recovery(cid)
+
+        await bus.publish(
+            event_type="rail.degraded",
+            payload={"status": "resolved"},
+            correlation_id=real_merchant_id,
+            merchant_id=real_merchant_id,
+        )
+
+        requeued = await wait_until(
+            lambda: any(
+                e["event_type"] == "checkout.payment_failed"
+                and e["payload"].get("checkout_id") == cid
+                and e["payload"].get("requeued_after_outage")
+                for e in bus._event_log
+            )
+        )
+        assert requeued, "cases held for an outage must be reconsidered once it clears"
+        assert checkouts_repo.get_checkout(cid)["recovery_queued_at"] is None
+
+    async def test_a_case_paid_during_the_outage_is_not_chased_afterwards(
+        self, real_merchant_id
+    ):
+        from app.db.repositories import checkouts as checkouts_repo
+
+        checkout = checkouts_repo.create_checkout(real_merchant_id, amount_paise=300_000)
+        cid = checkout["checkout_id"]
+        checkouts_repo.queue_for_rail_recovery(cid)
+        checkouts_repo.mark_paid(cid, rzp_payment_id="pay_during_outage")
+
+        queued = checkouts_repo.list_queued_for_rail(real_merchant_id)
+        assert cid not in [c["checkout_id"] for c in queued], (
+            "someone who paid while we were holding back must not be called about it"
+        )
