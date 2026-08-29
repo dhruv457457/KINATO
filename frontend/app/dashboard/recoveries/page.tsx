@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getRecoveries, formatInr, RecoveryRow } from "@/lib/api";
 import {
   PageHeader,
@@ -23,11 +23,15 @@ export default function RecoveriesPage() {
   // lands above the evidence it was written from.
   const [explainOnOpen, setExplainOnOpen] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     getRecoveries()
       .then((d) => setRows(d.recoveries))
       .catch(() => setError("Could not load recoveries right now."));
   }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   return (
     <>
@@ -70,6 +74,9 @@ export default function RecoveriesPage() {
                         setExplainOnOpen(true);
                         setSelectedId(r.recovery_attempt_id);
                       }}
+                      // A new attempt lands at the top of the list; give
+                      // the pipeline a moment to create it before looking.
+                      onRetried={() => setTimeout(load, 1500)}
                     />
                   </Cell>
                 </Row>

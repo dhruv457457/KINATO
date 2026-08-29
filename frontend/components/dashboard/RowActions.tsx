@@ -42,10 +42,16 @@ export function RowActions({
   recoveryAttemptId,
   state,
   onExplain,
+  onRetried,
 }: {
   recoveryAttemptId: string;
   state: string;
   onExplain: () => void;
+  /** Refetch the table. A retry does not change THIS row - that attempt is
+   *  finished and its state is history - it opens a NEW one, which is
+   *  invisible until the list reloads. Saying "restarted" while nothing
+   *  on screen moved was the confusing part, not the behaviour. */
+  onRetried: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<RetryResult | null>(null);
@@ -57,7 +63,9 @@ export function RowActions({
     if (busy) return;
     setBusy(true);
     try {
-      setResult(await retryRecovery(recoveryAttemptId));
+      const r = await retryRecovery(recoveryAttemptId);
+      setResult(r);
+      if (r.started) onRetried();
     } catch {
       setResult({ started: false, reason: "error", detail: "Could not reach the server." });
     } finally {
@@ -73,7 +81,7 @@ export function RowActions({
         style={{ color: good ? POSITIVE : INK_MUTED }}
         title={result.detail}
       >
-        {good ? "restarted" : REFUSAL_COPY[result.reason] || result.reason || "not retried"}
+        {good ? "new attempt above" : REFUSAL_COPY[result.reason] || result.reason || "not retried"}
       </span>
     );
   }

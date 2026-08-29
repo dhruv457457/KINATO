@@ -1,4 +1,5 @@
 import logging
+import uuid
 from typing import Dict, Any
 from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
@@ -136,6 +137,28 @@ class RecoveryEligibilityService:
                 return
 
         logger.info(f"Eligibility Check Passed. Generating Recovery Opportunity for {checkout_id}.")
+
+        # One opportunity per checkout, UNLESS a human or a release asked
+        # for another one.
+        #
+        # opportunity_v1_{checkout_id} was permanent and per-cart, which was
+        # right while a cart could only ever be recovered once. It stopped
+        # being right the moment Retry existed: the endpoint returned
+        # "started", the eligibility gate passed, and the event was then
+        # silently swallowed as a duplicate. The merchant pressed a button,
+        # was told it worked, and no phone ever rang.
+        #
+        # Automatic triggers keep the per-cart key, because that is what
+        # stops one abandoned cart producing two opportunities when both
+        # the SDK and the webhook report it. A deliberate re-trigger gets a
+        # unique key: it is not a duplicate of anything, it is somebody
+        # asking again.
+        deliberate = payload.get("retried_by_merchant") or payload.get("released_from_queue")
+        idempotency_key = (
+            f"opportunity_retry_{checkout_id}_{uuid.uuid4().hex[:12]}"
+            if deliberate
+            else f"opportunity_v1_{checkout_id}"
+        )
         
         # Emit Opportunity Created (this triggers the Call Orchestrator)
         await bus.publish(
@@ -154,7 +177,7 @@ class RecoveryEligibilityService:
             },
             correlation_id=correlation_id,
             merchant_id=merchant_id,
-            idempotency_key=f"opportunity_v1_{checkout_id}"
+            idempotency_key=idempotency_key,
         )
 
 
@@ -195,7 +218,7 @@ class RecoveryEligibilityService:
                 },
                 correlation_id=checkout["checkout_id"],
                 merchant_id=merchant_id,
-                idempotency_key=f"rail_requeue_{checkout['checkout_id']}",
+                idempotency_key=f"rail_requeue_{checkout['checkout_id']}_{uuid.uuid4().hex[:12]}",
             )
 
     @staticmethod

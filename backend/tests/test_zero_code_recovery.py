@@ -16,6 +16,7 @@ because they are the ways the fix itself could be worse than the bug:
 consent must never be resurrected for someone who opted out, and opting out
 must stop every channel rather than the one they happened to say it on.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -32,6 +33,7 @@ from app.db.database import get_db
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import consents as consents_repo
 from app.db.repositories import customers as customers_repo
+from app.db.repositories import recovery_attempts as ra_repo
 from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
 
@@ -355,3 +357,136 @@ class TestOneCartIsOneRecovery:
             )
         assert checkouts_repo.find_by_order_id(real_merchant_id, rzp_id) is not None
         assert checkouts_repo.find_by_order_id(real_merchant_id, "") is None
+
+
+class TestRetryActuallyStartsSomething:
+    """The endpoint returned started:true, the eligibility gate logged
+    "Check Passed", and the opportunity event was then dropped:
+
+        Idempotency key opportunity_v1_order_TVd5m7XEwFzwKM already
+        processed (durable check). Dropping event
+
+    The key was permanent and per-cart, which was right while a cart could
+    only ever be recovered once. Once a merchant could press Retry it meant
+    the button reported success and no phone ever rang - the exact shape
+    this whole document is about.
+    """
+
+    async def test_a_second_opportunity_can_be_raised_for_the_same_cart(
+        self, real_merchant_id
+    ):
+        from app.db.repositories import customers as customers_repo
+        from app.db.repositories import policies as policies_repo
+        from app.services.identity_service import identity_service
+        from tests.conftest import wait_until
+
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": 0, "calling_end_hour": 24}
+        )
+        customer = customers_repo.upsert_by_contact(
+            real_merchant_id, email="retry@example.com", phone="+919000000301"
+        )
+        await identity_service.grant_transactional_consent(
+            real_merchant_id, customer["customer_id"],
+            email="retry@example.com", phone="+919000000301",
+        )
+        checkout = checkouts_repo.create_checkout(
+            real_merchant_id, amount_paise=250_000, customer_id=customer["customer_id"]
+        )
+        cid = checkout["checkout_id"]
+
+        async def fire(**extra):
+            await bus.publish(
+                event_type="checkout.payment_failed",
+                payload={
+                    "checkout_id": cid,
+                    "customer_id": customer["customer_id"],
+                    "amount": 2500.0,
+                    **extra,
+                },
+                correlation_id=cid,
+                merchant_id=real_merchant_id,
+            )
+
+        def opportunities():
+            return [
+                e for e in bus._event_log
+                if e["event_type"] == "recovery.opportunity.created"
+                and e["payload"].get("checkout_id") == cid
+            ]
+
+        await fire()
+        assert await wait_until(lambda: len(opportunities()) >= 1)
+
+        # The same automatic trigger again is still a duplicate: this is
+        # what stops one cart producing two opportunities when both the SDK
+        # and the webhook report it.
+        await fire()
+        await asyncio.sleep(0.4)
+        assert len(opportunities()) == 1, "an automatic re-fire must still be deduplicated"
+
+        # The first attempt has to be finished before another can start:
+        # two live recoveries for one cart would mean two calls to the same
+        # person. A CALL FAILED row - which is what a merchant is looking
+        # at when they press Retry - is exactly that situation.
+        for a in ra_repo.list_active_for_checkout(cid):
+            ra_repo.update_state(a["recovery_attempt_id"], "CALL_FAILED")
+
+        # A merchant pressing Retry is not a duplicate of anything. It is
+        # somebody asking again.
+        await fire(retried_by_merchant=True)
+        assert await wait_until(lambda: len(opportunities()) >= 2), (
+            "a deliberate retry must raise a real opportunity, not be swallowed as a duplicate"
+        )
+
+    async def test_a_queue_release_is_not_a_duplicate_either(self, real_merchant_id):
+        """Same bug, same shape: a cart held on Monday night and released
+        Tuesday could never be held and released again."""
+        from app.db.repositories import customers as customers_repo
+        from app.db.repositories import policies as policies_repo
+        from app.services.identity_service import identity_service
+        from tests.conftest import wait_until
+
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": 0, "calling_end_hour": 24}
+        )
+        customer = customers_repo.upsert_by_contact(
+            real_merchant_id, email="release@example.com", phone="+919000000302"
+        )
+        await identity_service.grant_transactional_consent(
+            real_merchant_id, customer["customer_id"],
+            email="release@example.com", phone="+919000000302",
+        )
+        checkout = checkouts_repo.create_checkout(
+            real_merchant_id, amount_paise=250_000, customer_id=customer["customer_id"]
+        )
+        cid = checkout["checkout_id"]
+
+        for i in range(2):
+            for a in ra_repo.list_active_for_checkout(cid):
+                ra_repo.update_state(a["recovery_attempt_id"], "CALL_FAILED")
+            await bus.publish(
+                event_type="checkout.payment_failed",
+                payload={
+                    "checkout_id": cid,
+                    "customer_id": customer["customer_id"],
+                    "amount": 2500.0,
+                    "released_from_queue": True,
+                },
+                correlation_id=cid,
+                merchant_id=real_merchant_id,
+            )
+            await wait_until(
+                lambda n=i: len([
+                    e for e in bus._event_log
+                    if e["event_type"] == "recovery.opportunity.created"
+                    and e["payload"].get("checkout_id") == cid
+                ]) >= n + 1
+            )
+
+        raised = [
+            e for e in bus._event_log
+            if e["event_type"] == "recovery.opportunity.created"
+            and e["payload"].get("checkout_id") == cid
+        ]
+        assert len(raised) == 2, "each release must be able to raise its own opportunity"

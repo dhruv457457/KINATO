@@ -14,6 +14,7 @@ cheap and correct under both constraints.
 """
 import asyncio
 import logging
+import uuid
 from typing import Dict, Any
 
 from app.db.database import get_db, dialect
@@ -159,7 +160,13 @@ async def _drain_recovery_queue():
                 },
                 correlation_id=checkout["checkout_id"],
                 merchant_id=merchant_id,
-                idempotency_key=f"queue_release_{checkout['checkout_id']}",
+                # Unique per release, not per cart. A cart held on Monday
+                # night and released Tuesday morning can be held again on
+                # Tuesday night, and a permanent key would have made the
+                # second release a silent no-op. The queue flag is cleared
+                # before publishing, so a second sweeper pass finds nothing
+                # to re-fire anyway.
+                idempotency_key=f"queue_release_{checkout['checkout_id']}_{uuid.uuid4().hex[:12]}",
             )
 
 

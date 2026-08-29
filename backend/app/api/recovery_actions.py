@@ -91,6 +91,22 @@ async def retry_recovery(
             ),
         }
 
+    # An attempt already in flight for this cart. The eligibility gate
+    # refuses this case too, but silently and after the endpoint has
+    # already answered - so without this check the merchant is told
+    # "started" and nothing happens, which is the bug this button was
+    # meant to be free of.
+    active = await run_db_async(recovery_attempts_repo.list_active_for_checkout, checkout_id)
+    if active:
+        return {
+            "started": False,
+            "reason": "already_in_flight",
+            "detail": (
+                "A recovery for this cart is already running. Two at once would mean "
+                "two calls to the same person about the same order."
+            ),
+        }
+
     allowed, stop_reason = await run_db_async(outreach_guards.check_all, merchant_id, checkout_id)
     if not allowed:
         code = outreach_guards.stop_code(stop_reason)
