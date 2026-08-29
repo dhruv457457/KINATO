@@ -35,6 +35,20 @@ def within_calling_hours(merchant_id: str, now: Optional[datetime] = None) -> Tu
     end = int(policy.get("calling_end_hour", 20))
     hour = (now or datetime.now(IST)).astimezone(IST).hour
 
+    # Round the clock, expressed the two ways a merchant would try it.
+    #
+    # 0-24 is the explicit form. start == end is the one that mattered: a
+    # merchant setting 0 and 0 means "midnight to midnight, always", and
+    # the arithmetic said `0 <= hour < 0` - never, for every hour of the
+    # day. They would have switched calling off entirely while believing
+    # they had switched it fully on, and seen nothing but silence.
+    #
+    # A time window is the wrong place to express "never call". That is
+    # what revoking consent or pausing recovery is for, and neither of them
+    # looks like a typo.
+    if start == end or (start == 0 and end >= 24):
+        return True, ""
+
     ok = start <= hour < end if start <= end else (hour >= start or hour < end)
     if not ok:
         return False, f"quiet_hours (IST hour {hour} outside {start}:00-{end}:00)"

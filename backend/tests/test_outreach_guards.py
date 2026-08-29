@@ -196,3 +196,57 @@ class TestTheGateIsOneFunctionNotTwoCopies:
         missing from it is a stop nobody would know to look for."""
         assert "channel_cap_today" in outreach_guards.STOP_CODES
         assert "promise_to_pay" in outreach_guards.STOP_CODES
+
+
+@pytest.mark.real_clock
+class TestRoundTheClockIsReachable:
+    """A merchant asked how to call 24/7 and the honest answer was that
+    they could not. 0-23 silently skipped the 23:00 hour, 24 was rejected
+    by validation, and 0-0 - which reads as "midnight to midnight, always"
+    - evaluated to `0 <= hour < 0`, meaning never. They would have switched
+    calling off entirely while believing they had switched it fully on.
+    """
+
+    @pytest.mark.parametrize("start,end", [(0, 24), (0, 0), (10, 10), (23, 23)])
+    def test_every_hour_is_allowed(self, real_merchant_id, start, end):
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": start, "calling_end_hour": end}
+        )
+        for hour in range(24):
+            clock = datetime(2026, 8, 28, hour, 30, tzinfo=IST)
+            ok, reason = outreach_guards.within_calling_hours(real_merchant_id, now=clock)
+            assert ok, f"{start}-{end} refused hour {hour}: {reason}"
+
+    def test_same_value_no_longer_means_never(self, real_merchant_id):
+        """The dangerous reading. This is the assertion that would have
+        caught it."""
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": 0, "calling_end_hour": 0}
+        )
+        allowed = [
+            h for h in range(24)
+            if outreach_guards.within_calling_hours(
+                real_merchant_id, now=datetime(2026, 8, 28, h, 30, tzinfo=IST)
+            )[0]
+        ]
+        assert len(allowed) == 24, "0-0 must mean always, never nothing"
+
+    def test_a_real_window_still_refuses_outside_it(self, real_merchant_id):
+        """The point of making 24/7 reachable is not to weaken the guard."""
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": 10, "calling_end_hour": 20}
+        )
+        ok, reason = outreach_guards.within_calling_hours(
+            real_merchant_id, now=datetime(2026, 8, 28, 22, 30, tzinfo=IST)
+        )
+        assert not ok and "quiet_hours" in reason
+
+    def test_an_overnight_window_still_wraps(self, real_merchant_id):
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": 22, "calling_end_hour": 6}
+        )
+        for hour, expected in ((23, True), (2, True), (12, False)):
+            ok, _ = outreach_guards.within_calling_hours(
+                real_merchant_id, now=datetime(2026, 8, 28, hour, 30, tzinfo=IST)
+            )
+            assert ok is expected, f"hour {hour} judged wrongly for a 22-6 window"

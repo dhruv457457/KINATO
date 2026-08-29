@@ -289,7 +289,11 @@ class PolicyUpdateRequest(BaseModel):
     max_discount_percent: Optional[float] = Field(None, ge=0, le=100)
     minimum_margin_percent: Optional[float] = Field(None, ge=0, le=100)
     calling_start_hour: Optional[int] = Field(None, ge=0, le=23)
-    calling_end_hour: Optional[int] = Field(None, ge=0, le=23)
+    # 24 is allowed on the END hour only, and only so that 0-24 can mean
+    # "any hour". Capping it at 23 made true round-the-clock calling
+    # unreachable: 0-23 silently skipped 23:00-00:00, and the natural
+    # alternative (0-0) meant never.
+    calling_end_hour: Optional[int] = Field(None, ge=0, le=24)
     auto_approval_threshold_inr: Optional[float] = Field(None, ge=0)
 
 

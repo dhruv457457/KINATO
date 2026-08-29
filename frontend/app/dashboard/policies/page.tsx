@@ -146,11 +146,45 @@ export default function PoliciesPage() {
                 <input
                   type="number"
                   min={0}
-                  max={23}
+                  max={24}
                   value={policy.calling_end_hour}
                   onChange={(e) => setPolicy({ ...policy, calling_end_hour: Number(e.target.value) })}
                 />
               </div>
+            </div>
+
+            {/* Round-the-clock has to be reachable and obvious. Before this
+                it was neither: 0-23 silently skipped the 23:00 hour, and
+                0-0 - which reads as "midnight to midnight, always" - meant
+                never, so a merchant could switch calling off while
+                believing they had switched it fully on. */}
+            <div className="hint" style={{ marginTop: "-1.5rem", marginBottom: "2rem" }}>
+              {policy.calling_start_hour === policy.calling_end_hour ||
+              (policy.calling_start_hour === 0 && policy.calling_end_hour >= 24) ? (
+                <span>
+                  Calling <strong>around the clock</strong>. Times are judged in IST, wherever this is
+                  running.{" "}
+                  <button
+                    type="button"
+                    className="underline underline-offset-2"
+                    onClick={() => setPolicy({ ...policy, calling_start_hour: 10, calling_end_hour: 20 })}
+                  >
+                    Back to 10:00–20:00
+                  </button>
+                </span>
+              ) : (
+                <span>
+                  Judged in IST, not server time. Overnight windows work — 22 to 6 means ten at night
+                  until six in the morning.{" "}
+                  <button
+                    type="button"
+                    className="underline underline-offset-2"
+                    onClick={() => setPolicy({ ...policy, calling_start_hour: 0, calling_end_hour: 24 })}
+                  >
+                    Call at any hour
+                  </button>
+                </span>
+              )}
             </div>
 
             <div className="flex items-center gap-4 pt-5 border-t" style={{ borderColor: RULE_SOFT }}>
