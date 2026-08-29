@@ -170,3 +170,37 @@ def clear_rail_queue(merchant_id: str) -> None:
             "AND recovery_queued_at IS NOT NULL",
             (merchant_id,),
         )
+
+
+def find_by_order_id(merchant_id: str, order_id: str) -> Optional[Dict[str, Any]]:
+    """Find a checkout this merchant already tracked for a Razorpay order.
+
+    The SDK records a cart under the merchant's own identifier - in
+    practice the Razorpay order id - long before any payment fails. The
+    webhook then arrives carrying that same order id, and if it only looks
+    at notes.checkout_id it finds nothing and opens a SECOND checkout for
+    the same cart.
+
+    Observed in production: one abandoned cart produced order_TVd3XEkPFeE9VI
+    from the SDK and chk_wh_pay_TVd3g0Qckljb1S from the webhook, then two
+    recovery attempts, and would have produced two phone calls to one
+    person about one order.
+
+    Matches on the checkout_id itself and on rzp_order_id, because which of
+    the two holds the order id depends on how the merchant integrated, and
+    a customer should not be called twice over that detail.
+    """
+    if not order_id:
+        return None
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM checkouts
+            WHERE merchant_id = %s AND (checkout_id = %s OR rzp_order_id = %s)
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            (merchant_id, order_id, order_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None

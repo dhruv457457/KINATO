@@ -101,9 +101,26 @@ async def razorpay_webhook(merchant_id: str, request: Request):
             )
 
         if not checkout_id:
-            # No prior SDK/API integration ever tracked this checkout (the
-            # zero-code path) - create the row now from the webhook itself,
-            # so it's a real row the same as any other, not a special case.
+            # Before opening a new one, look for a cart this merchant
+            # already tracked for the same Razorpay order. The SDK records
+            # it under the order id well before any payment fails, and only
+            # consulting notes.checkout_id meant the webhook never found it
+            # - so one abandoned cart became two checkouts, two recovery
+            # attempts, and two phone calls to one person about one order.
+            existing = checkouts_repo.find_by_order_id(
+                merchant_id, payment_entity.get("order_id") or ""
+            )
+            if existing:
+                checkout_id = existing["checkout_id"]
+                logger.info(
+                    f"payment.failed matched an existing checkout {checkout_id} "
+                    f"via order {payment_entity.get('order_id')!r} - not opening a second one."
+                )
+
+        if not checkout_id:
+            # Genuinely untracked: nothing on the storefront ever told us
+            # about this cart (the zero-code path). Create the row now from
+            # the webhook itself, so it is a real row like any other.
             checkout_id = f"chk_wh_{payment_entity.get('id', uuid.uuid4().hex[:8])}"
             checkouts_repo.create_checkout(
                 merchant_id, amount_paise=amount_paise,
