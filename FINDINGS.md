@@ -643,6 +643,98 @@ stronger sentence. It is a sentence placed where the model is looking.
 
 ---
 
+## 16. Two bugs the deployed logs showed, and neither was the one reported
+
+A production log was handed over with the description "calls failing". Every
+recovery attempt in it ended `CALL_FAILED`. Nothing was failing.
+
+```
+15:06:45 UTC  =  20:36 IST
+Orchestrator halting rec_c2a05251755a: STOP_QUIET_HOURS
+```
+
+The merchant's calling window closes at 20:00 and the system correctly
+refused to telephone someone at half past eight at night. It then recorded
+that refusal as `CALL_FAILED` — the same state a broken phone number
+produces. Three consequences, in ascending order of seriousness:
+
+- The dashboard told the merchant these were *"real dial failures (no phone
+  on file, carrier issue)"*. A false statement to a merchant about their own
+  system.
+- `CALL_FAILED` sits in `CONTACTED_STATES`, so every refusal burned the
+  customer's contact cap for a call that never happened — precisely what
+  that counter's own docstring says must not happen.
+- A working guardrail looked like a broken integration, which is why it was
+  reported as a bug at all. **A compliance success that reads as a failure
+  will eventually be "fixed" by someone.** That is the real cost.
+
+`BLOCKED` is now its own terminal state: out of contact counting, reported
+apart from dial failures, coloured neutral rather than red. Terminal on
+purpose — the case becomes eligible again the moment the reason expires,
+which is the difference between stopping and failing.
+
+### The bug underneath it
+
+The same logs showed one abandoned cart producing two of everything:
+
+```
+checkout.started         order_TVd3XEkPFeE9VI        (SDK, on the storefront)
+checkout.payment_failed  chk_wh_pay_TVd3g0Qckljb1S   (webhook, seconds later)
+→ rec_c2a05251755a  and  rec_27bc2087e23e
+```
+
+The SDK records a cart under the Razorpay order id well before anything
+fails. The webhook then arrives carrying that same order id, consulted only
+`notes.checkout_id`, found nothing, and opened a second checkout beside the
+first. Every SDK-integrated merchant was getting **two recovery attempts,
+and would have got two phone calls, for one order** — with revenue at risk
+double-counted to match.
+
+It resolves the order id against existing checkouts now, on both the
+`checkout_id` and `rzp_order_id` columns, because which one holds it depends
+on how the merchant integrated and a customer should not be called twice
+over that detail. Verified by disabling the lookup and watching the
+duplicate reappear.
+
+### And a third, which is the interesting one
+
+Every generated opening line in those logs was discarded:
+
+```
+RecoveryStrategist: model returned an opening line containing a placeholder
+("Hi Dhruv, this is [Your Name] from Loomwork...")  - discarding it
+```
+
+Four generations, four placeholders. The guard held every time, so no
+customer heard brackets read aloud — but the personalised opening was
+therefore never used, and every call fell back to a generic line. A feature
+failing 100% of the time, silently, behind a guard that was working.
+
+The prompt already forbade it, in these words:
+
+> NEVER output a placeholder, bracket, or template slot such as
+> `[Your Name]`, `[Your Company]`, `{name}` or XYZ
+
+**The prohibition was the cause.** The model had no personal name, wanted to
+introduce itself, and the only concrete example of how to name the unknown
+thing was sitting right there in its own instructions. Telling it never to
+say `[Your Name]` is how `[Your Name]` got into the context.
+
+The fix removes the forbidden strings entirely and specifies the *shape* of
+the sentence instead — refer to yourself as the organisation, never as a
+named individual, plus one example of a good line. Measured over six
+consecutive generations: **6 of 6 usable, against 0 of 4 before.**
+
+This is #14 and #15 again from a third angle. There, a rule lost because it
+sat far from the instruction it contradicted. Here, a rule lost because
+stating it required naming the exact thing it prohibited. Both are the same
+underlying fact: **a prompt is not a rulebook the model consults, it is
+context the model completes.** Anything phrased as "never produce X" has
+put X in front of the model, and the reliable move is to describe what to
+produce instead.
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim
