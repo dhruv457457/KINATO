@@ -132,6 +132,23 @@ export interface AuditRow {
   created_at: string;
 }
 
+/** One side of one exchange, as it was actually said. Persisted per turn
+ *  so the drawer can show the conversation the agent's tool calls were a
+ *  response to - and so a mid-call restart has something to rebuild from. */
+export interface TranscriptTurn {
+  turn_id: string;
+  recovery_attempt_id: string;
+  turn_index: number;
+  speaker: "agent" | "customer";
+  text: string;
+  channel: string;
+  /** Twilio's Gather confidence for this turn. null means the input was not
+   *  speech at all (a keypad press), never "unknown, assume fine". */
+  stt_confidence: number | null;
+  input_mode: "speech" | "dtmf";
+  created_at: string;
+}
+
 export function getOverview(): Promise<DashboardOverview> {
   return apiFetch("/api/dashboard/overview");
 }
@@ -140,7 +157,9 @@ export function getRecoveries(): Promise<{ recoveries: RecoveryRow[] }> {
   return apiFetch("/api/dashboard/recoveries");
 }
 
-export function getRecoveryDetail(id: string): Promise<{ recovery_attempt: any; audit_trail: AuditRow[] }> {
+export function getRecoveryDetail(
+  id: string
+): Promise<{ recovery_attempt: any; audit_trail: AuditRow[]; transcript: TranscriptTurn[] }> {
   return apiFetch(`/api/dashboard/recoveries/${id}`);
 }
 
