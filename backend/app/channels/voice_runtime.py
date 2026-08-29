@@ -428,6 +428,22 @@ async def _publish_escalation(call_id: str, ctx: AgentContext, reason: str):
 
 @voice_router.api_route("/voice/outbound", methods=["GET", "POST"])
 async def twilio_outbound_twiml(request: Request):
+    """Same contract as /voice/respond: this may only ever answer with
+    TwiML. A 500 here is a call that is dropped before the customer has
+    heard a word."""
+    try:
+        return await _outbound(request)
+    except Exception as e:
+        logger.error(f"/voice/outbound raised, ending the call gracefully: {e}", exc_info=True)
+        return Response(
+            content=_escalation_twiml(
+                "Sorry, I'm having trouble pulling up your order right now. We'll follow up by email."
+            ),
+            media_type="text/xml",
+        )
+
+
+async def _outbound(request: Request):
     """Twilio hits this when an outbound call connects. recovery_attempt_id
     identifies which real recovery this call is for - see
     app/services/voice_dispatch.py, which is the only thing that places
@@ -538,9 +554,14 @@ async def _record_turn(
     ctx = session["ctx"]
     if not ctx.recovery_attempt_id or not (text or "").strip():
         return
-    try:
-        index = session["turn_index"]
-        session["turn_index"] = index + 1
+
+    # The index is claimed SYNCHRONOUSLY, before anything is awaited, so
+    # two turns can never race for the same slot even though the writes
+    # themselves land in the background.
+    index = session["turn_index"]
+    session["turn_index"] = index + 1
+
+    async def _write() -> None:
         await run_db_async(
             turns_repo.record_turn,
             merchant_id=ctx.merchant_id,
@@ -553,8 +574,19 @@ async def _record_turn(
             stt_confidence=stt_confidence,
             input_mode=input_mode,
         )
-    except Exception as e:
-        logger.warning(f"conversation_turns write failed (non-fatal): {e}")
+
+    async def _safe_write() -> None:
+        try:
+            await _write()
+        except Exception as e:
+            logger.warning(f"conversation_turns write failed (non-fatal): {e}")
+
+    # Fire and forget. A transcript is evidence ABOUT a call, never a
+    # precondition FOR one, and Twilio hangs up at ~15s: two writes at
+    # 2-2.8s each, sitting between the customer speaking and hearing a
+    # reply, is the whole budget spent on bookkeeping. Same mistake as the
+    # opening webhook, one layer down.
+    asyncio.create_task(_safe_write())
 
 
 def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
@@ -791,8 +823,40 @@ async def _handle_keypad(call_id: str, session: Dict[str, Any], digit: str) -> R
 @voice_router.api_route("/voice/respond", methods=["GET", "POST"])
 async def twilio_voice_respond(request: Request):
     """Twilio posts live speech transcriptions - and keypad digits - here.
-    One agent turn per exchange, through the Day 5 agent runtime, with real
-    tools."""
+
+    Nothing that happens inside may result in anything other than TwiML.
+    An unhandled exception here becomes a 500, and Twilio answers a 500 by
+    telling the customer "we cannot reach your server" and hanging up - so
+    a bug anywhere in a turn ends the call rather than degrading it. The
+    agent runtime already promises never to raise; this is the promise for
+    everything around it.
+    """
+    try:
+        return await _respond(request)
+    except Exception as e:
+        # Deliberately broad. There is no failure here worth converting
+        # into a dead call, and the alternative to a graceful line is
+        # Twilio's own error message read aloud to a real customer.
+        logger.error(f"/voice/respond raised, keeping the call alive: {e}", exc_info=True)
+        try:
+            block = await tts_voice_block(
+                "Sorry, something went wrong on our side just then. Could you say that again?"
+            )
+            return Response(content=_gather_twiml(block), media_type="text/xml")
+        except Exception:
+            # Even the fallback failed - say it with Twilio's own voice,
+            # which needs nothing from us but the words.
+            return Response(
+                content=_escalation_twiml(
+                    "Sorry, we are having a technical problem. We will follow up by email."
+                ),
+                media_type="text/xml",
+            )
+
+
+async def _respond(request: Request):
+    """One agent turn per exchange, through the Day 5 agent runtime, with
+    real tools."""
     if request.method == "POST":
         source: Any = await request.form()
     else:
