@@ -53,10 +53,10 @@ class TestQuietHours:
         assert not ok, "quiet hours must be judged in the customer's timezone, not the server's"
 
 
-class TestCallCap:
+class TestOutreachCap:
     def test_under_cap_is_allowed(self, real_merchant_id, unique_checkout_id):
         checkouts_repo.create_checkout(real_merchant_id, amount_paise=100_000, checkout_id=unique_checkout_id)
-        ok, _ = outreach_guards.under_call_cap(unique_checkout_id, max_calls=2)
+        ok, _ = outreach_guards.under_outreach_cap(unique_checkout_id, max_total=2)
         assert ok
 
     def test_cap_blocks_the_third_call(self, real_merchant_id, unique_checkout_id):
@@ -65,7 +65,7 @@ class TestCallCap:
             a = ra_repo.create_recovery_attempt(real_merchant_id, unique_checkout_id, None)
             ra_repo.update_state(a["recovery_attempt_id"], "CALL_FAILED")
 
-        ok, reason = outreach_guards.under_call_cap(unique_checkout_id, max_calls=2)
+        ok, reason = outreach_guards.under_outreach_cap(unique_checkout_id, max_total=2)
         assert not ok
         assert "max_calls_reached" in reason
 
@@ -77,7 +77,7 @@ class TestCallCap:
             a = ra_repo.create_recovery_attempt(real_merchant_id, unique_checkout_id, None)
             ra_repo.update_state(a["recovery_attempt_id"], "CONSENT_REVOKED")
 
-        ok, _ = outreach_guards.under_call_cap(unique_checkout_id, max_calls=2)
+        ok, _ = outreach_guards.under_outreach_cap(unique_checkout_id, max_total=2)
         assert ok, "attempts that never dialled must not consume the call cap"
 
 
@@ -95,3 +95,104 @@ class TestAlreadyPaid:
         assert reason == "already_paid"
 
 
+class TestOutreachCapCountsEveryChannel:
+    """under_call_cap counted CALLS. That was right while voice was the
+    only way anyone was ever contacted, and would have quietly allowed two
+    calls plus unlimited email the moment email became real - while
+    continuing to report that the cap was holding."""
+
+    def _attempt(self, merchant_id, checkout_id, channel):
+        a = ra_repo.create_recovery_attempt(merchant_id, checkout_id, None)
+        ra_repo.update_state(a["recovery_attempt_id"], "CALL_FAILED", channel=channel)
+        return a["recovery_attempt_id"]
+
+    def test_email_counts_towards_the_same_total_as_voice(
+        self, real_merchant_id, unique_checkout_id
+    ):
+        checkouts_repo.create_checkout(real_merchant_id, amount_paise=100_000, checkout_id=unique_checkout_id)
+        self._attempt(real_merchant_id, unique_checkout_id, "voice")
+        self._attempt(real_merchant_id, unique_checkout_id, "email")
+
+        ok, reason = outreach_guards.under_outreach_cap(unique_checkout_id, channel="voice")
+        assert not ok
+        assert "max_calls_reached" in reason
+
+    def test_one_per_channel_per_day_even_below_the_total_cap(
+        self, real_merchant_id, unique_checkout_id
+    ):
+        """A lifetime cap alone permits both attempts inside ten minutes.
+        The customer experiences the day, not the lifetime."""
+        checkouts_repo.create_checkout(real_merchant_id, amount_paise=100_000, checkout_id=unique_checkout_id)
+        self._attempt(real_merchant_id, unique_checkout_id, "voice")
+
+        # Total is 1 of 2, so the lifetime cap is not the thing stopping us.
+        blocked, reason = outreach_guards.under_outreach_cap(unique_checkout_id, channel="voice")
+        assert not blocked
+        assert "channel_cap_today" in reason
+
+        # ...but a different channel is still open today.
+        ok, _ = outreach_guards.under_outreach_cap(unique_checkout_id, channel="email")
+        assert ok
+
+    def test_a_requested_callback_earns_exactly_one_more_attempt(
+        self, real_merchant_id, unique_checkout_id
+    ):
+        """They asked. That is the one thing that lifts the cap - and it
+        lifts it by one, not into an exemption."""
+        checkouts_repo.create_checkout(real_merchant_id, amount_paise=100_000, checkout_id=unique_checkout_id)
+        self._attempt(real_merchant_id, unique_checkout_id, "voice")
+        self._attempt(real_merchant_id, unique_checkout_id, "email")
+        assert not outreach_guards.under_outreach_cap(unique_checkout_id, channel="voice")[0]
+
+        rid = self._attempt(real_merchant_id, unique_checkout_id, "voice")
+        ra_repo.update_state(rid, "CALLBACK_REQUESTED", callback_requested_at=datetime.now(timezone.utc))
+        # Now at 3 attempts against a lifted cap of 3 - still stopped, and
+        # that is correct: the extra attempt was the one just recorded.
+        ok, reason = outreach_guards.under_outreach_cap(unique_checkout_id, channel="email")
+        assert not ok and "max_calls_reached" in reason
+
+    def test_the_callback_lift_is_real(self, real_merchant_id, unique_checkout_id):
+        # Both prior attempts on voice, so the TOTAL cap is what stops us
+        # and email is still untouched today - otherwise the per-day cap
+        # blocks first and the lift is untestable.
+        checkouts_repo.create_checkout(real_merchant_id, amount_paise=100_000, checkout_id=unique_checkout_id)
+        a1 = self._attempt(real_merchant_id, unique_checkout_id, "voice")
+        self._attempt(real_merchant_id, unique_checkout_id, "voice")
+        blocked, reason = outreach_guards.under_outreach_cap(unique_checkout_id, channel="email")
+        assert not blocked and "max_calls_reached" in reason
+
+        ra_repo.update_state(a1, "CALLBACK_REQUESTED", callback_requested_at=datetime.now(timezone.utc))
+        ok, _ = outreach_guards.under_outreach_cap(unique_checkout_id, channel="email")
+        assert ok, "a customer who asked for a callback must get one"
+
+
+@pytest.mark.real_clock
+class TestTheGateIsOneFunctionNotTwoCopies:
+    def test_check_all_accepts_an_injected_clock(self, real_merchant_id, unique_checkout_id):
+        """The scoreboard used to walk the individual guards in an order it
+        wrote out by hand - a second copy of the rule deciding whether a
+        customer may be contacted, free to drift from production. It needs
+        a fixed clock, so the clock is a parameter rather than a reason to
+        fork the logic."""
+        checkouts_repo.create_checkout(real_merchant_id, amount_paise=100_000, checkout_id=unique_checkout_id)
+
+        quiet = datetime(2026, 8, 28, 4, 0, tzinfo=outreach_guards.IST)
+        open_hours = datetime(2026, 8, 28, 14, 0, tzinfo=outreach_guards.IST)
+
+        ok, reason = outreach_guards.check_all(real_merchant_id, unique_checkout_id, now=quiet)
+        assert not ok and outreach_guards.stop_code(reason) == "quiet_hours"
+
+        ok, _ = outreach_guards.check_all(real_merchant_id, unique_checkout_id, now=open_hours)
+        assert ok
+
+    def test_stop_code_extracts_the_machine_readable_half(self):
+        assert outreach_guards.stop_code("quiet_hours (IST hour 4 outside 10:00-20:00)") == "quiet_hours"
+        assert outreach_guards.stop_code("already_paid") == "already_paid"
+        assert outreach_guards.stop_code("") == ""
+        assert outreach_guards.stop_code(None) == ""
+
+    def test_every_stop_code_a_guard_can_return_is_declared(self):
+        """STOP_CODES seeds the report's counters at zero, so a code
+        missing from it is a stop nobody would know to look for."""
+        assert "channel_cap_today" in outreach_guards.STOP_CODES
+        assert "promise_to_pay" in outreach_guards.STOP_CODES
