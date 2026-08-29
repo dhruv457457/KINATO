@@ -44,6 +44,7 @@ export const STATE_LABELS: Record<string, string> = {
   CALL_FAILED: "Call failed",
   PROMISED: "Promised to pay",
   CALLBACK_REQUESTED: "Callback requested",
+  BLOCKED: "Stopped by a rule",
 };
 
 /** Plain English for each structured refusal a tool can return. A code a

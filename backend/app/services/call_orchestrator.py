@@ -127,7 +127,15 @@ class CallOrchestrator:
         if not allowed:
             code = outreach_guards.stop_code(stop_reason)
             logger.warning(f"Orchestrator halting {recovery_attempt_id}: STOP_{code.upper()}")
-            recovery_attempts_repo.update_state(recovery_attempt_id, "CALL_FAILED")
+            # BLOCKED, not CALL_FAILED. A guard stopping us is the system
+            # working: nobody was dialled, nothing failed, and a rule the
+            # merchant configured held. Recording it as a dial failure was
+            # wrong three times over - it told the merchant on the
+            # dashboard that these were "real dial failures (no phone on
+            # file, carrier issue)", it burned the customer's contact cap
+            # for a call that never happened, and it filed a compliance
+            # success under the same heading as a broken phone number.
+            recovery_attempts_repo.update_state(recovery_attempt_id, "BLOCKED")
             await bus.publish(
                 event_type="recovery.blocked",
                 payload={

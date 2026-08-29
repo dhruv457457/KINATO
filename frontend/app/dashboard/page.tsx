@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getOverview, formatInr, DashboardOverview } from "@/lib/api";
+import { RecoveredByDay, ProportionBar } from "@/components/dashboard/Chart";
 import {
   PageHeader,
   PageBody,
@@ -14,6 +15,8 @@ import {
   POSITIVE,
   WASH,
   NEGATIVE,
+  WARNING,
+  INK,
 } from "@/components/dashboard/primitives";
 
 /** Human copy for each real `recovery.blocked` reason the backend emits.
@@ -140,7 +143,7 @@ export default function OverviewPage() {
           <div className="max-w-[1000px]">
             {/* Hairline grid: the 1px gap IS the rule, so KPIs read as one
                 instrument rather than four floating cards. */}
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-px mb-10" style={{ background: RULE }}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-px mb-10" style={{ background: RULE }}>
               {[
                 {
                   label: "Revenue recovered",
@@ -193,13 +196,67 @@ export default function OverviewPage() {
               </div>
               <div style={{ background: "#FDFCF7" }}>
                 <StatCard
-                  label="Calls that couldn't connect"
-                  value={String(data.call_failed_count)}
-                  sub="Real dial failures (no phone on file, carrier issue) — never silently dropped."
+                  label="Stopped by a rule"
+                  value={String(data.blocked_count)}
+                  sub={
+                    data.blocked_count
+                      ? "Recoveries a hard stop refused before dialling — outside your calling hours, at the contact cap, or already paid. This number working is the product working."
+                      : "Nothing has hit a hard stop. Quiet hours, contact caps and already-paid checks all had nothing to refuse."
+                  }
                   index={5}
                 />
               </div>
             </div>
+
+            {/* The fortnight, and how the work split. Both sit inside the
+                same hairline vocabulary as the KPI bands above, so they
+                read as further panels of one instrument rather than as a
+                "charts section" bolted on. */}
+            {data.total_attempts > 0 && (
+              <div className="mt-10 grid grid-cols-1 lg:grid-cols-[1.6fr_1fr] gap-px" style={{ background: RULE }}>
+                <div className="p-6" style={{ background: "#FDFCF7" }}>
+                  {data.daily_series?.some((d) => d.recovered_paise > 0) ? (
+                    <RecoveredByDay series={data.daily_series} formatValue={formatInr} />
+                  ) : (
+                    <div>
+                      <div
+                        className="text-[10.5px] font-semibold uppercase tracking-widest mb-3"
+                        style={{ color: INK_MUTED }}
+                      >
+                        Recovered · last 14 days
+                      </div>
+                      <p className="text-[12px] leading-relaxed" style={{ color: INK_MUTED, maxWidth: "30rem" }}>
+                        Nothing recovered in the last fortnight yet. This fills in on its own as
+                        payments come back — there is no chart here rather than an empty one,
+                        because an axis with no bars looks like a fault.
+                      </p>
+                    </div>
+                  )}
+                </div>
+                <div className="p-6 flex flex-col gap-8" style={{ background: "#FDFCF7" }}>
+                  <ProportionBar
+                    label="How they were reached"
+                    emptyNote="No outreach has left the building yet."
+                    segments={(data.by_channel || []).map((c) => ({
+                      key: c.channel,
+                      value: c.attempts,
+                      tone: c.channel === "voice" ? INK : INK_MUTED,
+                    }))}
+                  />
+                  <ProportionBar
+                    label="How attempts ended"
+                    emptyNote="No attempt has reached a final state yet."
+                    segments={[
+                      { key: "Recovered", value: data.by_state?.RECOVERED || 0, tone: POSITIVE },
+                      { key: "Promised", value: data.by_state?.PROMISED || 0, tone: WARNING },
+                      { key: "Opted out", value: data.by_state?.CONSENT_REVOKED || 0, tone: NEGATIVE },
+                      { key: "Couldn't connect", value: data.by_state?.CALL_FAILED || 0, tone: INK_MUTED },
+                      { key: "Offer sent", value: data.by_state?.PAYMENT_LINK_SENT || 0, tone: INK },
+                    ]}
+                  />
+                </div>
+              </div>
+            )}
 
             <RuleBreaks count={data.rule_breaks} />
 
@@ -208,8 +265,16 @@ export default function OverviewPage() {
             {data.total_attempts === 0 && (
               <div className="mt-10">
                 <EmptyState>
-                  No recovery attempts yet. Once a real payment fails on your store, Kinato picks it up
-                  automatically — nothing to trigger here.
+                  <div className="font-medium mb-2" style={{ color: "#1B1A17" }}>
+                    Nothing has failed yet — which is the good version of an empty page.
+                  </div>
+                  Kinato starts on its own the moment Razorpay reports a failed payment on your
+                  store. There is nothing to trigger here and no campaign to launch.
+                  <div className="mt-3 pt-3 border-t" style={{ borderColor: RULE_SOFT }}>
+                    If payments <em>have</em> been failing and this is still empty, the webhook
+                    probably is not pointing here yet — Settings has the URL to paste into your
+                    Razorpay dashboard.
+                  </div>
                 </EmptyState>
               </div>
             )}
