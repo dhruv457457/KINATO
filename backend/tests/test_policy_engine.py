@@ -99,3 +99,62 @@ class TestWhichLimitActuallyBound:
     def test_an_approval_is_labelled_too_not_left_blank(self):
         decision = OfferPolicyEngine.evaluate(8.0, POLICY, cart_details=CART)
         assert decision["reason"] == "APPROVED"
+
+
+class TestTheAutoApprovalThresholdIsRealNow:
+    """merchant_policies.auto_approval_threshold_inr has been in the schema
+    since it was written, is editable on the Policies screen under the
+    words "discounts that cost less than this need no human review", and
+    was read by NOTHING.
+
+    It was even handed to the model in get_policy_limits, so the agent knew
+    about a limit that did not bind it - the merchant believed a control
+    existed and the model was told a number that constrained it not at all.
+    The same shape as FINDINGS #4's calling hours, in a different field.
+    """
+
+    CART = {"amount": 5000.0, "cogs": 2000.0}  # Rs 5000, plenty of margin
+
+    def test_zero_means_not_configured_not_approve_nothing(self):
+        """Zero is the schema default and therefore what every existing
+        merchant has. Reading it literally would have blocked every
+        discount on the platform the day it started being enforced."""
+        decision = OfferPolicyEngine.evaluate(
+            8.0, {**POLICY, "auto_approval_threshold_inr": 0}, cart_details=self.CART
+        )
+        assert decision["decision"] == "ALLOW"
+        assert decision["approved_discount"] == 8.0
+
+    def test_it_caps_the_discount_in_rupees(self):
+        decision = OfferPolicyEngine.evaluate(
+            40.0, {**POLICY, "auto_approval_threshold_inr": 200}, cart_details=self.CART
+        )
+        assert decision["reason"] == "REJECTED_APPROVAL_THRESHOLD"
+        # 4% of Rs 5000 is exactly Rs 200 - the agent may give away that
+        # much on its own authority and not a rupee more.
+        assert decision["approved_discount"] == pytest.approx(4.0)
+        assert self.CART["amount"] * decision["approved_discount"] / 100 == pytest.approx(200.0)
+
+    def test_it_only_binds_when_it_is_the_tightest_limit(self):
+        """A threshold looser than the ceiling must not steal the
+        explanation from the limit that actually bound."""
+        decision = OfferPolicyEngine.evaluate(
+            40.0, {**POLICY, "auto_approval_threshold_inr": 5000}, cart_details=self.CART
+        )
+        assert decision["reason"] == "REJECTED_CEILING"
+        assert decision["approved_discount"] == 10.0
+
+    def test_the_margin_floor_still_wins_when_it_is_tighter(self):
+        thin = {"amount": 1000.0, "cogs": 800.0}  # 20% margin, 15% floor
+        decision = OfferPolicyEngine.evaluate(
+            40.0, {**POLICY, "auto_approval_threshold_inr": 900}, cart_details=thin
+        )
+        assert decision["reason"] == "REJECTED_MARGIN_FLOOR"
+        assert decision["approved_discount"] == pytest.approx(5.0)
+
+    def test_the_cap_travels_on_the_decision(self):
+        """A refusal a merchant cannot check is just an assertion."""
+        decision = OfferPolicyEngine.evaluate(
+            40.0, {**POLICY, "auto_approval_threshold_inr": 200}, cart_details=self.CART
+        )
+        assert decision["auto_approval_cap_inr"] == 200

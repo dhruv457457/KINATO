@@ -126,7 +126,8 @@ export default function PoliciesPage() {
                 value={policy.auto_approval_threshold_inr}
                 onChange={(e) => setPolicy({ ...policy, auto_approval_threshold_inr: Number(e.target.value) })}
               />
-              <div className="hint">Discounts that cost less than this need no human review.</div>
+              <div className="hint">The most the AI may give away on one cart without you. Leave at 0 for no
+                limit; the ceiling and margin floor still apply either way.</div>
             </div>
 
             <SectionTitle>Calling hours</SectionTitle>

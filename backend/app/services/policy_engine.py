@@ -78,6 +78,22 @@ class OfferPolicyEngine:
 
         max_discount = float(merchant_policy.get("max_discount_percent", 10.0))
         min_margin = float(merchant_policy.get("minimum_margin_percent", 15.0))
+        # What the agent may give away on its own authority, in rupees.
+        #
+        # This column has existed since the schema was written, is editable
+        # on the Policies screen under the words "discounts that cost less
+        # than this need no human review", and was read by NOTHING. It was
+        # even handed to the model in get_policy_limits - so the agent knew
+        # about a limit it was not bound by, which is the worst of both:
+        # the merchant believed a control existed and the model was told a
+        # number that constrained it not at all. Exactly FINDINGS #4, in a
+        # different field.
+        #
+        # Zero is the schema default and therefore what every existing
+        # merchant has, so zero means "not configured", never "approve
+        # nothing" - reading it literally would have blocked every discount
+        # on the platform.
+        approval_cap_inr = float(merchant_policy.get("auto_approval_threshold_inr") or 0.0)
 
         # Every decision below carries the numbers it was made from. A
         # refusal a merchant cannot check is just an assertion, and this is
@@ -92,6 +108,7 @@ class OfferPolicyEngine:
                 "approved_discount": approved,
                 "ceiling_percent": max_discount,
                 "margin_floor_percent": min_margin,
+                "auto_approval_cap_inr": approval_cap_inr or None,
             }
 
         # 1. Check Product Exclusions
@@ -124,16 +141,18 @@ class OfferPolicyEngine:
         # single string "merchant_max_discount_or_margin_constraint" for
         # both, so REJECTED_CEILING and REJECTED_MARGIN_FLOOR were
         # indistinguishable despite being one line apart from being known.
-        ceiling_binds = max_discount <= max_allowed_by_margin
-        effective_max_discount = max(0.0, min(max_discount, max_allowed_by_margin))
+        # A third limit, in rupees rather than percent, so it has to be
+        # converted before it can be compared with the other two.
+        limits = [(max_discount, "REJECTED_CEILING"), (max_allowed_by_margin, "REJECTED_MARGIN_FLOOR")]
+        if approval_cap_inr > 0:
+            limits.append(((approval_cap_inr / cart_total) * 100, "REJECTED_APPROVAL_THRESHOLD"))
+
+        effective_max_discount, binding_reason = min(limits, key=lambda pair: pair[0])
+        effective_max_discount = max(0.0, effective_max_discount)
 
         if requested_discount <= effective_max_discount:
             return _decide("ALLOW", "APPROVED", requested_discount)
 
-        return _decide(
-            "MODIFY",
-            "REJECTED_CEILING" if ceiling_binds else "REJECTED_MARGIN_FLOOR",
-            effective_max_discount,
-        )
+        return _decide("MODIFY", binding_reason, effective_max_discount)
 
 policy_engine = OfferPolicyEngine()
