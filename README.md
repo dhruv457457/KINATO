@@ -142,7 +142,10 @@ Exposes exactly three methods: `Kinato.init`, `Kinato.identify`, `Kinato.track`.
 - **No contact details** → recovery blocked, and the reason surfaced on the dashboard rather than silently dropped.
 - **Degraded agent** → an agent running without its LLM cannot call any mutating tool at all.
 - **Duplicate webhooks** → deduplicated against a database UNIQUE constraint, so a redeploy landing between Razorpay's retries cannot double-count revenue.
-- **The sale comes first** → a customer ready to buy is sent a full-price link. The agent never volunteers a discount, and a declined card is treated as a broken checkout, not a price objection.
+- **The sale comes first** → a customer ready to buy is sent a full-price link. The agent never volunteers a discount, and a declined card is treated as a broken checkout, not a price objection — enforced by a `REJECTED_FULL_PRICE_FIRST` refusal from the deterministic failure classifier, not by a prompt.
+- **We might have misheard** → Twilio reports how well it heard every spoken turn. Below 0.6 no money tool will run at all; below 0.3 the model isn't called and the agent asks them to repeat it. Speech-to-text fails *silently*, returning a fluent sentence nobody said, so money must not move on one.
+- **The keypad always works** → every prompt accepts speech or a digit. 9 revokes consent immediately with no model involved, and a pressed key beats whatever noise was transcribed alongside it. It is the only input path transcription cannot corrupt, which is why opt-out lives on it.
+- **A promise is remembered, and chased once** → "I'll pay Friday" pauses outreach until Friday. If it lapses, exactly one reminder is sent — and only if they haven't paid, haven't opted out on any channel, and there is a real link to remind them of.
 
 ---
 

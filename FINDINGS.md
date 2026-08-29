@@ -221,6 +221,428 @@ more than its share.
 
 ---
 
+## 10. Twilio told us how well it heard, on every turn, and nothing read it
+
+Every Gather callback Twilio has ever posted to this app carried a
+`Confidence` float alongside `SpeechResult`. The handler read the words and
+dropped the number on the floor.
+
+So a turn like this:
+
+```
+SpeechResult: "yes that sounds fine send it"
+Confidence:   0.14
+```
+
+reached the agent with exactly the same authority as a clean 0.95 utterance,
+and could mint an offer token and send a real payment link on the strength of
+it. Speech-to-text was already documented as the weakest link in this system.
+What was not appreciated is *how* it fails: not with an error, but with a
+fluent, plausible sentence that the customer never said. The agent then
+reasons impeccably about words that do not exist.
+
+**Fix.** Two thresholds, both enforced in code rather than asked of the prompt:
+
+- Below **0.3** the model is not called at all. There is nothing to reason
+  about, so the agent says the line broke up and asks them to repeat it. Two
+  consecutive misses stop asking — being asked a third time is where a bad
+  line becomes an irritating call — and offer the keypad instead.
+- Below **0.6** the conversation continues normally, but `check_offer` and
+  `issue_offer` refuse outright with `REJECTED_LOW_CONFIDENCE`. The agent can
+  still acknowledge, confirm, and close warmly. It cannot spend the merchant's
+  margin on a sentence we are not sure we heard.
+
+`issue_offer` checks independently of `check_offer`, deliberately: a token
+minted on a clearly-heard turn must not become spendable by a later garbled
+"yes" that was never a yes.
+
+**And the keypad, which cannot be misheard at all.** Every `<Gather>` now
+accepts `speech dtmf`. A digit arrives as a digit, at confidence 1.0 by
+construction — it is the only input path in this system that transcription
+cannot corrupt, which is exactly why opt-out belongs on it: 9 revokes consent
+immediately, with no model involved, and still writes a real audit row because
+it goes through the same `execute_tool` choke point as everything else. When a
+digit and a transcription arrive together, the digit wins. Acting on the
+speech there would mean selling to someone who had just asked to be left alone.
+
+**The instructive part** is where the first version of the barrier-confirmation
+rule went wrong. Requiring the customer to confirm a stated price objection
+before any discount is right on a phone call. Implementing it as a default on
+`AgentContext` was not: every caller that built a context without thinking
+about it — the batch scoreboard, and any future channel — silently lost the
+ability to discount at all. Eight existing tests failed and were, correctly,
+pointing at the product rather than at themselves. The rule now has an explicit
+scope (`input_is_speech`), because it exists to guard against *mishearing*, and
+a keypad press or a typed reply cannot be misheard. A guarantee whose blast
+radius is decided by a default value is not a guarantee; it is an accident that
+has not happened yet.
+
+The batch runner sets that flag too, and carries the same confirmation state
+machine, so the scoreboard keeps measuring the agent that actually runs — the
+exact drift #6 is about, which would otherwise have reappeared the same day it
+was fixed.
+
+---
+
+## 11. The reminder we were careful to send only once was never sent at all
+
+Promise-to-pay is one of the more thought-through things in this codebase.
+A customer who says "I'll pay Friday" has outreach paused until Friday. If
+Friday passes unpaid, the sweeper allows exactly **one** reminder, enforced
+by a `promise_reminded_at` column so it can never become a campaign. There
+are tests. They pass.
+
+```python
+await bus.publish(
+    event_type="recovery.promise_lapsed",
+    payload={...,  "reminder": "final"},
+    idempotency_key=f"promise_reminder_{attempt['recovery_attempt_id']}",
+)
+```
+
+Nothing subscribed to `recovery.promise_lapsed`. Not one handler, ever. The
+event fired, the row was marked reminded, the audit trail recorded a
+reminder — and no email reached any customer for the entire life of the
+feature.
+
+The care was real. The reminder was imaginary.
+
+**Why the tests didn't catch it.** Every existing test asserted the thing
+the code was proud of: that a lapsed promise *surfaces*, and that it is
+marked reminded exactly once. All of that was true. None of them asked
+whether a customer ever received anything, because the restraint was the
+interesting part and the delivery was assumed.
+
+**Fix.** A real subscriber, with three refusals in front of it — all of
+which would otherwise turn a helpful nudge into the thing merchants get
+complaints about:
+
+- **They have paid.** The sweeper's query already excludes paid checkouts;
+  this checks again at the last moment before the email leaves, because a
+  payment landing in that gap is exactly the race worth losing safely.
+- **They have opted out — on *any* channel.** `record_opt_out` revokes the
+  voice channel, and a per-channel check would have let the email go out to
+  someone who had said "don't contact me again" on the phone. Consent to
+  contact is per-channel and must be granted explicitly; a refusal is read
+  as broadly as possible. The asymmetry is deliberate: the safe direction
+  is different for the two questions.
+- **There is no link on file.** Only Razorpay's payment-link *id* was
+  stored, never the payable URL, so the one thing needed to remind someone
+  of a promise existed nowhere once the event carrying it had been handled.
+  The URL is persisted now, and an attempt without one sends nothing —
+  an email that asks for money with no way to pay it is worse than silence.
+
+**The pattern, which is the reason this is written down.** This is the same
+shape as #4's `calling_start_hour` and #5's terminal-state list: a column,
+a state, or an event that *looks* wired up, is described in comments as
+wired up, has tests around the half that is real — and is connected to
+nothing at the far end. Publishing to an empty subscriber list is not an
+error in any language. It is indistinguishable from working, right up until
+someone asks a customer whether they got the email.
+
+Worth noting what the fix does **not** do: it does not add a second
+reminder, a retry, or an escalation. The original restraint was correct.
+It just needed to be restraint about something that happens.
+
+---
+
+## 12. The integration on the front page of the README recovered nothing
+
+The product's headline pitch is one sentence:
+
+> Setup is one webhook URL. No code on the storefront.
+
+A merchant who did exactly that got **zero recoveries, and no explanation**.
+
+The trace is four steps long and nothing in it throws:
+
+1. `payment.failed` arrives. `upsert_by_contact` creates the customer from
+   Razorpay's own payload — email, phone, everything needed to reach them.
+2. It records **no consent**, because nothing asked it to.
+3. `recovery_eligibility` requires a granted `voice` consent row.
+4. It fails, and `return`s — **without publishing `recovery.blocked`**,
+   unlike the `no_contact` and `rail_degraded` branches immediately above
+   it, which both do.
+
+The only place consent had ever been granted was `customer.identified` from
+the JavaScript SDK — the integration path the README explicitly describes as
+optional.
+
+So the recommended setup produced a customer row, a checkout row, and
+silence. The dashboard showed revenue at risk with nothing recovered against
+it and nothing anywhere saying why, which is the exact symptom of FINDINGS
+#3 reappearing in a different part of the pipeline.
+
+**A second bug was hiding inside the first.** The gate asked about *voice*
+specifically, so a customer with an email address and no phone number was
+refused outright — not "recovered by email instead", refused. That one would
+have survived the consent fix untouched.
+
+**Fix.** Consent is recorded when a payment fails, for the channels the
+contact details actually support, with `source="razorpay_transactional"` so
+a merchant can tell it apart from an explicit opt-in in the ledger. It is
+defensible on its own terms: the customer typed those details into this
+merchant's checkout minutes earlier, in order to pay this merchant, and the
+contact is about that specific failed payment. The gate now asks which
+channels are open rather than whether one particular channel is, and a
+refusal publishes `recovery.blocked{reason: no_consent}` with copy on the
+dashboard explaining what to do about it.
+
+**The part worth being careful about is the fix, not the bug.** Two ways it
+could have been worse than what it replaced, both now covered by tests:
+
+- The consent ledger is append-only and *the latest row wins*. Inserting a
+  grant without checking would silently resurrect anyone who had opted
+  out — and every subsequent failed payment would do it again. A customer
+  who asked us to stop would be re-enrolled by the act of trying to pay.
+  The revocation check is the first thing the function does.
+- Granting `email` made a dormant bug live: `record_opt_out` revoked
+  *voice only*. That was survivable while voice was the only channel anyone
+  was ever contacted on. The moment email became real, "take me off your
+  list", said on a phone call, would have stopped the calls and kept the
+  emails. Opt-out now covers every channel, including ones we have not
+  tried them on yet. Nobody should have to opt out once per protocol.
+
+Note the asymmetry that came out of this, which is now deliberate: consent
+to contact is **per channel and must be granted explicitly**, while a
+refusal is read **as broadly as possible**. The safe direction is different
+for the two questions, so they are answered by two different functions.
+
+**Why this went unnoticed for so long.** Every test in the suite that
+exercised recovery built its own consent row first, because that is what a
+test does when it wants to test the thing after the gate. The gate itself
+was never the subject. `tests/test_zero_code_recovery.py` starts one step
+earlier — from a merchant who has pasted in a webhook URL and done nothing
+else — and four of its assertions fail against the old code. That was
+verified by disabling the fix and watching them go red, rather than assumed.
+
+---
+
+## 13. A safety check we added that morning quietly re-created #1
+
+The mishearing work (#10) added a rule: before proposing a discount, read
+the barrier back to the customer and get an answer. On a phone call that is
+obviously right. It shipped with tests, and the tests passed.
+
+Then the ablation harness ran this case:
+
+```
+Customer: "Can you do 40% off? Otherwise I am not interested."
+Agent:    (asks whether price is the problem)
+[call ends]                                    outcome: NO SALE
+```
+
+The customer had stated the barrier themselves, in their own words,
+unmistakably — and the agent answered by asking them to confirm the thing
+they had just said. On a short call there is no second turn, so the sale
+was simply lost.
+
+That is **FINDINGS #1 again**: the script outranking the sale. The first
+version of that bug was a prompt that made discovery mandatory. This one
+was a *guardrail* doing the same thing, which is worse, because a guardrail
+is exactly the kind of code nobody re-examines — it is on the safety side,
+so its failures look like caution.
+
+**Cause.** The rule was written as "confirm before every spoken discount"
+when what it was actually for was "confirm when we might have misheard."
+Those are the same rule only if you assume every spoken turn is equally
+trustworthy — and #10 exists precisely because they are not.
+
+**Fix.** Confirmation now applies only in the band where mishearing is
+plausible: above the floor where money may move at all (0.6), below the
+point where the transcription is clean (0.85). A 0.95-confidence "can you
+do 40% off" goes straight to the policy engine, which caps it at 10% and
+says why. Three confidence bands, three behaviours, one coherent idea:
+**confirmation is a remedy for mishearing, not a negotiation ritual.**
+
+**What is worth noticing** is what caught it. Not a test — the tests were
+written from the same misunderstanding as the code, so they agreed with it.
+Not review. It was `scripts/run_ablation.py`, a harness built for an
+entirely different purpose: proving the guardrails are load-bearing by
+removing them. Running the *gated* arm surfaced a gated-arm bug on the
+first case that exercised it.
+
+A harness that runs the real agent over real cases finds things that
+assertions written alongside the code cannot, because it does not share
+the author's assumptions. That is the same lesson as #6, arriving from the
+opposite direction: there, a drifting harness measured an agent that no
+longer existed; here, an honest harness measured the agent that did, and
+disagreed with its author.
+
+---
+
+## 14. Two safe-looking changes, one symptom: every recovery went to zero
+
+The ablation harness reported `recovered: 0` in all three arms. Not fewer
+recoveries — none, across twenty-five cases. Both causes were changes made
+that same day, both looked like improvements, and neither raised an error.
+
+### Cause one: the right check, asked about the wrong thing
+
+`issue_offer` used to verify VOICE consent before sending. Delivering by
+email while checking the phone channel is plainly the wrong question, so it
+was changed to check consent on the delivery channel instead.
+
+That is more correct and it is worse. Consent is granted per channel, and
+plenty of customers have granted voice and not email. Those customers were
+now phoned, agreed to the offer on the call — and had it silently refused.
+Worse still, the call's fallback line says:
+
+> "Great news - I've sent that offer to your email, you should see it any
+> moment."
+
+Nothing had been sent. That is **FINDINGS #2 exactly**: the customer told
+the opposite of what happened, by a well-intentioned change to a different
+part of the system.
+
+The mistake was framing. At that point in a call the customer has *asked*
+for the link, during a conversation we already had consent for. Sending it
+completes a request; it does not initiate contact. The right question is
+therefore the broad one — "have they told us to stop?" — not "do we hold a
+separate opt-in for this protocol?" A customer who opted out anywhere gets
+nothing; everyone else gets the thing they just asked for.
+
+### Cause two: the prompt got longer, so the agent stopped selling
+
+The mishearing work added about 1,050 characters of instruction to the live
+system prompt: how to handle the confirmation turn, and what the keypad
+does. Every sentence was accurate. The prompt went from ~5,600 to ~6,650
+characters.
+
+The agent then did this, with the customer saying *"just send me the link
+again"*:
+
+```
+Turn 1  "Hello - can you hear me alright? Am I speaking with Rahul?"
+Turn 2  "I'm calling from Loomwork. I noticed you were looking at a linen
+         shirt but didn't finish checking out..."
+[no tool calls at all]
+```
+
+It was working through the numbered opening sequence while the customer
+asked twice to buy. The prompt still contained **THE SALE COMES FIRST**, in
+capitals, unchanged. It had simply been diluted: instructions compete for
+attention, and adding more of them weakens every one already there.
+
+**Fix.** The additions were cut from 1,048 characters to 391. Almost all of
+the confirmation explanation was deleted outright — not softened, deleted —
+because `check_offer` already returns `REJECTED_UNCONFIRMED_BARRIER` with a
+sentence saying what to do about it. The prompt does not need to pre-teach
+a rule the tool states at the moment it applies. The keypad went from a
+paragraph to one line. Recoveries returned immediately.
+
+### The rule this project should hold itself to
+
+Prompt space is a budget, not a document. Anything enforced in code should
+be **absent** from the prompt, not summarised in it: the enforcement
+already carries the explanation, and the summary costs attention that the
+rules with no mechanism behind them cannot spare.
+
+Three separate bugs in one day — this, #13, and the original #1 — were the
+same failure: an instruction added for good reasons made the agent follow a
+script instead of making a sale. In two of the three, the instruction was a
+*safety* feature, which is what makes this class hard. Safety text is the
+text nobody deletes.
+
+And both causes here were invisible to the test suite. Every test passed
+throughout. What caught them was a harness that runs the real agent over
+real cases and counts money — `recovered: 0` is a sentence no unit test in
+this repository was in a position to say.
+
+---
+
+## 15. #1 was never actually fixed, and the scoreboard had been saying so
+
+The very first entry in this document describes a customer asking twice for
+a checkout link and being interrogated instead. The fix was a rule added to
+the system prompt: **THE SALE COMES FIRST**, plus *"Never ask a second time
+why they didn't complete the order."*
+
+Running the scoreboard case that exercises exactly that scenario:
+
+```
+Customer: "I still want it, just send me the checkout link."
+Agent:    "Can I ask what stopped you from finishing?"
+Customer: "Yes."
+Agent:    "Could you share what held you back from completing the order?"
+[no tool calls at all]                              outcome: NO SALE
+```
+
+That is #1, unchanged, including the second ask that the prompt explicitly
+forbids. The rule had been in the prompt for weeks. It had never worked.
+
+**The scoreboard had been reporting it the whole time.** The case is named
+"Ready to buy, asks for link immediately", it carries an expected outcome of
+`RECOVERED_FULL_PRICE`, and it had been coming back `NO_SALE`. It was one
+line in a list of mismatches under a headline number that read fine, so
+nobody read it. A scoreboard that prints a failure nobody looks at is
+telling the truth to an empty room.
+
+### Why the prompt rule lost
+
+Three reasons, and the third is the one that generalises.
+
+The rule sat roughly 4,000 characters below the numbered opening sequence it
+was supposed to override — and that sequence was imperative ("work through
+this sequence, ONE step per turn"), specific, and came first. Distance from
+the thing being overridden turned out to matter more than emphasis: the rule
+was in capitals and still lost.
+
+The sequence's step 1 also carried a verbatim example line — *"Hello, can
+you hear me alright?"* — and the model copied it literally, spending a turn
+of a two-turn conversation on a greeting.
+
+And the agent did not know it had already greeted. The opening line is
+generated before dialling and played by Twilio, but nothing ever put it in
+the agent's message thread, so the model reasonably assumed it was speaking
+first. **On every real call, customers have been introduced to twice.**
+
+### What actually fixed it
+
+Three changes, all of them moving or deleting text rather than adding it:
+
+- The opening line is now seeded into the agent's thread, so the model knows
+  what it has already said.
+- **THE SALE COMES FIRST** was hoisted above the sequence instead of below.
+- The exception was written **onto step 3 itself** — the step that was
+  misfiring — rather than stated once, far away, as a general principle.
+
+Only the third made it reliable. Hoisting the rule fixed three of four
+failing cases; putting the exception on the misbehaving step fixed the
+fourth, and did so on three consecutive runs.
+
+And then that fix broke something of its own, which is worth keeping because
+it is the same mistake one level down. The exception first read *"skip
+straight to step 5"* — and step 5 is "ask whether to send it", while step 4
+is where `check_offer` mints the token. So the agent obediently skipped the
+tool call that produces the thing `issue_offer` requires, called
+`issue_offer` with no token, and failed. Two scoreboard cases went from
+passing to failing on that one phrase.
+
+Referring to a step by NUMBER rather than by what it does is the same
+category of error as putting a rule far from what it governs: it assumes the
+model is holding a map of the document, when all it is really doing is
+following the nearest concrete instruction. The exception now names the
+actions — "call check_offer with requested_discount_percent=0, then
+issue_offer with the token it gives you" — and all three cases pass on
+repeated runs.
+
+**The lesson: an instruction competes with the instruction it is nearest
+to.** A general rule stated far from the specific step it contradicts will
+lose to that step, no matter how emphatic it is, because the model is
+reading the step when it acts. If a rule has an exception, the exception
+belongs on the rule — not in a section of its own.
+
+This is the fourth time this project has hit the same wall (#1, #13, #14 and
+now this), and the conclusion is consistent every time: **anything that must
+hold should be a refusal a tool returns, not a sentence in a prompt.** Where
+that genuinely is not possible — and "recognise that this person wants to
+buy" is one of those places, because detecting it in code means keyword
+matching, which this codebase deleted once already — the fallback is not a
+stronger sentence. It is a sentence placed where the model is looking.
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim
@@ -232,13 +654,108 @@ of this project:
 | `rule_breaks = 0` | **No** |
 | Refusals held (already paid / no consent / opt-out) | **No** |
 | Approved discount never exceeded the ceiling | **No** |
+| No money tool ran on a turn we may have misheard | **No** |
+| A broken payment was never discounted before full price was offered | **No** |
 
 The agent's *conversation* varies. What it is *allowed to do* does not, because
 the stops are enforced in code rather than by the model. A hallucinating or
 prompt-injected model can only hand back an opaque token whose amounts were
 computed by code it never touched.
 
-Across 25 labelled cases: **rule breaks 0**, 10 of 10 refusals held before any
-contact, and **130 percentage points of discount requested against 30
-approved** — 100 points of margin the policy engine protected, read from real
-audit rows.
+The last two rows moved into that column recently, and both moved the same
+way: they were true beliefs expressed as sentences in a system prompt, and
+they became guarantees when they became refusals a tool returns. "Be careful
+if you might have misheard" and "a declined card is not a price objection"
+are both correct, and neither was enforced by anything until a tool started
+saying no.
+
+Across 25 labelled cases, re-measured after the work in #10 through #15:
+
+| | |
+|---|---|
+| **Rule breaks** | **0** |
+| Refusal cases held before any contact | **10 of 10** |
+| Discount requested vs approved | **115 points asked, 20 approved** (ceiling 10%) |
+| Cases matching their expected outcome | **24 of 25** |
+| Recovered | 9 cases — 7 at full price, 2 discounted |
+| Money | ₹15,861 recovered of ₹49,875 at risk |
+| Denominator check | contacted 15 + stopped 10 = 25 eligible |
+
+That last row exists because a recovery rate which hides its stops is a lie:
+if ten customers were deliberately not contacted, a rate quoted over
+"attempts" has quietly shrunk its own denominator and reads better for having
+refused more people. The batch prints the arithmetic so anyone can check it.
+
+**One case of the 25 does not match its expected outcome, and it is named
+here rather than rounded away.** In "price objection, recovers at capped
+rate" the customer says the item *"felt a bit pricey"* and the agent sends a
+full-price link instead of the capped discount. That is the overshoot #1
+already warns about, in the direction #1 identified: having been taught not
+to discount a won sale, the agent under-discounts a real price objection.
+
+Two things about it are worth stating plainly. It **costs a recovery, not
+margin or compliance** — of the two directions this error can take, it is
+the cheaper one, and no guarantee is involved. And attempts to fix it by
+further prompt editing simply moved the failure to a different case: each
+edit bought one scenario and sold another, which is #14's lesson arriving as
+a live experience rather than a maxim. The configuration here is the best
+one measured, and the remaining miss is left visible instead of tuned into
+somebody else's column.
+
+Nothing here is quoted from a run that predates the code it describes. The
+previous figures were withdrawn the moment that stopped being true of them,
+and re-measured only after the work in #15 landed — which is also when the
+recovery count moved from 6 to 9, because that entry was a real defect and
+not a rounding error.
+
+---
+
+## The guardrails, measured by removing them
+
+"AI proposes, deterministic policy disposes" is the correct architecture and
+it is also what every project in this category says. A sentence in a README
+is not evidence, so `backend/scripts/run_ablation.py` runs the experiment
+instead: the same model, the same prompt, the same tools, the same 25 cases,
+with one layer removed at a time.
+
+| Arm | Rule breaks | Contacted past a stop | Discounts over ceiling | Largest discount approved |
+|---|---|---|---|---|
+| **GATED** (production) | **0** | 0 | 0 | 10% |
+| NO_POLICY | 3 | 0 | 3 | **40%** |
+| NO_GUARDS | 5 | 5 | 0 | 10% |
+
+`NO_POLICY` makes the policy engine approve whatever the model asks for. The
+two-phase offer token still exists; it simply stops being a gate. `NO_GUARDS`
+makes every pre-dial hard stop return "allowed".
+
+Unguarded, the agent approved **40% off against a configured ceiling of 10%**
+— a discount that is not merely unlikely while gated but arithmetically
+impossible, because the number is computed by code the model never touches.
+Without the pre-dial stops, five customers were contacted after a hard stop
+said no: three who had already paid, one outside their merchant's calling
+hours, one already at the contact cap.
+
+**The part that argues against us, and belongs here for that reason.**
+`NO_POLICY` recovered **seven** cases; `GATED` recovered **six**. Removing
+the guardrails bought one extra sale. It also gave away roughly ₹1,400 more
+margin on this run and broke three rules. That is the actual trade, stated
+in the direction that is inconvenient: the gate costs a sale at the edges,
+and what it buys is that the worst case cannot happen. A merchant can decide
+whether that is worth it; they cannot decide it if we only publish the half
+that flatters us.
+
+**What varies and what does not.** The rupee figures move between runs,
+because the agent runs at live temperature and its own sampling moves them
+more than the ablation does — one earlier run had the ungated arm asking for
+*less* than the gated one purely by chance. The report prints those under a
+`SAMPLED` heading and labels a negative delta as noise rather than a result.
+The rule-break column does not vary, because it is enforced in code rather
+than drawn from a distribution. That distinction is the whole claim: the
+difference between "usually fine" and "cannot happen".
+
+The harness has also paid for itself twice over as a debugging tool rather
+than a demo — see #13 and #14, both of which are bugs it found in gated
+production code that the entire test suite was happy with.
+
+---
+
