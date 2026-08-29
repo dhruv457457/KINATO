@@ -10,6 +10,8 @@ import logging
 # back to ephemeral local SQLite. This used to live only in
 # run_backend.py's __main__ block, which a production start command
 # (`uvicorn app.main:app`, per the Procfile) never actually executes.
+logger = logging.getLogger(__name__)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 import asyncio
@@ -75,10 +77,31 @@ app.mount("/sdk", StaticFiles(directory="static/sdk"), name="sdk")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    # Wildcards do not work in allow_origins - Starlette compares strings.
+    # A pattern belongs here or nowhere, and it is empty unless configured.
+    allow_origin_regex=settings.CORS_ORIGIN_REGEX or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info(
+    "CORS allows %s%s",
+    settings.cors_origins_list,
+    f" + regex {settings.CORS_ORIGIN_REGEX!r}" if settings.CORS_ORIGIN_REGEX else "",
+)
+# A wildcard in this list is always a mistake, and a silent one: Starlette
+# compares origins by exact string, so "https://*.vercel.app" matches
+# nothing while reading exactly like it matches everything. A deployed
+# frontend then loads perfectly and every request it makes is blocked by
+# the browser, with the server logs showing nothing wrong at all.
+for _origin in settings.cors_origins_list:
+    if "*" in _origin and _origin != "*":
+        logger.warning(
+            "CORS origin %r contains a wildcard and will never match anything - "
+            "allow_origins is compared exactly. Use CORS_ORIGIN_REGEX for patterns, "
+            "or list the exact origin.",
+            _origin,
+        )
 
 # Added AFTER the global CORSMiddleware so it wraps OUTSIDE it (Starlette
 # applies middleware in reverse-registration order) - it must see the

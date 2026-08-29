@@ -66,8 +66,24 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(default="", description="PostgreSQL connection string")
     
     CORS_ORIGINS: str = Field(
-        default="http://localhost:3000,http://127.0.0.1:3000,https://*.vercel.app",
-        description="Allowed CORS origins"
+        default="http://localhost:3000,http://127.0.0.1:3000",
+        description="Allowed CORS origins, matched EXACTLY (no wildcards)"
+    )
+    # Starlette matches allow_origins by exact string. The default here used
+    # to include "https://*.vercel.app", which matched nothing and never
+    # could - the browser was told nothing was allowed, so a deployed
+    # frontend loaded fine and every request it made failed, with the
+    # config appearing to permit exactly what it was blocking.
+    #
+    # Patterns need allow_origin_regex, so that is a separate setting and
+    # it is OPT-IN. Left empty by default deliberately: anyone can deploy
+    # to vercel.app, and a blanket https://.*\.vercel\.app combined with
+    # allow_credentials would let any site on that domain make
+    # authenticated requests with a logged-in merchant's cookie. Set it to
+    # your OWN preview pattern if you need one.
+    CORS_ORIGIN_REGEX: str = Field(
+        default="",
+        description=r"Optional regex for allowed origins, e.g. https://kinato-[a-z0-9-]+\.vercel\.app",
     )
 
     @property
