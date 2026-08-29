@@ -467,3 +467,41 @@ def channel_breakdown(merchant_id: str) -> Dict[str, Any]:
         by_state = {dict(r)["state"]: int(dict(r)["n"]) for r in cursor.fetchall()}
 
     return {"by_channel": by_channel, "by_state": by_state}
+
+
+def get_call_context(recovery_attempt_id: str) -> Optional[Dict[str, Any]]:
+    """Everything a live call needs to open, in ONE round trip.
+
+    Loading this as four separate reads - attempt, checkout, customer,
+    merchant - cost four sequential round trips, and each is 2-2.8s from
+    Railway to Supabase (see policies.py). Twilio hangs up on the customer
+    after about 15 seconds, so four reads plus any bookkeeping put the
+    opening webhook straight through that ceiling and the caller heard "we
+    cannot reach your server".
+
+    Joined rather than parallelised on purpose. FINDINGS #8 measured
+    concurrent reads against this database as 80% SLOWER, because
+    overlapping round trips cost less than the extra connections they
+    force. One query avoids the question entirely: it is fewer round trips
+    AND fewer connections.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT ra.*,
+                   c.line_items        AS checkout_line_items,
+                   c.failure_class     AS checkout_failure_class,
+                   c.amount_paise      AS checkout_amount_paise,
+                   cu.name             AS customer_name,
+                   m.name              AS merchant_name
+            FROM recovery_attempts ra
+            LEFT JOIN checkouts  c  ON c.checkout_id  = ra.checkout_id
+            LEFT JOIN customers  cu ON cu.customer_id = ra.customer_id
+            LEFT JOIN merchants  m  ON m.merchant_id  = ra.merchant_id
+            WHERE ra.recovery_attempt_id = %s
+            """,
+            (recovery_attempt_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None

@@ -40,6 +40,7 @@ on a server-computed offer_token (see app/agents/tools.py). "Opt-out" is
 the model calling record_opt_out, which revokes real consent immediately.
 The discount ladder lives entirely in merchant_policies, never in a prompt.
 """
+import asyncio
 import dataclasses
 import json
 import logging
@@ -310,38 +311,37 @@ def _describe_cart(checkout: Dict[str, Any]) -> str:
 
 
 def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]:
-    attempt = recovery_attempts_repo.get_recovery_attempt(recovery_attempt_id)
-    if not attempt:
+    """Build a call session from ONE database read.
+
+    This used to make four sequential reads - attempt, checkout, customer,
+    merchant. Each is 2-2.8s from Railway to Supabase, and Twilio hangs up
+    on the customer after roughly 15 seconds, so the opening webhook was
+    spending most of its budget fetching things a single join returns.
+    """
+    row = recovery_attempts_repo.get_call_context(recovery_attempt_id)
+    if not row:
         return None
-    checkout = checkouts_repo.get_checkout(attempt["checkout_id"])
-    customer = customers_repo.get_customer(attempt["customer_id"]) if attempt.get("customer_id") else None
+
     try:
-        plan = json.loads(attempt.get("plan") or "{}")
+        plan = json.loads(row.get("plan") or "{}")
     except (TypeError, ValueError):
         plan = {}
 
-    # The store name the agent introduces itself with. Empty when the
-    # merchant has no usable name on file - the prompt then omits it
-    # entirely rather than inviting the model to invent one.
-    business_name = ""
-    try:
-        merchant = merchants_repo.get_merchant(attempt["merchant_id"])
-        business_name = ((merchant or {}).get("name") or "").strip()
-    except Exception:
-        business_name = ""
-
-    # Classified once, by the webhook, and read from the checkout row here
-    # - so a second recovery attempt days later diagnoses from the same
-    # evidence rather than guessing again from nothing.
-    failure_class = (checkout or {}).get("failure_class")
+    # Empty when the merchant has no usable name on file - the prompt then
+    # omits it entirely rather than inviting the model to invent one. A
+    # real call once read "[Your Name] from [Your Company]" aloud.
+    business_name = (row.get("merchant_name") or "").strip()
 
     ctx = AgentContext(
-        merchant_id=attempt["merchant_id"],
+        merchant_id=row["merchant_id"],
         correlation_id=recovery_attempt_id,
-        customer_id=attempt.get("customer_id"),
-        checkout_id=attempt["checkout_id"],
+        customer_id=row.get("customer_id"),
+        checkout_id=row["checkout_id"],
         recovery_attempt_id=recovery_attempt_id,
-        failure_class=failure_class,
+        # Classified once, by the webhook, and read from the checkout here -
+        # so a second attempt days later diagnoses from the same evidence
+        # rather than guessing again from nothing.
+        failure_class=row.get("checkout_failure_class"),
     )
     return {
         "ctx": ctx,
@@ -350,39 +350,29 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
         # possible - see its docstring for why the greeting is generated
         # ahead of connect-time rather than lazily inside this webhook.
         "opening_voice_block": plan.get("voice_block") or "",
-        "customer_name": (customer or {}).get("name", ""),
-        "item_description": _describe_cart(checkout) if checkout else "their order",
-        # Who the agent says it is. Empty when the merchant has no usable
-        # business name, in which case the prompt omits it entirely rather
-        # than letting the model invent one.
+        "customer_name": (row.get("customer_name") or ""),
+        "item_description": _describe_cart({"line_items": row.get("checkout_line_items")}),
         "business_name": business_name,
-        "failure_class": failure_class,
+        "failure_class": row.get("checkout_failure_class"),
         # Pre-computed by call_orchestrator BEFORE dialling and carried in
-        # the plan, for exactly the reason the opening voice_block is:
-        # this webhook answers inside Twilio's ~15s deadline, and blowing
-        # that deadline does not degrade the call, it ENDS it. Building the
-        # brief here would have added a DB round trip (~2-2.8s from Railway
-        # to Supabase, per policies.py's measurement) to the single most
-        # deadline-sensitive request in the system, to save nothing.
+        # the plan, for the same reason the opening voice block is: this
+        # webhook answers inside Twilio's ~15s deadline, and blowing that
+        # deadline does not degrade the call, it ENDS it.
         "memory_brief": plan.get("memory_brief") or "",
         "turns": 0,
-        # Where the next persisted turn goes. Zero for a fresh call, which
-        # is the overwhelmingly common case and costs no query;
-        # _rehydrate_session overrides it with the real value read from the
-        # transcript, which is the only path where it can be non-zero.
+        # Zero for a fresh call, which costs no query; _rehydrate_session
+        # overrides it with the real value read from the transcript, the
+        # only path where it can be non-zero.
         "turn_index": 0,
         # Consecutive turns we could not make out at all. Reset by any
         # usable turn; MAX_MISHEARD_STREAK ends the attempt gracefully
         # instead of asking a third time.
         "misheard_streak": 0,
         # Set once check_offer has bounced a discount with
-        # REJECTED_UNCONFIRMED_BARRIER. The agent's very next turn IS the
-        # confirming question, so the customer's reply to it is, by
-        # construction, an answer to that question - which is what unlocks
-        # the discount path. Deriving this from the refusal rather than by
-        # scanning the customer's words for "yes" is deliberate: keyword-
-        # matching agreement is the exact pattern this file's own rewrite
-        # deleted, and it is no more trustworthy here than it was there.
+        # REJECTED_UNCONFIRMED_BARRIER. Deriving it from the refusal rather
+        # than by scanning the customer's words for "yes" is deliberate:
+        # keyword-matching agreement is the pattern this file's own rewrite
+        # deleted.
         "discount_bounced": False,
     }
 
@@ -467,18 +457,32 @@ async def twilio_outbound_twiml(request: Request):
         )
 
     CALL_SESSIONS[call_id] = session
-    # The only identifier a later mid-call webhook carries. Recorded now,
-    # while we still have both halves of the mapping.
-    try:
-        await run_db_async(
-            recovery_attempts_repo.update_state,
-            recovery_attempt_id,
-            "CALLING",
-            twilio_call_sid=call_id,
-        )
-    except Exception as e:
-        logger.warning(f"[CALL {call_id}] Could not record the Twilio CallSid (non-fatal): {e}")
-    await _record_turn(session, turns_repo.AGENT, session["opening_line"])
+
+    # Persisted AFTER the response, never before it.
+    #
+    # Twilio gives this webhook about 15 seconds before it hangs up on the
+    # customer with "we cannot reach your server". _load_session_for_call
+    # already costs four sequential reads, and each one is 2-2.8s from
+    # Railway to Supabase (see policies.py). Adding two writes in front of
+    # the TwiML put the total straight through that ceiling and killed real
+    # calls - the ONLY thing this handler owes Twilio is the XML.
+    #
+    # Neither write is needed to produce it. The CallSid mapping matters to
+    # a later turn, and the opening line matters to the transcript; both can
+    # land a moment after the customer has already started hearing it.
+    async def _persist_opening() -> None:
+        try:
+            await run_db_async(
+                recovery_attempts_repo.update_state,
+                recovery_attempt_id,
+                "CALLING",
+                twilio_call_sid=call_id,
+            )
+            await _record_turn(session, turns_repo.AGENT, session["opening_line"])
+        except Exception as e:
+            logger.warning(f"[CALL {call_id}] Post-answer bookkeeping failed (non-fatal): {e}")
+
+    asyncio.create_task(_persist_opening())
     # And tell the AGENT it said it, not just the transcript. Twilio plays
     # this line; the model never saw it, so it introduced itself again on
     # the very next turn.
