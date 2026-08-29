@@ -207,6 +207,44 @@ def init_db(force_reseed: bool = False) -> None:
             "CREATE INDEX IF NOT EXISTS idx_recovery_attempts_merchant ON recovery_attempts (merchant_id, created_at);"
         )
 
+        # 8b. Conversation turns - what was actually SAID, on both sides.
+        #
+        # Until this table existed, a live call's dialogue lived in a
+        # module-global dict and in stdout. That meant: the recovery drawer
+        # (whose own docstring calls it "the screen the whole product is
+        # judged on") showed tool calls with no conversation next to them;
+        # a second worker process could not serve a call the first one
+        # started; a restart mid-call told the customer "I lost track of
+        # our order details"; and the agent began every later attempt
+        # knowing nothing about the earlier one.
+        #
+        # stt_confidence and input_mode are stored per turn because "we may
+        # have misheard this" is a fact about the turn, and it is exactly
+        # the fact a merchant needs when a call reads oddly in the drawer.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            turn_id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
+            recovery_attempt_id TEXT NOT NULL,
+            customer_id TEXT,
+            turn_index INTEGER NOT NULL,
+            speaker TEXT NOT NULL,
+            text TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'voice',
+            stt_confidence REAL,
+            input_mode TEXT NOT NULL DEFAULT 'speech',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_turns_attempt "
+            "ON conversation_turns (recovery_attempt_id, turn_index);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_turns_customer "
+            "ON conversation_turns (customer_id, created_at);"
+        )
+
         # 9. Offer tokens - the two-phase money gate. An LLM tool call can
         # only ever reference one of these by its opaque token; the actual
         # amount is whatever this row says, never what the model argues for.
@@ -304,6 +342,47 @@ def init_db(force_reseed: bool = False) -> None:
         "ALTER TABLE recovery_attempts ADD COLUMN promised_amount_paise BIGINT",
         "ALTER TABLE recovery_attempts ADD COLUMN promise_words TEXT",
         "ALTER TABLE recovery_attempts ADD COLUMN promise_reminded_at TIMESTAMPTZ",
+        # The customer pressed 0 on the keypad to ask us to call back. This
+        # is the ONE thing that may lift the outreach cap, so it has to be
+        # a stored fact rather than an inference: "they asked us to" is the
+        # difference between a follow-up and a nuisance call.
+        "ALTER TABLE recovery_attempts ADD COLUMN callback_requested_at TIMESTAMPTZ",
+        # Why the payment failed, as Razorpay described it and as we
+        # classified it. Razorpay has always sent all of this; only
+        # error_reason ever reached the event bus, and nothing read even
+        # that, so a bank timeout and a stolen-card block produced the
+        # identical sales call. Stored on the checkout because it is a
+        # fact about the payment, not about any one recovery attempt -
+        # a second attempt must diagnose from the same evidence.
+        "ALTER TABLE checkouts ADD COLUMN error_code TEXT",
+        "ALTER TABLE checkouts ADD COLUMN error_reason TEXT",
+        "ALTER TABLE checkouts ADD COLUMN error_description TEXT",
+        "ALTER TABLE checkouts ADD COLUMN error_source TEXT",
+        "ALTER TABLE checkouts ADD COLUMN error_step TEXT",
+        "ALTER TABLE checkouts ADD COLUMN payment_method TEXT",
+        "ALTER TABLE checkouts ADD COLUMN failure_class TEXT",
+        # Held back because RAZORPAY was down, not because of anything
+        # about this customer. Recorded so the case can be picked up again
+        # when the outage clears - previously it was published as blocked
+        # and then dropped on the floor, and nothing ever re-fired it.
+        "ALTER TABLE checkouts ADD COLUMN recovery_queued_at TIMESTAMPTZ",
+        # Twilio's CallSid for this attempt. Recorded so /voice/respond can
+        # find its way back to the recovery attempt from the CallSid alone
+        # - the only identifier Twilio sends on a mid-call turn. Without it
+        # an attempt is only reachable through the in-memory session the
+        # /voice/outbound request happened to create, so a restart or a
+        # second worker answers the customer with "I lost track of our
+        # order details" and the call is over.
+        "ALTER TABLE recovery_attempts ADD COLUMN twilio_call_sid TEXT",
+        # The payable URL, not just Razorpay's id for it. Only the id was
+        # stored, so the one thing needed to remind a customer of a promise
+        # they made - the link they were given - existed nowhere after the
+        # event that carried it had been handled.
+        "ALTER TABLE recovery_attempts ADD COLUMN rzp_payment_link_url TEXT",
+        # Which offer the promise was made against. A promise recorded with
+        # only a date loses the terms it was a promise about, so a reminder
+        # a week later cannot say what was agreed.
+        "ALTER TABLE recovery_attempts ADD COLUMN promised_offer_token TEXT",
     ):
         try:
             with get_db() as alter_conn:

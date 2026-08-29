@@ -57,7 +57,11 @@ def update_state(recovery_attempt_id: str, state: str, **fields) -> None:
 # states are CALL_FAILED and CONSENT_REVOKED, so a correctly-failed call
 # never counted as finished and permanently blocked that checkout from
 # being retried.
-TERMINAL_STATES = ("RECOVERED", "CALL_FAILED", "CONSENT_REVOKED")
+# CALLBACK_REQUESTED is terminal for THIS attempt deliberately: the
+# customer asked us to try again later, so this attempt is finished and
+# must stop blocking the checkout - the whole point is that a further
+# attempt becomes possible (see outreach_guards' callback exemption).
+TERMINAL_STATES = ("RECOVERED", "CALL_FAILED", "CONSENT_REVOKED", "CALLBACK_REQUESTED")
 
 
 def list_active_for_checkout(checkout_id: str) -> list:
@@ -255,3 +259,123 @@ def active_promise_for_checkout(checkout_id: str) -> Optional[Dict[str, Any]]:
         )
         row = cursor.fetchone()
     return dict(row) if row else None
+
+
+def get_by_call_sid(call_sid: str) -> Optional[Dict[str, Any]]:
+    """Find the recovery attempt a live Twilio call belongs to.
+
+    A mid-call webhook carries the CallSid and nothing else, so this is the
+    only route back to the attempt when the in-memory session is gone -
+    after a restart, or on a second worker process that never handled this
+    call's /voice/outbound. Newest first, because a CallSid is unique in
+    practice but nothing in the schema promises it.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM recovery_attempts WHERE twilio_call_sid = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (call_sid,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def list_for_customer(customer_id: str, limit: int = 10) -> list:
+    """This customer's recovery attempts, newest first.
+
+    Across every checkout, deliberately: what matters for the next
+    conversation is what happened with this PERSON, not with one cart. A
+    customer who broke a promise on a different order is still a customer
+    who broke a promise.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM recovery_attempts WHERE customer_id = %s "
+            "ORDER BY created_at DESC LIMIT %s",
+            (customer_id, limit),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+# States that mean we actually reached out. CREATED alone means the attempt
+# was opened and then stopped by consent or a guard before anything left the
+# building, and that must not burn the customer's contact budget - the
+# distinction count_calls_for_checkout has always made, kept in one place
+# now that two counters depend on it.
+#
+# CONSENT_REVOKED is deliberately absent: it is written by the PRE-DIAL
+# consent gate as well as by an opt-out mid-call, and counting a customer's
+# refusal as a contact would be exactly backwards.
+CONTACTED_STATES = (
+    "CALLING", "PAYMENT_LINK_SENT", "RECOVERED", "CALL_FAILED",
+    "PROMISED", "CALLBACK_REQUESTED",
+)
+
+
+def count_recent_by_channel(checkout_id: str, within_hours: int = 24) -> Dict[str, int]:
+    """How many times this checkout has been contacted on each channel in
+    the last `within_hours`.
+
+    A lifetime count answers "have we bothered them too much ever"; this
+    answers "have we bothered them too much today", and the second question
+    is the one a customer actually experiences. Both are enforced.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT channel, COUNT(*) AS n FROM recovery_attempts
+            WHERE checkout_id = %s
+              AND channel IS NOT NULL
+              AND state IN %s
+              AND created_at > NOW() - INTERVAL '{int(within_hours)} hours'
+            GROUP BY channel
+            """,
+            (checkout_id, CONTACTED_STATES),
+        )
+        return {dict(r)["channel"]: dict(r)["n"] for r in cursor.fetchall()}
+
+
+def count_outreach_for_checkout(checkout_id: str) -> int:
+    """Every outreach attempt on this checkout, on any channel, ever.
+
+    count_calls_for_checkout counts only calls. Once email became a real
+    channel, a lifetime cap that counted calls alone would let a customer
+    be contacted twice by phone and then indefinitely by email while the
+    cap reported itself as holding.
+
+    Counted by STATE, not by whether a channel happens to be recorded. The
+    first version of this filtered on `channel IS NOT NULL`, which quietly
+    stopped counting every attempt that never got as far as choosing one -
+    and the scoreboard immediately reported a rule break, because a
+    checkout already at its cap was waved through. The states are the
+    record of what actually happened; the channel column is a label on it.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM recovery_attempts "
+            "WHERE checkout_id = %s AND state IN %s",
+            (checkout_id, CONTACTED_STATES),
+        )
+        row = cursor.fetchone()
+        return dict(row)["n"] if row else 0
+
+
+def callback_requested(checkout_id: str) -> bool:
+    """Did the customer themselves ask us to call back?
+
+    The one thing that may lift the outreach cap, and it must be a stored
+    fact rather than an inference - "they asked us to" is the entire
+    difference between a follow-up and a nuisance call.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM recovery_attempts WHERE checkout_id = %s "
+            "AND callback_requested_at IS NOT NULL LIMIT 1",
+            (checkout_id,),
+        )
+        return cursor.fetchone() is not None

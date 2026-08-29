@@ -30,10 +30,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from app.agents.state import AgentContext
 from app.db.database import run_db_async
 from app.db.repositories import checkouts as checkouts_repo
+from app.db.repositories import consents as consents_repo
 from app.db.repositories import offer_tokens as offer_tokens_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from app.services.failure_diagnosis import FULL_PRICE_FIRST_CLASSES
 from app.services.policy_engine import policy_engine
 from app.services.payment_execution import payment_execution, PaymentExecutionError
 from app.services.identity_service import identity_service
@@ -48,6 +50,53 @@ FORBIDDEN_ARG_NAMES = {
     "merchant_id", "customer_id", "checkout_id", "recovery_attempt_id",
     "phone", "email", "amount", "amount_paise", "price", "cogs",
 }
+
+# --- The mishearing gate -----------------------------------------------
+# Below this Twilio Gather confidence, no money tool may run at all. The
+# agent's only remaining move is to ask the customer to repeat themselves.
+#
+# The reasoning is the same one that produced the offer token. A model that
+# is prompted "be careful if you might have misheard" is being asked for a
+# promise; a tool that refuses to execute is a mechanism. Speech-to-text is
+# the least reliable input in this entire system - accents and line noise
+# degrade it badly, and it degrades SILENTLY, returning a confident-looking
+# sentence that is simply not what the customer said. Money must not move
+# on a sentence we are not reasonably sure we heard.
+#
+# 0.6 is deliberately conservative for a MONEY action while being no bar at
+# all to conversation: the agent still replies, still confirms, still
+# closes warmly on a 0.35 turn. It just cannot spend the merchant's margin
+# on one.
+LOW_CONFIDENCE_FLOOR = 0.6
+
+# Above this, we heard them clearly enough that reading the barrier back
+# would be a ritual rather than a check.
+#
+# The first version of the confirmation rule required it on EVERY spoken
+# discount request, and that was wrong in a way worth recording. A customer
+# who says "can you do 40% off?" has stated the barrier themselves, in
+# their own words, unmistakably. Answering that with "so is it the price
+# that's holding you up?" is exactly the scripted interrogation FINDINGS #1
+# is about - the script outranking the sale - and on a single-exchange call
+# it loses the sale outright, which is how this was caught.
+#
+# So confirmation is a remedy for MISHEARING, not a negotiation ritual, and
+# it applies only in the band where we could plausibly have misheard: above
+# the floor where money is allowed to move at all, below the point where
+# the transcription is clean.
+CLEARLY_HEARD_FLOOR = 0.85
+
+# Every channel a customer is revoked from when they opt out. Listing them
+# is deliberate rather than deriving it from "channels with a granted row":
+# a customer who says "stop contacting me" must be stopped on channels we
+# have not yet tried them on, and on channels added after they said it.
+OPT_OUT_CHANNELS = ("voice", "email")
+
+
+def _confidence_ok(ctx: AgentContext) -> bool:
+    """None means the input was not speech (keypad, email, scripted batch
+    case) and so is not subject to this gate at all."""
+    return ctx.stt_confidence is None or ctx.stt_confidence >= LOW_CONFIDENCE_FLOOR
 
 
 @dataclass
@@ -149,9 +198,90 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
     if not ctx.checkout_id:
         return {"decision": "DENY", "reason": "no_checkout_in_context"}
 
+    # Did we actually hear them? See LOW_CONFIDENCE_FLOOR.
+    if not _confidence_ok(ctx):
+        return {
+            "decision": "DENY",
+            "reason": "REJECTED_LOW_CONFIDENCE",
+            "detail": (
+                f"speech confidence {ctx.stt_confidence:.2f} is below "
+                f"{LOW_CONFIDENCE_FLOOR:.2f} - ask them to repeat that before "
+                "discussing any price"
+            ),
+        }
+
+    # A DISCOUNT on a SPOKEN turn requires that the customer has confirmed
+    # the barrier we read back to them.
+    #
+    # Three things are deliberately narrow here. Full price is never gated
+    # - a customer who asks for the link gets the link, which is the whole
+    # point of FINDINGS #1. Non-speech turns are never gated, because the
+    # rule exists to guard against MISHEARING and a keypad press or a typed
+    # email reply cannot be misheard. And the check is on the tool, not in
+    # the prompt, for the same reason the offer token exists.
+    # The sale comes first, as a mechanism rather than a sentence.
+    #
+    # A declined card, a failed 3DS step or a bank timeout is not a price
+    # objection - those customers want to pay the full amount and need a
+    # working link. That rule has existed since FINDINGS #1, but only ever
+    # as a paragraph in the system prompt, which is precisely the kind of
+    # guarantee this codebase does not accept anywhere else.
+    #
+    # Note what this does NOT do: it is full price FIRST, not full price
+    # forever. If the customer goes on to say plainly that the price is too
+    # high, the confirmation turn sets barrier_confirmed and the discount
+    # becomes available. FINDINGS #1 records the correction to that bug
+    # overshooting in exactly this direction - sending full price to people
+    # who had explicitly raised price - and both directions lose money.
+    if (
+        requested_discount_percent > 0
+        and ctx.failure_class in FULL_PRICE_FIRST_CLASSES
+        and not ctx.barrier_confirmed
+    ):
+        return {
+            "decision": "DENY",
+            "reason": "REJECTED_FULL_PRICE_FIRST",
+            "detail": (
+                f"this checkout failed as {ctx.failure_class} - their payment broke, they did not "
+                "object to the price. Send a working link at full price "
+                "(requested_discount_percent=0) unless they themselves say the price is too high"
+            ),
+        }
+
+    if (
+        requested_discount_percent > 0
+        and ctx.input_is_speech
+        and ctx.stt_confidence is not None
+        and ctx.stt_confidence < CLEARLY_HEARD_FLOOR
+        and not ctx.barrier_confirmed
+    ):
+        return {
+            "decision": "DENY",
+            "reason": "REJECTED_UNCONFIRMED_BARRIER",
+            "detail": (
+                "the customer has not yet confirmed that price is what stopped "
+                "them - read it back to them and ask, or send full price with "
+                "requested_discount_percent=0"
+            ),
+        }
+
     checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
     if not checkout:
         return {"decision": "DENY", "reason": "checkout_not_found"}
+
+    # Already paid, checked at the MONEY GATE itself.
+    #
+    # This was checked before dialling and once per conversation turn, but
+    # never here - so the one place that actually mints spendable offers
+    # was the one place that never asked. The turn check closes the gap in
+    # practice on a voice call; it does nothing for any other caller, and
+    # "the caller happens to check first" is not a property of this tool.
+    if checkout.get("status") == "paid" or checkout.get("paid_at"):
+        return {
+            "decision": "DENY",
+            "reason": "REJECTED_ALREADY_PAID",
+            "detail": "this checkout has already been paid - there is nothing to recover",
+        }
 
     policy = await run_db_async(policy_engine.get_policy, ctx.merchant_id)
     product_ids = []
@@ -172,7 +302,13 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
     )
 
     if decision["decision"] == "DENY":
-        return {"decision": "DENY", "reason": decision["reason"]}
+        return {
+            "decision": "DENY",
+            "reason": decision["reason"],
+            "requested_percent": requested_discount_percent,
+            "ceiling_percent": decision.get("ceiling_percent"),
+            "margin_floor_percent": decision.get("margin_floor_percent"),
+        }
 
     approved_percent = decision["approved_discount"]
     base_amount_paise = checkout["amount_paise"]
@@ -194,8 +330,15 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
 
     return {
         "decision": decision["decision"],
+        # The reason travels on an approval too, not only on a refusal:
+        # "you asked 40, you got 10, because of your ceiling" is the whole
+        # explanation, and splitting half of it into a different code path
+        # is how it ends up missing from the audit row that matters.
+        "reason": decision["reason"],
         "requested_percent": requested_discount_percent,
         "approved_percent": approved_percent,
+        "ceiling_percent": decision.get("ceiling_percent"),
+        "margin_floor_percent": decision.get("margin_floor_percent"),
         "final_amount_paise": final_amount_paise,
         "offer_token": token_row["offer_token"],
         "expires_at": str(token_row["expires_at"]),
@@ -236,6 +379,19 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
     this agent) doesn't need its own copy of that logic - the exact
     duplication that made call_orchestrator's old _process_offer_request
     and this tool two different paths to the same money-moving action."""
+    # The mishearing gate again, on the acting half of the money gate.
+    # check_offer already refuses under the floor, but issue_offer must
+    # refuse independently: a token minted on a clearly-heard turn must not
+    # become spendable by a later, garbled "yes" that was never a yes.
+    if not _confidence_ok(ctx):
+        return {
+            "status": "REJECTED",
+            "reason": "REJECTED_LOW_CONFIDENCE",
+            "detail": (
+                f"speech confidence {ctx.stt_confidence:.2f} is below "
+                f"{LOW_CONFIDENCE_FLOOR:.2f} - confirm what they want before sending anything"
+            ),
+        }
     try:
         token = await run_db_async(
             offer_tokens_repo.consume_offer_token,
@@ -246,8 +402,32 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
     except ValueError as e:
         return {"status": "REJECTED", "reason": str(e)}
 
-    if ctx.customer_id and not await identity_service.check_consent(ctx.merchant_id, ctx.customer_id, channel="voice"):
-        return {"status": "REJECTED", "reason": "consent_revoked"}
+    # The question here is "have they told us to stop?", NOT "do we hold a
+    # marketing opt-in for this particular protocol?"
+    #
+    # Both of the obvious versions of this check are wrong. The original
+    # asked for VOICE consent while delivering by email - the wrong
+    # question, which happened to give the right answer on a phone call and
+    # would give a nonsense one anywhere else. Replacing it with a check for
+    # consent on the DELIVERY channel looked more correct and was worse: a
+    # customer who consented to calls but not email would be phoned, agree
+    # to the offer, and have it silently refused - while the call's fallback
+    # line told them "I've sent that offer to your email." That is FINDINGS
+    # #2 exactly: the customer told the opposite of what happened. It also
+    # took the scoreboard's recoveries to zero, which is how it was caught.
+    #
+    # What is actually happening is that a customer, mid-conversation on a
+    # channel we already had consent for, has ASKED for this link. Sending
+    # it is completing a request, not initiating contact. So the bar is the
+    # broad one: a customer who has opted out anywhere gets nothing.
+    if ctx.customer_id and await run_db_async(
+        consents_repo.has_opted_out, ctx.merchant_id, ctx.customer_id
+    ):
+        return {
+            "status": "REJECTED",
+            "reason": "consent_revoked",
+            "detail": "this customer has asked not to be contacted",
+        }
 
     approved_percent = token["approved_percent"] or 0.0
     original_amount = token["base_amount_paise"] / 100.0
@@ -299,6 +479,7 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
                     approved_discount_percent=approved_percent,
                     final_amount_paise=token["final_amount_paise"],
                     rzp_payment_link_id=payment_result["payment_link_id"],
+                    rzp_payment_link_url=payment_result["url"],
                 )
             )
         )
@@ -413,9 +594,22 @@ def _parse_promise_date(raw: str):
         return None
 
 async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
+    """"Don't contact me again" - across every channel, not just this one.
+
+    This revoked voice only. That was survivable while voice was the only
+    way anyone was ever contacted; it stopped being survivable the moment
+    email became a real consented channel, because a customer who said
+    "take me off your list" on the phone would have kept receiving email.
+    They did not ask to stop being phoned. They asked to stop being
+    contacted, and a customer should not have to opt out once per protocol
+    we happen to have implemented.
+    """
     if not ctx.customer_id:
         return {"status": "REJECTED", "reason": "no_customer_in_context"}
-    await identity_service.revoke_consent(ctx.merchant_id, ctx.customer_id, channel="voice", source="agent_tool")
+    for channel in OPT_OUT_CHANNELS:
+        await identity_service.revoke_consent(
+            ctx.merchant_id, ctx.customer_id, channel=channel, source="agent_tool"
+        )
     if ctx.recovery_attempt_id:
         # Was previously only reflected in the consents table - the
         # recovery_attempts row itself stayed wherever it was (e.g.
@@ -427,7 +621,13 @@ async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
 
 
 
-async def _record_promise_to_pay(ctx: AgentContext, pay_date: str, amount_inr: float = 0.0, customer_words: str = "") -> Dict[str, Any]:
+async def _record_promise_to_pay(
+    ctx: AgentContext,
+    pay_date: str,
+    amount_inr: float = 0.0,
+    customer_words: str = "",
+    offer_token: str = "",
+) -> Dict[str, Any]:
     """The customer said they will pay, just not now.
 
     This is a STOPPING rule, not a soft outcome. "I'll pay on Friday" means
@@ -451,6 +651,13 @@ async def _record_promise_to_pay(ctx: AgentContext, pay_date: str, amount_inr: f
             promised_at=parsed,
             promised_amount_paise=int(round(amount_inr * 100)) if amount_inr else None,
             promise_words=(customer_words or "")[:500],
+            # WHICH offer they promised against. Recording only a date
+            # loses the terms the promise was about, so a reminder days
+            # later cannot say what was actually agreed - and a promise
+            # nobody can restate is not much of a promise. Storing the
+            # token moves nothing: it is a reference to terms the server
+            # computed, exactly as everywhere else in this file.
+            promised_offer_token=(offer_token or None),
         )
     )
     logger.info(f"Promise to pay recorded for {ctx.recovery_attempt_id}: {parsed.date()} - outreach paused until then.")
@@ -476,6 +683,13 @@ record_promise_to_pay = Tool(
         },
         "amount_inr": {"type": "number", "description": "Amount they said they would pay, if they named one. 0 if not."},
         "customer_words": {"type": "string", "description": "Their own words, quoted as closely as you heard them."},
+        "offer_token": {
+            "type": "string",
+            "description": (
+                "The offer_token from check_offer, if they are promising to pay a price you already "
+                "quoted them. Leave empty if no offer was discussed."
+            ),
+        },
     },
     required=["pay_date"],
     fn=_record_promise_to_pay,
