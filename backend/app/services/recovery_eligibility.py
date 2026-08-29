@@ -6,6 +6,7 @@ from app.db.database import run_db_async
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories.merchants import is_rail_degraded
+from app.services import outreach_guards
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,38 @@ class RecoveryEligibilityService:
                 merchant_id=merchant_id,
             )
             return
+
+        # Quiet hours, checked HERE rather than only before dialling.
+        #
+        # The pre-dial guard is correct and stays, but on its own it
+        # produced this, once per sweeper pass, all night: create an
+        # attempt, generate an opening line with a real LLM call, block it,
+        # mark it terminal, become eligible again, repeat. Every cycle cost
+        # money and wrote a row, and none of it could ever reach anyone.
+        #
+        # Only when voice is the ONLY way we could reach them. Calling
+        # hours are a courtesy about telephones; an email channel is not
+        # subject to them, and queueing an email-reachable customer because
+        # the phone window shut would be inventing a restriction.
+        if channels == ["voice"]:
+            hours_ok, hours_reason = await run_db_async(
+                outreach_guards.within_calling_hours, merchant_id
+            )
+            if not hours_ok:
+                logger.info(f"Queueing {checkout_id} until the calling window opens: {hours_reason}")
+                await run_db_async(checkouts_repo.queue_for_rail_recovery, checkout_id)
+                await bus.publish(
+                    event_type="recovery.blocked",
+                    payload={
+                        "checkout_id": checkout_id,
+                        "customer_id": customer_id,
+                        "reason": "quiet_hours",
+                        "detail": f"{hours_reason} - held until the window opens, then re-evaluated",
+                    },
+                    correlation_id=correlation_id,
+                    merchant_id=merchant_id,
+                )
+                return
 
         logger.info(f"Eligibility Check Passed. Generating Recovery Opportunity for {checkout_id}.")
         

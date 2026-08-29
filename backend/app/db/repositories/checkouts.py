@@ -204,3 +204,24 @@ def find_by_order_id(merchant_id: str, order_id: str) -> Optional[Dict[str, Any]
         )
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+def merchants_with_queued(max_age_hours: int = 24) -> List[str]:
+    """Merchants holding at least one queued, still-unpaid checkout.
+
+    Lets the sweeper ask "is this merchant able to reach anyone yet?" once
+    per merchant rather than once per checkout, which matters because the
+    answer depends on the merchant's calling hours and rail health, not on
+    the cart.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT DISTINCT merchant_id FROM checkouts
+            WHERE recovery_queued_at IS NOT NULL
+              AND status != 'paid'
+              AND recovery_queued_at > NOW() - INTERVAL '{int(max_age_hours)} hours'
+            """
+        )
+        return [dict(r)["merchant_id"] for r in cursor.fetchall()]

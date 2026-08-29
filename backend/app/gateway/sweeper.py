@@ -18,7 +18,10 @@ from typing import Dict, Any
 
 from app.db.database import get_db, dialect
 from app.gateway.event_bus import bus
+from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from app.db.repositories.merchants import is_rail_degraded
+from app.services import outreach_guards
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +102,65 @@ async def sweep_once() -> int:
 
     await _expire_stale_calls()
     await _remind_lapsed_promises()
+    await _drain_recovery_queue()
     return fired
+
+
+async def _drain_recovery_queue():
+    """Let held cases go once the reason for holding them has passed.
+
+    Two things put a checkout on hold: Razorpay being down, and the
+    merchant's calling window being shut. The first resolves with a webhook
+    and is drained the moment it arrives. The second resolves because it
+    became nine in the morning, and nothing sends an event for that - so it
+    is checked here, on the sweeper's own tick.
+
+    Held cases used to be handled by not holding them at all: the pipeline
+    built an attempt every pass all night, generated an opening line with a
+    real LLM call, blocked it before dialling, and started over. Correct,
+    expensive, and completely invisible.
+
+    Re-publishing checkout.payment_failed rather than jumping to an
+    opportunity is deliberate: every guard runs again on release, so
+    nothing is grandfathered past a stop it would fail today.
+    """
+    try:
+        merchant_ids = checkouts_repo.merchants_with_queued()
+    except Exception as e:
+        logger.warning(f"Sweeper: could not read the recovery queue: {e}")
+        return
+
+    for merchant_id in merchant_ids:
+        try:
+            if is_rail_degraded(merchant_id):
+                continue
+            hours_ok, _ = outreach_guards.within_calling_hours(merchant_id)
+            if not hours_ok:
+                continue
+
+            queued = checkouts_repo.list_queued_for_rail(merchant_id)
+            checkouts_repo.clear_rail_queue(merchant_id)
+        except Exception as e:
+            logger.warning(f"Sweeper: could not drain the queue for {merchant_id}: {e}")
+            continue
+
+        if queued:
+            logger.info(f"Sweeper: releasing {len(queued)} held checkout(s) for {merchant_id}.")
+        for checkout in queued:
+            await bus.publish(
+                event_type="checkout.payment_failed",
+                payload={
+                    "checkout_id": checkout["checkout_id"],
+                    "customer_id": checkout.get("customer_id"),
+                    "amount": (checkout.get("amount_paise") or 0) / 100.0,
+                    "amount_paise": checkout.get("amount_paise"),
+                    "currency": checkout.get("currency", "INR"),
+                    "released_from_queue": True,
+                },
+                correlation_id=checkout["checkout_id"],
+                merchant_id=merchant_id,
+                idempotency_key=f"queue_release_{checkout['checkout_id']}",
+            )
 
 
 async def _remind_lapsed_promises():

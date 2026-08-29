@@ -19,7 +19,11 @@ trail" bar:
    opportunity.
 """
 import uuid
+from datetime import datetime
+
 import pytest
+
+from app.services import outreach_guards
 
 from app.gateway.event_bus import bus
 from app.db.repositories import merchants as merchants_repo
@@ -368,4 +372,112 @@ class TestAnOutageDefersRecoveryRatherThanDestroyingIt:
         queued = checkouts_repo.list_queued_for_rail(real_merchant_id)
         assert cid not in [c["checkout_id"] for c in queued], (
             "someone who paid while we were holding back must not be called about it"
+        )
+
+
+class TestQuietHoursHoldsInsteadOfChurning:
+    """From the deployed logs: all night, once per sweeper pass, the
+    pipeline built a recovery attempt, spent a real LLM call generating an
+    opening line, blocked it on quiet hours before dialling, marked it
+    terminal, became eligible again, and started over. Every guard was
+    correct. The behaviour was still wrong.
+    """
+
+    @pytest.mark.real_clock
+    async def test_a_cart_is_held_rather_than_attempted_outside_calling_hours(
+        self, real_merchant_id, monkeypatch
+    ):
+        from app.db.repositories import checkouts as checkouts_repo
+        from app.db.repositories import customers as customers_repo
+        from app.db.repositories import policies as policies_repo
+        from app.services.identity_service import identity_service
+        from tests.conftest import wait_until
+
+        # A window that is definitely shut, whatever time the suite runs.
+        now = datetime.now(outreach_guards.IST)
+        shut = (now.hour + 2) % 24
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": shut, "calling_end_hour": (shut + 1) % 24}
+        )
+
+        customer = customers_repo.upsert_by_contact(real_merchant_id, phone="+919000000200")
+        await identity_service.grant_transactional_consent(
+            real_merchant_id, customer["customer_id"], phone="+919000000200"
+        )
+        checkout = checkouts_repo.create_checkout(
+            real_merchant_id, amount_paise=250_000, customer_id=customer["customer_id"]
+        )
+        cid = checkout["checkout_id"]
+
+        await bus.publish(
+            event_type="checkout.payment_failed",
+            payload={"checkout_id": cid, "customer_id": customer["customer_id"], "amount": 2500.0},
+            correlation_id=cid,
+            merchant_id=real_merchant_id,
+        )
+
+        held = await wait_until(
+            lambda: any(
+                e["event_type"] == "recovery.blocked"
+                and e["payload"].get("reason") == "quiet_hours"
+                for e in bus._event_log
+            )
+        )
+        assert held, "a cart outside the calling window must be held, with a visible reason"
+        assert checkouts_repo.get_checkout(cid)["recovery_queued_at"] is not None
+
+        # And crucially: no attempt, so no LLM call and no row per pass.
+        assert not any(
+            e["event_type"] == "recovery.opportunity.created" for e in bus._event_log
+        ), "holding means not starting the work, not starting it and then stopping it"
+
+    @pytest.mark.real_clock
+    async def test_the_sweeper_releases_it_once_the_window_opens(
+        self, real_merchant_id
+    ):
+        from app.db.repositories import checkouts as checkouts_repo
+        from app.db.repositories import policies as policies_repo
+        from app.gateway import sweeper
+        from tests.conftest import wait_until
+
+        # Window wide open.
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": 0, "calling_end_hour": 23}
+        )
+        checkout = checkouts_repo.create_checkout(real_merchant_id, amount_paise=300_000)
+        cid = checkout["checkout_id"]
+        checkouts_repo.queue_for_rail_recovery(cid)
+
+        await sweeper._drain_recovery_queue()
+
+        released = await wait_until(
+            lambda: any(
+                e["event_type"] == "checkout.payment_failed"
+                and e["payload"].get("checkout_id") == cid
+                and e["payload"].get("released_from_queue")
+                for e in bus._event_log
+            )
+        )
+        assert released, "a held cart must be reconsidered once the window opens"
+        assert checkouts_repo.get_checkout(cid)["recovery_queued_at"] is None
+
+    @pytest.mark.real_clock
+    async def test_it_stays_held_while_the_window_is_still_shut(self, real_merchant_id):
+        from app.db.repositories import checkouts as checkouts_repo
+        from app.db.repositories import policies as policies_repo
+        from app.gateway import sweeper
+
+        now = datetime.now(outreach_guards.IST)
+        shut = (now.hour + 2) % 24
+        policies_repo.update_policy(
+            real_merchant_id, {"calling_start_hour": shut, "calling_end_hour": (shut + 1) % 24}
+        )
+        checkout = checkouts_repo.create_checkout(real_merchant_id, amount_paise=300_000)
+        cid = checkout["checkout_id"]
+        checkouts_repo.queue_for_rail_recovery(cid)
+
+        await sweeper._drain_recovery_queue()
+
+        assert checkouts_repo.get_checkout(cid)["recovery_queued_at"] is not None, (
+            "draining early would defeat the purpose of holding it"
         )
