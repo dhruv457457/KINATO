@@ -735,6 +735,107 @@ produce instead.
 
 ---
 
+## 17. Every budget in this system was fiction, because the database was 8,000 km away
+
+The call agent worked and then died, always on the same turn. Turns where it
+only talks answered in 2.0–2.3s. The turn where the customer says *"yes, send
+it"* blew the 11s ceiling every time. The production log dates the pieces:
+
+```
++0.00  customer speech in
++1.47  LLM #1 returns
++4.91  PolicyEngine evaluates       <- check_offer's DB work  = 3.44s
++6.90  agent.tool_called published  <- ONE audit write        = 1.99s
++7.60  LLM #2 returns
++11.0  CUT OFF, issue_offer still running
+```
+
+Two seconds to write one audit row is not a query. Nothing about that row is
+expensive. It is `INSERT` plus a redundant `SELECT` — two round trips — and
+each round trip was costing about a second.
+
+Railway was deployed in `ams`, Amsterdam. Supabase is `ap-northeast-2`,
+Seoul. Roughly 8,600 km, badly routed, on every single database call, and the
+money turn makes about twelve of them in sequence.
+
+The evidence had been sitting in this repo for weeks, already written down
+and already misread. `policies.py` carries a comment recording a single-row
+indexed SELECT measured at **2365ms and 2795ms**, which is why a 60-second
+policy cache exists at all. Finding #9 records three *concurrent* reads
+timing **80% slower** than three sequential ones — concurrency forced new
+connections, and establishing one cost more than the overlap saved. Both were
+treated as facts about Supabase to be worked around. Both were the same fact
+about geography, and it was fixable in a dropdown.
+
+**Every latency constant in the codebase had been tuned against this.**
+`VOICE_DEADLINE_S` was cut 9.0 → 7.5 after a live call died. The tool
+descriptions were rewritten to stop the model making a second DB-backed call.
+The system prompt was trimmed from 1048 characters to 391. Each of those was
+a real improvement and each was reasoned about carefully, and together they
+were an elaborate accommodation of a misconfiguration. **Tuning is what you
+do when you have accepted a number you should have questioned.**
+
+### The shield was killing the thing it protected
+
+Finding #2 is about `issue_offer` being cancelled mid-flight, leaving a real
+payment link created and unrecorded while the customer was told someone would
+follow up. The fix was to shield money actions from the deadline and wait for
+them. It read as careful. It was:
+
+```python
+await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=grace_s)
+```
+
+`asyncio.gather` propagates cancellation to its children. When `wait_for`
+timed out it cancelled the gather, which cancelled the shielded `issue_offer`
+tasks — and the handler then logged *"did not settle within 6.0s"* about
+tasks it had just killed itself. **The code written to prevent the
+half-applied effect was the code producing it,** and its log line described
+the symptom while hiding the cause.
+
+Worse, the tasks were only referenced by a list owned by the `run_agent`
+frame. asyncio holds tasks *weakly*. When the outer 11s timeout cancelled
+that frame, an in-flight Razorpay call could simply be garbage collected —
+the same class of bug `_spawn_write` had already been invented to fix
+elsewhere in the codebase, on the write that records that a payment link was
+sent.
+
+`asyncio.wait` does not cancel on timeout. The grace now ends the *waiting*,
+never the work; a module-level set holds the tasks so nothing can collect
+them. Both are covered by tests that fail against the old code — verified by
+restoring it.
+
+### The server was never crashing
+
+*"When the policy engine starts, the Twilio server stops"* was reported
+repeatedly and read as a crash. There was no crash. The razorpay SDK is
+synchronous `requests`, and it was being called directly from a coroutine —
+so it did not merely block that call, it froze the whole event loop, and
+every other live call's Twilio webhook went unanswered for its duration.
+`record_audit` was doing the same thing for two round trips per tool call.
+**A frozen event loop and a dead process are indistinguishable from
+outside,** and we spent weeks debugging the wrong one.
+
+### And a round trip nobody was buying anything with
+
+`voice_runtime` already prefers its own wording after `issue_offer` and
+`record_opt_out`, because what is said once money has moved has to be true
+about what moved. But the runtime still routed back to the model for a
+closing sentence after every tool call — a full round trip whose output the
+caller had always intended to discard. On the turn that blew the budget, it
+was one of the two model calls in it.
+
+The lesson is the one this project keeps relearning from the other side.
+Findings #14 and #15 are about guarantees that lived in a prompt and
+therefore did not hold. This is about *budgets* that lived in constants and
+therefore did not hold: 7.5s reasoning + 6.0s settle + 2.0s speech = 15.5s,
+wrapped in an 11.0s timeout, inside Twilio's 15.0s. Five numbers, each with a
+careful comment explaining it, that could not all be true at once. Nothing
+was checking. `tests/test_turn_budget.py` checks now — **arithmetic a comment
+asserts is arithmetic nobody has done.**
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim
