@@ -920,6 +920,80 @@ It tripped its own guard. The test caught it.
 
 ---
 
+## 19. "Great news — I've sent that offer" was reachable on a turn where nothing was sent
+
+FINDINGS #2 is a real payment link created and never recorded, while the
+customer was told someone would follow up. This is the same rule broken the
+other way, and it had been sitting in the reply path the whole time.
+
+`runtime.py` appends a tool's name to `tool_calls_made` the moment it returns,
+**before** looking at whether it worked:
+
+```python
+result = await asyncio.shield(inner)
+state["tool_calls_made"].append(tool.name)     # <- unconditional
+_reason = result.get("reason") ...             # <- the check, afterwards
+```
+
+That is deliberate — the batch scoreboard needs the record of everything that
+executed even when the turn later times out. But `voice_runtime` then chose
+what to *say* from the same list:
+
+```python
+if "issue_offer" in result.tool_calls_made:
+    reply_text = ... or "Great news - I've sent that offer to your email."
+```
+
+So a **refused** `issue_offer` reached the branch reserved for a successful
+one. Normally the graph loops back to the model, which writes real prose, and
+the canned line is never used. The hole is the turns where it doesn't:
+`max_iterations_reached` sets `content: None` with **`ok=True, degraded=False`**
+— a *non-degraded success* path — and a hit deadline sets `output=None`. Both
+land on empty content, both match the first branch, and the agent tells a
+customer their offer is on its way having sent nothing.
+
+The `record_opt_out` version is worse. It is not only a false sentence: the
+call **ends** on it (`_escalation_twiml` + `<Hangup/>`), so the customer hears
+*"Understood, I won't contact you about this again"*, cannot say it twice
+because the line is dead, and the opt-out was never written down — so the next
+attempt dials them anyway. **A promise never to call someone again, made while
+failing to record it, is the one thing in this system it is least acceptable to
+get wrong.**
+
+The fix needed no new data. `result.refusals` was already on the same object,
+and already read *fifteen lines earlier* to drive the barrier-confirmation
+state machine. The reply branches now ask `_tool_succeeded()` instead of
+`in tool_calls_made` — conservative by construction: if any attempt of that
+tool was refused this turn, it does not count, even if a later one worked.
+Understating a send costs one extra sentence; overstating one cannot be taken
+back.
+
+### The half that made it invisible
+
+The guard above is only worth as much as what reaches `refusals`, and the
+tracker only recorded reasons starting with `REJECTED_`. Every structured code
+matches that — `REJECTED_CEILING`, `REJECTED_LOW_CONFIDENCE` — but two real
+failures do not:
+
+- `payment_execution_failed: ...` — **what Razorpay returns when it refuses**
+- `degraded_agent_cannot_mutate` — the degraded gate
+
+So on the call where Razorpay had run out of test payment links, the tool
+failed four times, `refusals` stayed **empty**, and every downstream question
+of the form "did that work?" was answered *yes, by omission*. The most
+important refusal in the system was the one it could not see.
+
+Both halves are pinned by tests written to fail first — verified by restoring
+the old condition and watching the Razorpay case go undetected again. The
+scoreboard is unaffected: it tallies refusal codes from `audit_log` rows, not
+from this tracker.
+
+The general shape, for the third time in this file: **a list that means
+"attempted" must never be read as a list that means "succeeded"**, and the
+distance between those two readings is exactly one word of a variable name.
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim

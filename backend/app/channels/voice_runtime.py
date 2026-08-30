@@ -389,6 +389,35 @@ def solicits_card_details(text: str) -> bool:
     return bool(text) and bool(_CARD_SOLICITATION.search(text))
 
 
+def _tool_succeeded(result, tool: str) -> bool:
+    """Did this tool actually DO the thing, or merely get attempted?
+
+    `tool_calls_made` means "ran", not "worked" - runtime.py appends the name
+    immediately after execution, before looking at the result, and that is
+    deliberate: the batch scoreboard needs the record of everything that
+    executed even when the turn later times out.
+
+    But the reply below is a statement to a customer about their money, and
+    "attempted" is not a thing worth saying out loud. A refused issue_offer
+    used to reach the same branch as a successful one, so on any turn where
+    the model then produced no closing sentence - max_iterations_reached and
+    a hit deadline both do exactly that - the agent said "I've sent that
+    offer to your email" having sent nothing.
+
+    The answer was already on the same object, fifteen lines from where it
+    was needed: `refusals` is read just above to drive the
+    barrier-confirmation state machine.
+
+    Conservative by construction: if ANY attempt of this tool was refused
+    this turn, it does not count as succeeded, even if a later attempt
+    worked. Understating a send costs one extra sentence; overstating one
+    cannot be taken back.
+    """
+    if tool not in (result.tool_calls_made or []):
+        return False
+    return not any(r.get("tool") == tool for r in (result.refusals or []))
+
+
 def _build_system_prompt(
     customer_name: str,
     item_description: str,
@@ -842,11 +871,16 @@ async def _run_agent_turn(
     # played anyway because the wrapping result looked degraded). The
     # customer must never be told "we'll follow up" when something real
     # already happened this turn.
-    if "issue_offer" in result.tool_calls_made:
+    #
+    # _tool_succeeded, not `in tool_calls_made`: that list records what RAN,
+    # including what was refused, so the canned lines below - which are
+    # claims about money and about consent - were reachable after a refusal
+    # on any turn where the model produced no text of its own.
+    if _tool_succeeded(result, "issue_offer"):
         reply_text = result.output.get("content") if (result.output or {}).get("content") else (
             "Great news - I've sent that offer to your email, you should see it any moment."
         )
-    elif "record_opt_out" in result.tool_calls_made:
+    elif _tool_succeeded(result, "record_opt_out"):
         reply_text = result.output.get("content") if (result.output or {}).get("content") else (
             "Understood, I won't contact you about this again. Take care."
         )
@@ -888,7 +922,13 @@ async def _run_agent_turn(
 
     await _record_turn(session, turns_repo.AGENT, reply_text)
 
-    if "record_opt_out" in result.tool_calls_made:
+    # Only hang up on a RECORDED opt-out. Ending the call here on a refused
+    # one is the worst version of this bug: the customer hears "I won't
+    # contact you about this again", the call ends so they cannot say it
+    # twice, and nothing was written down - so the next attempt dials them
+    # anyway. A promise never to call someone again, made while failing to
+    # record it, is the one this system least deserves to get wrong.
+    if _tool_succeeded(result, "record_opt_out"):
         agent_runtime.discard_thread(call_id)
         return Response(content=_escalation_twiml(reply_text), media_type="text/xml")
 

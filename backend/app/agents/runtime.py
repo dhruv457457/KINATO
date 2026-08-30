@@ -271,8 +271,25 @@ def _build_graph(
                 # reading the model's own prose back. Same survives-a-
                 # timeout reasoning as tool_calls_tracker above.
                 _reason = result.get("reason") if isinstance(result, dict) else None
-                if isinstance(_reason, str) and _reason.startswith("REJECTED_"):
-                    refusals_tracker.append({"tool": tool.name, "reason": _reason})
+                _status = result.get("status") if isinstance(result, dict) else None
+                # Any refusal, not only the ones whose reason happens to be
+                # spelled REJECTED_*.
+                #
+                # The structured codes (REJECTED_CEILING, REJECTED_LOW_
+                # CONFIDENCE, ...) all match that prefix, but two very real
+                # failures do not: "payment_execution_failed: ..." when
+                # Razorpay refuses, and "degraded_agent_cannot_mutate" from
+                # the degraded gate. So on the call where Razorpay had run
+                # out of payment links, the tool failed, the caller's
+                # refusals list stayed empty, and every downstream check that
+                # asks "did this work?" was told yes by omission.
+                _refused = (
+                    isinstance(_reason, str) and _reason.startswith("REJECTED_")
+                ) or _status in ("REJECTED", "ERROR")
+                if _refused:
+                    refusals_tracker.append(
+                        {"tool": tool.name, "reason": _reason or str(_status)}
+                    )
                 elif tool.terminal and isinstance(result, dict) and result.get("status") not in ("REJECTED", "ERROR"):
                     # This tool ENDS the turn, so the graph must not route
                     # back to the model for a closing sentence. That round
