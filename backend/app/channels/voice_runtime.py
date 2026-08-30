@@ -41,6 +41,7 @@ the model calling record_opt_out, which revokes real consent immediately.
 The discount ladder lives entirely in merchant_policies, never in a prompt.
 """
 import asyncio
+import contextvars
 import dataclasses
 import json
 import time
@@ -101,21 +102,29 @@ voice_router = APIRouter()
 # The durable fix was removing the redundancy - check_offer already loads the
 # cart and policy itself, so the tool descriptions and prompt now tell the
 # model to call it directly - but the budget also needs to fit a real
-# check_offer -> issue_offer sequence: ~2 tool calls plus 2-3 model round
-# trips. 9s covers that, and with voice_block capped at 2s the worst case is
-# ~11s, still inside Twilio's ~15s deadline.
-VOICE_MAX_ITERATIONS = 4
-# Cut from 9.0 after a live call died on the turn where check_offer ran.
+# check_offer -> issue_offer sequence.
 #
-# That turn is the expensive one by construction - two model round trips
-# around a tool that itself reads the cart and the policy - and it is also
-# the turn that matters most, because it is where money is discussed. The
-# arithmetic that has to hold is: reasoning + one TTS attempt + the guard
-# read, all inside Twilio's ~15s. At 9.0 the worst case had no margin left
-# for a slow database, and the customer heard Twilio's error instead of an
-# offer. Losing a little reasoning degrades one turn; losing the deadline
-# ends the call.
-VOICE_DEADLINE_S = 7.5
+# That sequence is now two model round trips rather than three: issue_offer
+# is a terminal tool, so the runtime no longer goes back to the model for a
+# closing sentence the caller was always going to discard (see
+# agents/tools.py's `terminal` field). And the budget is no longer a
+# constant at all - see _remaining_reasoning_budget below.
+VOICE_MAX_ITERATIONS = 4
+# A floor and a ceiling, not the budget itself.
+#
+# This used to be a flat 7.5s, cut from 9.0 after a live call died on the
+# check_offer turn. A fixed number is the wrong shape: it has to assume the
+# worst about everything that already happened this turn (session
+# rehydration on a restarted worker, the paid-guard read), and on a warm
+# turn where none of that cost anything it throws the slack away. The turn
+# that blew the budget was starved of reasoning time that was sitting
+# unused.
+#
+# _respond now DERIVES the real deadline from the wall clock - see
+# _remaining_reasoning_budget - and these two only stop the derived value
+# from being absurd in either direction.
+VOICE_DEADLINE_MIN_S = 4.0
+VOICE_DEADLINE_MAX_S = 10.0
 
 # --- Surviving speech-to-text ------------------------------------------
 # Twilio posts a `Confidence` float (0.0-1.0) with every SpeechResult, and
@@ -158,7 +167,46 @@ TURN_BUDGET_WARN_S = 10.0
 # Twilio's deadline so there is still time to render and return a spoken
 # line after the cut - a timeout that fires at the deadline is worth
 # nothing, because answering late is the same as not answering.
-TURN_HARD_TIMEOUT_S = 11.0
+#
+# Raised 11.0 -> 12.5. The 11.0 implicitly reserved ~4s to answer after the
+# cut, but the cut-off branch returns a literal <Say> with no network call
+# at all: it costs microseconds, not seconds. That reserve was 1.5s of
+# reasoning being left on the table on every single turn for nothing.
+TURN_HARD_TIMEOUT_S = 12.5
+
+# What a turn still has to do AFTER the agent stops reasoning: render one
+# TTS line and return the TwiML. The reasoning budget is whatever is left
+# once these are set aside, which is what makes the arithmetic below add up
+# by construction rather than by three constants agreeing with each other
+# by hand. tests/test_turn_budget.py asserts it.
+TTS_BUDGET_S = 2.0
+RESPONSE_RESERVE_S = 0.4
+
+# When this turn started, per request. A ContextVar rather than a parameter
+# because the turn's start is set in the outermost handler and needed
+# several frames down; asyncio copies the context into the task that
+# wait_for creates, so each concurrent call reads its own.
+_turn_started: contextvars.ContextVar[float] = contextvars.ContextVar("kinato_turn_started", default=0.0)
+
+
+def _remaining_reasoning_budget() -> float:
+    """How long the agent may reason, given what this turn has already spent.
+
+    The old flat VOICE_DEADLINE_S had to assume the worst about everything
+    before it - a cold session rehydration, a slow paid-guard read - on
+    every turn, including the turns where none of that happened. This asks
+    the clock instead. What is left after setting aside one TTS render and
+    the time to return TwiML is the budget, and it shrinks on its own when
+    the turn has already been expensive rather than being wrong about it in
+    advance.
+    """
+    started = _turn_started.get()
+    if not started:
+        # No turn clock (a direct unit-test call, the batch harness). Fall
+        # back to the ceiling rather than inventing a number.
+        return VOICE_DEADLINE_MAX_S
+    remaining = TURN_HARD_TIMEOUT_S - (time.monotonic() - started) - TTS_BUDGET_S - RESPONSE_RESERVE_S
+    return max(VOICE_DEADLINE_MIN_S, min(VOICE_DEADLINE_MAX_S, remaining))
 
 # The keypad. This is the ONLY input path in the system that speech
 # recognition cannot corrupt - a DTMF digit arrives as a digit, at
@@ -731,7 +779,7 @@ async def _run_agent_turn(
         tools=ALL_TOOLS,
         thread_id=call_id,
         max_iterations=VOICE_MAX_ITERATIONS,
-        deadline_s=VOICE_DEADLINE_S,
+        deadline_s=_remaining_reasoning_budget(),
     )
 
     # The discount was refused for want of a confirmed barrier. The agent's
@@ -872,6 +920,10 @@ async def twilio_voice_respond(request: Request):
     everything around it.
     """
     started = time.monotonic()
+    # Everything downstream derives its own budget from this one clock (see
+    # _remaining_reasoning_budget). Set before the task is created so the
+    # task inherits it.
+    _turn_started.set(started)
     try:
         # A hard ceiling on the whole turn, not just on the reasoning.
         #

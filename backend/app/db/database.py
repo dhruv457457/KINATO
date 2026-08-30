@@ -77,6 +77,35 @@ def _resolve_ipv4_hostaddr(database_url: str):
         return None
 
 
+# How many connections the pool keeps open from the start.
+#
+# This was 1, and the cost of that is not obvious until you measure it: a
+# single-row indexed SELECT was timed at 2365ms and 2795ms from Railway (see
+# repositories/policies.py), and FINDINGS records three CONCURRENT reads
+# measuring 80% slower than three sequential ones. Neither number is about
+# queries. They are handshakes - with minconn=1, every connection past the
+# first is established on demand, and a voice call opens several at once.
+#
+# A live call cannot afford to discover that. Pay for the connections at
+# boot, when nobody is on the phone.
+POOL_MIN_CONNECTIONS = 5
+POOL_MAX_CONNECTIONS = 20
+
+# libpq keepalives. Supabase reaps idle connections; without these, a pooled
+# connection can be dead-but-look-alive, and the failure surfaces mid-call as
+# a query that has to re-handshake before it can even start. The numbers are
+# deliberately well inside a typical idle timeout.
+_KEEPALIVE_KWARGS = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    # Makes a slow query attributable in Supabase's own dashboard instead of
+    # showing up as an anonymous connection.
+    "application_name": "kinato-backend",
+}
+
+
 def init_pool():
     global db_pool, USE_SQLITE
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -84,9 +113,11 @@ def init_pool():
     if PSYCOPG2_AVAILABLE and settings.DATABASE_URL and not settings.DATABASE_URL.startswith("sqlite"):
         ipv4_addr = _resolve_ipv4_hostaddr(settings.DATABASE_URL)
         pool_kwargs = {"hostaddr": ipv4_addr} if ipv4_addr else {}
+        pool_kwargs.update(_KEEPALIVE_KWARGS)
         try:
             db_pool = psycopg2.pool.ThreadedConnectionPool(
-                1, 20, dsn=settings.DATABASE_URL, connect_timeout=4, **pool_kwargs
+                POOL_MIN_CONNECTIONS, POOL_MAX_CONNECTIONS,
+                dsn=settings.DATABASE_URL, connect_timeout=4, **pool_kwargs
             )
             # Test connection
             conn = db_pool.getconn()
@@ -102,7 +133,10 @@ def init_pool():
                 # genuinely IPv6-only).
                 logger.warning(f"PostgreSQL connection via forced IPv4 failed ({e}); retrying with default DNS resolution.")
                 try:
-                    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=settings.DATABASE_URL, connect_timeout=4)
+                    db_pool = psycopg2.pool.ThreadedConnectionPool(
+                        POOL_MIN_CONNECTIONS, POOL_MAX_CONNECTIONS,
+                        dsn=settings.DATABASE_URL, connect_timeout=4, **_KEEPALIVE_KWARGS
+                    )
                     conn = db_pool.getconn()
                     db_pool.putconn(conn)
                     USE_SQLITE = False
@@ -370,3 +404,32 @@ async def run_db_async(fn: Callable[..., T], *args, **kwargs) -> T:
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_db_executor, functools.partial(fn, *args, **kwargs))
+
+
+async def prewarm_pool(connections: int = 6) -> None:
+    """Open and exercise several pooled connections at once, off the clock.
+
+    A voice call issues a burst of queries, and a burst is exactly the shape
+    that costs the most here: FINDINGS records three concurrent reads timing
+    80% SLOWER than three sequential ones, because sequential calls reuse one
+    hot connection while concurrency forces new ones, and establishing a
+    connection to Supabase costs more than the overlap saves.
+
+    So establish them while the phone is still ringing. Call this before
+    dialling, never during a turn - the whole point is that it happens where
+    there is no deadline. Failures are ignored: a warm pool is an
+    optimisation, and a call must not fail because it could not be warmed.
+    """
+    if USE_SQLITE or db_pool is None:
+        return
+
+    def _touch() -> None:
+        with get_db() as conn:
+            conn.cursor().execute("SELECT 1")
+
+    try:
+        await asyncio.gather(
+            *(run_db_async(_touch) for _ in range(connections)), return_exceptions=True
+        )
+    except Exception as e:  # pragma: no cover - defensive; gather already absorbs
+        logger.debug(f"Pool prewarm did not complete (non-fatal): {e}")

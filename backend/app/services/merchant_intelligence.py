@@ -1,9 +1,10 @@
 import logging
 import os
 import json
-import httpx
 from typing import Dict, Any
 from dotenv import load_dotenv
+from app.core.config import settings
+from app.core.net import shared_ipv4_client
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import audit as audit_repo
 
@@ -90,28 +91,37 @@ class MerchantIntelligenceAgent:
 
         if OPENROUTER_API_KEY:
             try:
-                async with httpx.AsyncClient(timeout=4.5) as client:
-                    res = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                        json={
-                            "model": "openai/gpt-4o-mini",
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            "max_tokens": 250,
-                            "temperature": 0.5,
-                        },
-                    )
-                    if res.status_code == 200:
-                        answer = res.json()["choices"][0]["message"]["content"]
-                        return {
-                            "question": question,
-                            "answer": answer,
-                            "metrics": context_summary,
-                            "source": "llm",
-                        }
+                # shared_ipv4_client, not a bare httpx.AsyncClient: this was
+                # the one LLM call site that bypassed app/core/net.py
+                # entirely, so it kept the black-holed-IPv6 failure that
+                # module exists to prevent, and paid a fresh handshake every
+                # time on top.
+                #
+                # The model and base URL come from settings now. Hardcoding
+                # them here meant a provider swap would silently leave this
+                # endpoint on the old one, still billing, still slow.
+                client = shared_ipv4_client("llm", timeout=4.5)
+                res = await client.post(
+                    f"{settings.LLM_BASE_URL.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                    json={
+                        "model": settings.LLM_MODEL,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "max_tokens": 250,
+                        "temperature": 0.5,
+                    },
+                )
+                if res.status_code == 200:
+                    answer = res.json()["choices"][0]["message"]["content"]
+                    return {
+                        "question": question,
+                        "answer": answer,
+                        "metrics": context_summary,
+                        "source": "llm",
+                    }
             except Exception as e:
                 logger.warning(f"MerchantIntel LLM call failed: {e}")
 

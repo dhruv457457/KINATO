@@ -18,7 +18,11 @@ class Settings(BaseSettings):
     # LLM Settings (OpenRouter)
     OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API Key")
     LLM_BASE_URL: str = Field(default="https://openrouter.ai/api/v1", description="LLM Base URL")
-    LLM_MODEL: str = Field(default="openrouter/free", description="LLM Model")
+    # A real, routable slug. The old default was "openrouter/free", which is
+    # not a model OpenRouter will serve - so any deployment that forgot to
+    # set LLM_MODEL degraded every agent run and looked like a model
+    # problem rather than a missing config line.
+    LLM_MODEL: str = Field(default="openai/gpt-4o-mini", description="LLM Model")
 
     # Razorpay Credentials (Loaded strictly from .env)
     RAZORPAY_KEY_ID: str = Field(default="", description="Razorpay Key ID")

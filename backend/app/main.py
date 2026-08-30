@@ -21,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
 
+from app.core.net import close_shared_clients
+from app.db.database import prewarm_pool
 from app.api.dashboard import router as dashboard_router
 from app.api.recovery_actions import actions_router
 from app.api.triggers import trigger_router
@@ -61,8 +63,17 @@ async def lifespan(app: FastAPI):
     # Replaces the old per-checkout asyncio.sleep task (lost on restart, and
     # unsafe across multiple worker processes) - see app/gateway/sweeper.py.
     sweeper_task = asyncio.create_task(run_sweeper_loop())
+    # Open the database connections a call will need before any call needs
+    # them - a cold connection is the most expensive thing on a live turn.
+    # Named, not bare create_task: asyncio references tasks weakly and a
+    # collected warm-up is a warm-up that silently never happened.
+    warmup_task = asyncio.create_task(prewarm_pool())
     yield
+    warmup_task.cancel()
     sweeper_task.cancel()
+    # The shared HTTP clients (OpenRouter, ElevenLabs) hold keepalive
+    # connections open on purpose; this is where they are given back.
+    await close_shared_clients()
 
 
 app = FastAPI(title="Kinato Core Server — Autonomous Revenue Infrastructure", lifespan=lifespan)

@@ -52,6 +52,19 @@ MAX_ITERATIONS = 4
 # two consecutive scoreboard runs at 0.2, which made it impossible to tell
 # a real regression from sampling noise.
 LLM_TEMPERATURE = 0.2
+
+# Latency scales with how much the model decides to write, and this was
+# unbounded. A line that is about to be READ ALOUD to someone on a phone
+# needs very few tokens; a paragraph is a worse call as well as a slower
+# one.
+#
+# Generous rather than tight on purpose. Truncating mid-tool-call produces
+# an unparseable arguments blob, which json.loads turns into `{}`, which
+# becomes a TypeError on a missing required argument, which execute_tool
+# files as a quiet "REJECTED: bad_arguments" - recoveries would simply stop
+# happening with nothing in the logs pointing at why. See the finish_reason
+# check below, which refuses to guess at a truncated response.
+LLM_MAX_TOKENS = 400
 DEFAULT_DEADLINE_S = 8.0
 
 # Multi-turn history per conversation (see module docstring for why this is
@@ -62,16 +75,68 @@ DEFAULT_DEADLINE_S = 8.0
 # split from the rebuild plan.
 _conversation_store: Dict[str, List[Dict[str, Any]]] = {}
 
+# Strong references to money actions that are still running.
+#
+# `inflight_mutations` below is owned by a run_agent frame. When the
+# CALLER's outer timeout (voice_runtime's TURN_HARD_TIMEOUT_S) fires, that
+# frame is cancelled and destroyed - and asyncio holds only WEAK references
+# to running tasks, so an issue_offer that is mid-Razorpay-call could
+# simply be garbage collected. Shielding does not help here: a shield
+# protects against cancellation, not against nobody holding the task at
+# all.
+#
+# This set is that holder, taken at creation and released on completion. It
+# is what makes "a money action that has started always finishes" true for
+# the outer clock as well as the inner one.
+_MONEY_TASKS: set = set()
+
+
+# One OpenAI client per event loop, not per model round trip.
+#
+# This used to build a fresh AsyncOpenAI - and with it a fresh httpx pool -
+# on every single call_model node execution, so each of the two-to-three
+# model round trips in a turn paid DNS + TCP + TLS before sending a byte.
+# Keyed by loop for the same reason as net.py's cache: a client binds its
+# pool to the loop that first used it, and the test suite runs one loop per
+# test.
+# Keyed on the credentials too, not just the loop: a test (or a provider
+# swap at runtime) that changes LLM_BASE_URL or the key must not silently
+# keep talking to the old endpoint through a cached client.
+_LLM_CLIENTS: Dict[tuple, Any] = {}
+
 
 def _get_llm_client():
+    # Read the key on every call, deliberately. Returning None here is the
+    # DEGRADATION GATE - it is what forces the heuristic, non-mutating path
+    # in call_model - and a client built once at import time would read the
+    # setting once at import time, breaking both that gate and every test
+    # that patches settings.
     if not settings.OPENROUTER_API_KEY:
         return None
-    from openai import AsyncOpenAI
-    from app.core.net import ipv4_client
 
-    # ipv4_client: diagnosed live - repeated OpenRouter ConnectTimeouts on
-    # this machine, same root cause as ElevenLabs's (see app/core/net.py).
-    return AsyncOpenAI(base_url=settings.LLM_BASE_URL, api_key=settings.OPENROUTER_API_KEY, http_client=ipv4_client())
+    from openai import AsyncOpenAI
+    from app.core.net import ipv4_client, shared_ipv4_client
+
+    try:
+        loop_key = id(asyncio.get_running_loop())
+    except RuntimeError:
+        # ipv4_client (not shared): diagnosed live - repeated OpenRouter
+        # ConnectTimeouts, same black-holed-IPv6 root cause as ElevenLabs's
+        # (see app/core/net.py).
+        return AsyncOpenAI(
+            base_url=settings.LLM_BASE_URL, api_key=settings.OPENROUTER_API_KEY, http_client=ipv4_client()
+        )
+
+    key = (loop_key, settings.LLM_BASE_URL, settings.OPENROUTER_API_KEY)
+    client = _LLM_CLIENTS.get(key)
+    if client is None:
+        client = AsyncOpenAI(
+            base_url=settings.LLM_BASE_URL,
+            api_key=settings.OPENROUTER_API_KEY,
+            http_client=shared_ipv4_client("llm"),
+        )
+        _LLM_CLIENTS[key] = client
+    return client
 
 
 def _build_graph(
@@ -110,6 +175,7 @@ def _build_graph(
                 messages=state["messages"],
                 tools=[t.to_openai_schema() for t in tools],
                 temperature=LLM_TEMPERATURE,
+                max_tokens=LLM_MAX_TOKENS,
                 timeout=6.0,
             )
         except Exception as e:
@@ -118,7 +184,24 @@ def _build_graph(
             state["final"] = {"degraded": True, "reason": f"llm_call_failed: {e.__class__.__name__}"}
             return state
 
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
+
+        # A response cut off by max_tokens is not a response. If it was
+        # cut off MID TOOL CALL the arguments JSON is unparseable, and the
+        # failure is silent all the way down: json.loads -> {} -> TypeError
+        # on a missing argument -> a "REJECTED: bad_arguments" audit row
+        # that looks like the model choosing badly rather than a truncated
+        # payload. Degrade here, where it can still be named.
+        if getattr(choice, "finish_reason", None) == "length" and message.tool_calls:
+            logger.warning(
+                "Agent response was truncated by max_tokens mid tool call - degrading rather "
+                "than acting on a partial tool-call payload."
+            )
+            state["ctx"] = dataclasses.replace(ctx, degraded=True, allow_mutations=False, source="heuristic")
+            state["final"] = {"degraded": True, "reason": "llm_response_truncated"}
+            return state
+
         message_dict: Dict[str, Any] = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
             message_dict["tool_calls"] = [
@@ -141,6 +224,7 @@ def _build_graph(
         tool_calls = last_message.get("tool_calls") or []
         state["iterations"] += 1
 
+        terminal_tools: List[str] = []
         read_calls, mutating_calls = [], []
         for tc in tool_calls:
             name = tc["function"]["name"]
@@ -173,6 +257,8 @@ def _build_graph(
                     # unawaitable - which is precisely the half-applied effect
                     # this is meant to prevent.
                     inner = asyncio.create_task(execute_tool(tool, args, ctx))
+                    _MONEY_TASKS.add(inner)
+                    inner.add_done_callback(_MONEY_TASKS.discard)
                     inflight_mutations.append((tool.name, inner))
                     result = await asyncio.shield(inner)
                 else:
@@ -187,6 +273,17 @@ def _build_graph(
                 _reason = result.get("reason") if isinstance(result, dict) else None
                 if isinstance(_reason, str) and _reason.startswith("REJECTED_"):
                     refusals_tracker.append({"tool": tool.name, "reason": _reason})
+                elif tool.terminal and isinstance(result, dict) and result.get("status") not in ("REJECTED", "ERROR"):
+                    # This tool ENDS the turn, so the graph must not route
+                    # back to the model for a closing sentence. That round
+                    # trip is what pushed the "yes, send it" turn past
+                    # Twilio's window on a live call - and the caller throws
+                    # the sentence away regardless: voice_runtime prefers its
+                    # own line for exactly these tools, because what is said
+                    # here has to be true about money that has already moved.
+                    # Paying a model to write text nobody reads is the
+                    # cheapest second in this system to give back.
+                    terminal_tools.append(tool.name)
             return {"tool_call_id": tc["id"], "role": "tool", "name": name, "content": json.dumps(result)}
 
         # Read-only tools run concurrently; mutating tools run strictly
@@ -207,6 +304,20 @@ def _build_graph(
         # only a node's *return value* is merged into state).
         if state["iterations"] >= max_iterations:
             state["final"] = {"degraded": False, "reason": "max_iterations_reached", "content": None}
+
+        # `content: None` is deliberate. The CALLER owns the line for a
+        # terminal tool (voice_runtime's issue_offer / record_opt_out
+        # branches, which already prefer their own wording over the
+        # model's), and None routes straight to it without the model being
+        # asked at all. Not degraded: the turn did exactly what it set out
+        # to do, which is the opposite of degraded.
+        if terminal_tools and state.get("final") is None:
+            state["final"] = {
+                "degraded": False,
+                "reason": "terminal_tool",
+                "content": None,
+                "terminal_tool": terminal_tools[0],
+            }
 
         return state
 
@@ -265,7 +376,22 @@ async def run_agent(
     refusals_tracker: List[Dict[str, str]] = []
     graph = _build_graph(tools, max_iterations, tool_calls_tracker, inflight_mutations, refusals_tracker)
 
-    async def _settle_inflight_mutations(grace_s: float = 6.0) -> None:
+    async def _settle_inflight_mutations(grace_s: float = 2.0) -> None:
+        """Give a money action a moment to land, then DETACH - never cancel.
+
+        This used to be `asyncio.wait_for(asyncio.gather(...))`, which is a
+        trap: gather propagates cancellation to its children, so when the
+        timeout fired it cancelled the very issue_offer tasks the shield
+        exists to protect, and then logged "did not settle" about tasks it
+        had just killed. That is the half-applied effect described in
+        run_one's comment, produced by the code written to prevent it.
+
+        `asyncio.wait` does not cancel on timeout. Anything still running
+        when the grace elapses keeps running to completion, held by
+        _MONEY_TASKS, and is simply no longer waited on - the conversation
+        turn ends, the money action does not. The grace is short for the
+        same reason: the customer is on the phone, and Twilio is counting.
+        """
         pending = [(n, t) for n, t in inflight_mutations if not t.done()]
         if not pending:
             return
@@ -273,10 +399,13 @@ async def run_agent(
             f"Deadline hit with {len(pending)} money action(s) still running "
             f"({[n for n, _ in pending]}) - waiting for them rather than reporting a half-applied effect."
         )
-        try:
-            await asyncio.wait_for(asyncio.gather(*(t for _, t in pending), return_exceptions=True), timeout=grace_s)
-        except asyncio.TimeoutError:
-            logger.error(f"Money action(s) {[n for n, _ in pending]} did not settle within {grace_s}s.")
+        await asyncio.wait([t for _, t in pending], timeout=grace_s)
+        still_running = [n for n, t in inflight_mutations if not t.done()]
+        if still_running:
+            logger.error(
+                f"Money action(s) {still_running} did not settle within {grace_s}s - "
+                "detaching; they keep running and will complete."
+            )
         for name, task in inflight_mutations:
             if task.done() and not task.cancelled() and task.exception() is None and name not in tool_calls_tracker:
                 tool_calls_tracker.append(name)

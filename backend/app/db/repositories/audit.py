@@ -29,21 +29,34 @@ def record_audit(
             INSERT INTO audit_log (audit_id, merchant_id, correlation_id, actor, action,
                                     args, result, decision, degraded, latency_ms)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
             """,
             (audit_id, merchant_id, correlation_id, actor, action,
              json.dumps(args or {}), json.dumps(result or {}), decision, degraded, latency_ms),
         )
-        cursor.execute("SELECT * FROM audit_log WHERE audit_id = %s", (audit_id,))
+        # RETURNING, not a follow-up SELECT. The row was already in hand
+        # after the INSERT; asking for it again cost a second round trip,
+        # and from Railway a round trip is not microseconds.
         return dict(cursor.fetchone())
 
 
 def get_audit_trail_for_correlation(correlation_id: str) -> List[Dict[str, Any]]:
     """Everything that happened for one checkout/recovery attempt, in order -
-    this is what backs the recovery detail drawer."""
+    this is what backs the recovery detail drawer.
+
+    `audit_id` breaks the tie on created_at. Audit writes are backgrounded
+    now (see app/agents/audit.py), so two tools finishing inside the same
+    clock tick can land with identical timestamps, and the row order was
+    then whatever Postgres felt like - different on every read of the same
+    trail.
+
+    This makes that order STABLE, not causal: audit_id is a random uuid, so
+    it cannot say which tool ran first. If real ties ever show up in the
+    drawer, the fix is a monotonic sequence column, not a cleverer sort."""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM audit_log WHERE correlation_id = %s ORDER BY created_at ASC",
+            "SELECT * FROM audit_log WHERE correlation_id = %s ORDER BY created_at ASC, audit_id ASC",
             (correlation_id,),
         )
         return cursor.fetchall()

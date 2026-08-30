@@ -125,6 +125,11 @@ class TestOfferTokenGate:
             assert result["status"] == "REJECTED"
             assert "merchant_mismatch" in result["reason"]
         finally:
+            # Audit writes are backgrounded; drain before deleting the
+            # merchant, or a row lands after its owner is gone.
+            from app.agents import audit as agent_audit
+            await agent_audit.drain(timeout=10.0)
+
             from app.db.database import get_db
             with get_db() as conn:
                 cursor = conn.cursor()

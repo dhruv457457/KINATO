@@ -146,6 +146,23 @@ def _reset_bus_state():
     bus._processed_idempotency_keys.clear()
 
 
+@pytest.fixture(autouse=True)
+async def _drain_audit_writes():
+    """Let backgrounded audit rows land before a test tears its data down.
+
+    Audit writes are fire-and-forget so a live call does not pay two DB
+    round trips per tool call (app/agents/audit.py). In a test that means a
+    write can still be in flight when the loop closes - the row is lost, or
+    worse, lands after the test has already DELETEd the merchant that owns
+    it. Draining here keeps teardown ordered without putting anything back
+    on the call's critical path.
+    """
+    yield
+    from app.agents import audit as agent_audit
+
+    await agent_audit.drain(timeout=10.0)
+
+
 async def wait_until(predicate, timeout: float = 3.0, interval: float = 0.05):
     """Polls `predicate()` until it returns truthy or timeout elapses.
     Needed because bus.publish fires subscribers as fire-and-forget asyncio

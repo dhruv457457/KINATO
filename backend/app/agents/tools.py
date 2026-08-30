@@ -43,6 +43,22 @@ from app.gateway.event_bus import bus
 
 logger = logging.getLogger(__name__)
 
+# Background writes that must not be garbage collected mid-flight.
+#
+# asyncio holds only a WEAK reference to a running task, so a bare
+# `create_task(...)` whose handle nobody keeps can be collected before it
+# finishes. voice_runtime learned this the hard way and has its own copy of
+# this pattern; importing it here would be circular, so this is the second
+# holder rather than a shared one.
+_BACKGROUND_WRITES: set = set()
+
+
+def _spawn_write(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_WRITES.add(task)
+    task.add_done_callback(_BACKGROUND_WRITES.discard)
+
+
 # Never accepted as a tool-call argument from the model, in any tool below.
 # These come from AgentContext, built by the caller (call_orchestrator /
 # voice_runtime / merchant intelligence route), never from model output.
@@ -107,6 +123,16 @@ class Tool:
     required: List[str]
     fn: Callable[..., Awaitable[Dict[str, Any]]]  # fn(ctx: AgentContext, **args) -> dict
     mutating: bool  # True => sequential execution + subject to the degraded gate
+    # True => a successful call ENDS the conversation turn, and the runtime
+    # must not route back to the model for a closing sentence.
+    #
+    # This is not a shortcut: the caller already refuses to use the model's
+    # text after these tools (voice_runtime prefers its own line, because
+    # what is said after money moves has to be true about what moved). The
+    # second LLM round trip was therefore always paid for output that was
+    # discarded - and it is the round trip that pushed the "yes, send it"
+    # turn past Twilio's 15s window on every live call.
+    terminal: bool = False
 
     def to_openai_schema(self) -> Dict[str, Any]:
         return {
@@ -328,6 +354,19 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
         )
     )
 
+    # The mint is conditional on the cart still being unpaid, in the same
+    # statement (see create_offer_token). No row means it was paid between
+    # the read above and the mint - a real window on a live call, because
+    # the customer can be paying from the earlier link while we talk. Same
+    # refusal code as the read-based check, so nothing downstream can tell
+    # which one caught it, and neither can be skipped.
+    if not token_row:
+        return {
+            "decision": "DENY",
+            "reason": "REJECTED_ALREADY_PAID",
+            "detail": "this checkout was paid while the offer was being prepared",
+        }
+
     return {
         "decision": decision["decision"],
         # The reason travels on an approval too, not only on a refusal:
@@ -470,8 +509,14 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
 
     # Bookkeeping, not the money action - the link already exists and the
     # customer is waiting on the line. Don't hold the call open for it.
+    #
+    # _spawn_write, not a bare create_task: asyncio keeps only a WEAK
+    # reference to a running task, so a fire-and-forget write can be
+    # garbage collected before it lands. Of all the writes in this file
+    # that would be the worst one to lose - it is the record that a real
+    # payment link went out.
     if ctx.recovery_attempt_id:
-        asyncio.create_task(
+        _spawn_write(
             run_db_async(
                 lambda: recovery_attempts_repo.update_state(
                     ctx.recovery_attempt_id,
@@ -551,6 +596,10 @@ issue_offer = Tool(
     required=["offer_token"],
     fn=_issue_offer,
     mutating=True,
+    # The link is sent; there is nothing left to negotiate this turn, and
+    # voice_runtime already speaks its own line here rather than the
+    # model's.
+    terminal=True,
 )
 
 
@@ -703,6 +752,9 @@ record_opt_out = Tool(
     required=[],
     fn=_record_opt_out,
     mutating=True,
+    # They asked us to stop. Asking a model what to say next is the one
+    # thing that cannot improve this turn.
+    terminal=True,
 )
 
 

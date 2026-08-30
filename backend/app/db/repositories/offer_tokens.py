@@ -21,31 +21,64 @@ def create_offer_token(
     checkout_id: Optional[str] = None,
     recovery_attempt_id: Optional[str] = None,
     expires_in_seconds: int = 900,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
+    """Mint one spendable offer. None if the checkout was already paid.
+
+    Two things changed here for latency, neither of which weakens the gate:
+
+    RETURNING replaces the follow-up SELECT. The row was already in hand
+    after the INSERT; asking the database for it a second time cost a whole
+    round trip, and from Railway a round trip is not microseconds.
+
+    And when a checkout_id is given, the INSERT is CONDITIONAL on that
+    checkout still being unpaid - `INSERT ... SELECT ... WHERE`. Zero rows
+    back means the cart was paid, and the caller turns that into
+    REJECTED_ALREADY_PAID. This is stronger than the read-then-check it
+    replaces, not merely faster: previously the paid check and the mint were
+    two separate statements, so a payment landing between them produced a
+    spendable discount for a cart that had just been paid for. Now the check
+    and the mint are the same statement, and that window does not exist.
+    """
     offer_token = new_id("off")
+    expires_expr = (
+        "CURRENT_TIMESTAMP + (%s || ' seconds')::interval" if _is_postgres()
+        else "datetime('now', '+' || %s || ' seconds')"
+    )
+    columns = """offer_token, merchant_id, checkout_id, recovery_attempt_id,
+                 requested_percent, approved_percent, decision, reason,
+                 base_amount_paise, final_amount_paise, expires_at"""
+    values = (offer_token, merchant_id, checkout_id, recovery_attempt_id, requested_percent,
+              approved_percent, decision, reason, base_amount_paise, final_amount_paise,
+              expires_in_seconds)
+
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO offer_tokens (offer_token, merchant_id, checkout_id, recovery_attempt_id,
-                                       requested_percent, approved_percent, decision, reason,
-                                       base_amount_paise, final_amount_paise, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    CURRENT_TIMESTAMP + (%s || ' seconds')::interval)
-            """ if _is_postgres() else
-            """
-            INSERT INTO offer_tokens (offer_token, merchant_id, checkout_id, recovery_attempt_id,
-                                       requested_percent, approved_percent, decision, reason,
-                                       base_amount_paise, final_amount_paise, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    datetime('now', '+' || %s || ' seconds'))
-            """,
-            (offer_token, merchant_id, checkout_id, recovery_attempt_id, requested_percent,
-             approved_percent, decision, reason, base_amount_paise, final_amount_paise,
-             expires_in_seconds),
-        )
-        cursor.execute("SELECT * FROM offer_tokens WHERE offer_token = %s", (offer_token,))
-        return dict(cursor.fetchone())
+        if checkout_id:
+            cursor.execute(
+                f"""
+                INSERT INTO offer_tokens ({columns})
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {expires_expr}
+                FROM checkouts c
+                WHERE c.checkout_id = %s
+                  AND COALESCE(c.status, '') <> 'paid'
+                  AND c.paid_at IS NULL
+                RETURNING *
+                """,
+                values + (checkout_id,),
+            )
+        else:
+            cursor.execute(
+                f"""
+                INSERT INTO offer_tokens ({columns})
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {expires_expr})
+                RETURNING *
+                """,
+                values,
+            )
+        row = cursor.fetchone()
+        # None means the WHERE matched nothing: the cart is paid, or gone.
+        # No token exists, so there is nothing spendable to leak.
+        return dict(row) if row else None
 
 
 def _is_postgres() -> bool:

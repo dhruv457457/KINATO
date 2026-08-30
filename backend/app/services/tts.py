@@ -28,7 +28,7 @@ from typing import Dict
 from xml.sax.saxutils import escape
 
 from app.core.config import settings
-from app.core.net import ipv4_client
+from app.core.net import shared_ipv4_client
 
 # Twilio gives up waiting on a webhook response after ~15s and plays its
 # own "application error" message to the caller if it isn't answered in
@@ -87,25 +87,30 @@ async def generate_elevenlabs_audio(text: str) -> str:
     # ~15s webhook-response deadline in the first place. voice_block()'s
     # outer asyncio.wait_for is the real safety net now; this timeout just
     # keeps a single hung attempt from eating the whole budget itself.
+    # A SHARED client, not a per-call one. Building a fresh transport here
+    # meant every line the agent speaks paid DNS + TCP + TLS to ElevenLabs
+    # before the request left - inside a 2s budget, on every turn. Not
+    # closed, and deliberately not a context manager: it is meant to outlive
+    # this request and keep its connection open for the next line.
     try:
-        async with ipv4_client(timeout=3.0) as client:
-            res = await client.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?optimize_streaming_latency=4",
-                headers={"xi-api-key": settings.ELEVENLABS_API_KEY},
-                json={
-                    "text": clean_text,
-                    "model_id": "eleven_flash_v2_5",
-                    "voice_settings": {"stability": 0.55, "similarity_boost": 0.85, "style": 0.35, "use_speaker_boost": False},
-                },
-            )
-            if res.status_code == 200:
-                os.makedirs(os.path.join("static", "audio"), exist_ok=True)
-                with open(file_path, "wb") as f:
-                    f.write(res.content)
-                audio_url = f"{settings.NGROK_URL}/audio/{file_id}"
-                AUDIO_CACHE[clean_text] = audio_url
-                return audio_url
-            logger.warning(f"ElevenLabs HTTP {res.status_code}: {res.text}")
+        client = shared_ipv4_client("tts", timeout=3.0)
+        res = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?optimize_streaming_latency=4",
+            headers={"xi-api-key": settings.ELEVENLABS_API_KEY},
+            json={
+                "text": clean_text,
+                "model_id": "eleven_flash_v2_5",
+                "voice_settings": {"stability": 0.55, "similarity_boost": 0.85, "style": 0.35, "use_speaker_boost": False},
+            },
+        )
+        if res.status_code == 200:
+            os.makedirs(os.path.join("static", "audio"), exist_ok=True)
+            with open(file_path, "wb") as f:
+                f.write(res.content)
+            audio_url = f"{settings.NGROK_URL}/audio/{file_id}"
+            AUDIO_CACHE[clean_text] = audio_url
+            return audio_url
+        logger.warning(f"ElevenLabs HTTP {res.status_code}: {res.text}")
     except Exception as e:
         logger.warning(f"ElevenLabs call failed: {e.__class__.__name__}: {e!r}")
     return ""

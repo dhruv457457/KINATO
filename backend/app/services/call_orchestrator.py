@@ -39,7 +39,7 @@ from app.services.voice_dispatch import place_outbound_call, VoiceDispatchError
 from app.services.tts import voice_block as tts_voice_block
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import customers as customers_repo
-from app.db.database import run_db_async
+from app.db.database import prewarm_pool, run_db_async
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,15 @@ class CallOrchestrator:
             # Memory is an improvement, never a precondition - a call must
             # not fail because we could not remember the last one.
             logger.warning(f"Could not build the customer memory brief (non-fatal): {e}")
+        # Warm the connection pool while the phone is still ringing.
+        #
+        # Same argument as the voice block and the memory brief above: this
+        # side of the dial has no deadline, and the other side answers inside
+        # Twilio's ~15s. A call's first turns issue several queries at once,
+        # and a cold connection is the single most expensive thing in this
+        # system - so pay for them here, where paying costs nothing.
+        await prewarm_pool()
+
         plan = {
             **plan,
             "voice_block": await tts_voice_block(opening_line),

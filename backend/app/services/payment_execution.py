@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -48,8 +49,12 @@ class PaymentExecutionService:
         Raises PaymentExecutionError if the merchant hasn't connected Razorpay
         yet, or if the live API call fails - never returns a fake link.
         """
+        # `get_client_for_merchant` is cached for 5 minutes, but on a MISS it
+        # does a synchronous DB read and a Fernet decrypt - both on the event
+        # loop, both during a live call. Off the loop with the API call
+        # below.
         try:
-            client = get_client_for_merchant(merchant_id)
+            client = await asyncio.to_thread(get_client_for_merchant, merchant_id)
         except (RazorpayNotConnectedError, MerchantNotFoundError) as e:
             raise PaymentExecutionError(str(e)) from e
 
@@ -70,18 +75,32 @@ class PaymentExecutionService:
             "kinato_touchpoint": "voice_recovery",
         }
 
+        # The razorpay SDK is synchronous `requests`. Called directly from a
+        # coroutine it does not merely block THIS call - it freezes the whole
+        # event loop, so every other live call's Twilio webhook goes
+        # unanswered for its duration, and asyncio cannot cancel it because
+        # there is no await to cancel at. That is what "the server stops when
+        # the policy engine runs" actually was: not a crash, a frozen loop.
+        #
+        # asyncio.to_thread, not run_db_async: that executor is deliberately
+        # sized below the connection pool as backpressure (see
+        # db/database.py), and putting a multi-second HTTP call on it would
+        # turn a slow Razorpay into a stalled database.
         try:
             expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-            rzp_link = client.payment_link.create({
-                "amount": amount_paise,
-                "currency": "INR",
-                "accept_partial": False,
-                "expire_by": int(expires_at.timestamp()),
-                "reference_id": recovery_attempt_id,
-                "description": f"Recovery checkout for {checkout_id}",
-                "notify": {"sms": False, "email": True},
-                "notes": notes
-            })
+            rzp_link = await asyncio.to_thread(
+                client.payment_link.create,
+                {
+                    "amount": amount_paise,
+                    "currency": "INR",
+                    "accept_partial": False,
+                    "expire_by": int(expires_at.timestamp()),
+                    "reference_id": recovery_attempt_id,
+                    "description": f"Recovery checkout for {checkout_id}",
+                    "notify": {"sms": False, "email": True},
+                    "notes": notes,
+                },
+            )
         except Exception as e:
             raise PaymentExecutionError(f"Razorpay Payment Link API call failed: {e}") from e
 

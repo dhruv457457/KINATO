@@ -39,6 +39,7 @@ from app.services import outreach_guards
 from app.agents.state import AgentContext
 from app.agents.tools import ALL_TOOLS
 from app.agents import runtime as agent_runtime
+from app.agents import audit as agent_audit
 from app.services import payment_execution as payment_execution_module
 
 
@@ -446,6 +447,14 @@ async def run_scenario(scenario: dict) -> dict:
         all_tool_calls.extend(result.tool_calls_made)
         if "record_opt_out" in result.tool_calls_made or "issue_offer" in result.tool_calls_made:
             break  # conversation naturally ends here, same as a real call would
+
+    # Audit writes are fire-and-forget on the hot path so a live call does
+    # not pay for them (app/agents/audit.py). This scoreboard reads those
+    # rows the instant the turn loop ends, and scores every case from them -
+    # so it has to wait for them, or a real recovery becomes NO_SALE because
+    # its row had not landed yet. That would not be a slower scoreboard, it
+    # would be a lying one.
+    await agent_audit.drain()
 
     audit_rows = audit_repo.get_audit_trail_for_correlation(correlation_id)
     issued = next((r for r in audit_rows if r["action"] == "issue_offer" and r["decision"] == "ISSUED"), None)
