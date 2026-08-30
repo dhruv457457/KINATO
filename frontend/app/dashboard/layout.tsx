@@ -2,8 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { getCurrentMerchant, Merchant, stepPath } from "@/lib/api";
+import { getCurrentMerchant, logout, Merchant, stepPath } from "@/lib/api";
 import { DashboardErrorBoundary } from "@/components/dashboard/ErrorBoundary";
+import { INK, INK_MUTED, RULE_SOFT } from "@/components/dashboard/primitives";
 
 const NAV_ITEMS: { label: string; path: string; enabled: boolean }[] = [
   { label: "Overview", path: "/dashboard", enabled: true },
@@ -22,6 +23,21 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const router = useRouter();
   const [merchant, setMerchant] = useState<Merchant | null>(null);
   const [checked, setChecked] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+
+  async function handleLogout() {
+    setSigningOut(true);
+    try {
+      await logout();
+    } catch {
+      // The session cookie may already be gone, or the server unreachable.
+      // Either way the intent was to leave, so leave - staying on the
+      // dashboard because sign-out failed is the one outcome nobody wants.
+    }
+    // replace, not push: the dashboard must not be one Back press away
+    // from looking signed in.
+    router.replace("/login");
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -94,9 +110,24 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             })}
           </nav>
         </div>
-        <div className="text-[11px] text-dark-200 hidden lg:block">
+        {/* Who is signed in, and the way out.
+            Not hidden below lg any more: on a phone the rail is the only
+            chrome there is, so hiding identity there meant a merchant had
+            no way to tell whose dashboard they were looking at, and no way
+            to leave it. */}
+        <div className="text-[11px] text-dark-200 mt-4 lg:mt-0 pt-4 lg:pt-0 border-t lg:border-t-0" style={{ borderColor: RULE_SOFT }}>
           <div className="font-medium text-dark">{merchant.name}</div>
-          <div className="truncate">{merchant.email}</div>
+          <div className="truncate mb-3">{merchant.email}</div>
+          <button
+            onClick={handleLogout}
+            disabled={signingOut}
+            className="text-[11px] font-semibold uppercase tracking-wider transition-colors disabled:opacity-50"
+            style={{ color: INK_MUTED }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = INK)}
+            onMouseLeave={(e) => (e.currentTarget.style.color = INK_MUTED)}
+          >
+            {signingOut ? "Signing out…" : "Sign out"}
+          </button>
         </div>
       </aside>
 

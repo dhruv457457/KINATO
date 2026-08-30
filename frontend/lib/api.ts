@@ -297,6 +297,33 @@ export function getRazorpayStatus(): Promise<{ connected: boolean; webhook_secre
   return apiFetch("/api/merchant/razorpay/status");
 }
 
+/** Replaces the stored Razorpay API key pair.
+ *
+ *  Same endpoint onboarding uses, exposed again in Settings because keys
+ *  are not a one-time decision: they get rotated, and a test account that
+ *  hits Razorpay's 30-payment-link ceiling has to be swapped for another.
+ *  Until this was reachable after onboarding, the only way to change them
+ *  was to make a new account.
+ *
+ *  The backend validates the pair against Razorpay before storing it, so a
+ *  typo fails here rather than silently on the next call. */
+export function connectRazorpay(
+  keyId: string,
+  keySecret: string
+): Promise<{ status: string; message: string }> {
+  return apiFetch("/api/merchant/razorpay/connect", {
+    method: "POST",
+    body: JSON.stringify({ key_id: keyId, key_secret: keySecret }),
+  });
+}
+
+/** Ends the session. The cookie is httpOnly, so only the server can clear
+ *  it - a client-side "log out" that just redirects would leave the
+ *  session valid and the next visitor signed in as this merchant. */
+export function logout(): Promise<{ status: string }> {
+  return apiFetch("/api/auth/logout", { method: "POST" });
+}
+
 /** Sets ONLY the webhook signing secret. Until it's set, Razorpay events are
  *  rejected unverified and recovery never starts — see
  *  backend/app/payments/webhooks.py. */

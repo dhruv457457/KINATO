@@ -10,6 +10,8 @@ import {
   saveWebhookSecret,
   getAllowedOrigins,
   setAllowedOrigins,
+  connectRazorpay,
+  ApiError,
   ApiKeyRow,
 } from "@/lib/api";
 import {
@@ -25,6 +27,7 @@ import {
   INK_MUTED,
   WASH,
   NEGATIVE,
+  POSITIVE,
 } from "@/components/dashboard/primitives";
 
 /** Copy-to-clipboard field. Used for both the webhook URL and a freshly
@@ -76,6 +79,37 @@ export default function SettingsPage() {
   const [newKey, setNewKey] = useState<{ key: string; key_type: string } | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [keyIdDraft, setKeyIdDraft] = useState("");
+  const [keySecretDraft, setKeySecretDraft] = useState("");
+  const [showKeySecret, setShowKeySecret] = useState(false);
+  const [rzpKeysSaved, setRzpKeysSaved] = useState(false);
+  const [rzpKeyError, setRzpKeyError] = useState("");
+
+  async function handleConnectRazorpay() {
+    setBusy(true);
+    setRzpKeyError("");
+    setRzpKeysSaved(false);
+    try {
+      await connectRazorpay(keyIdDraft.trim(), keySecretDraft.trim());
+      setRzpConnected(true);
+      setRzpKeysSaved(true);
+      // Clear both fields. A secret left sitting in an input is a secret on
+      // screen, and the field is a write-only slot by design - we never
+      // read these back.
+      setKeyIdDraft("");
+      setKeySecretDraft("");
+      setShowKeySecret(false);
+    } catch (err) {
+      // Show what Razorpay actually said. "Could not connect" tells a
+      // merchant nothing about whether they pasted a live key into a test
+      // field or simply mistyped one character.
+      setRzpKeyError(
+        err instanceof ApiError ? err.message : "Could not reach the server to verify those keys."
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     getWebhookUrl()
@@ -174,6 +208,77 @@ export default function SettingsPage() {
               <StatusPill tone={rzpConnected ? "positive" : "negative"}>
                 {rzpConnected ? "Connected" : "Not connected"}
               </StatusPill>
+            )}
+          </div>
+
+          {/* Key rotation.
+              These were previously settable only during onboarding, as if
+              connecting an account were a decision you make once. It isn't:
+              keys get rotated, and a test account that hits Razorpay's
+              30-payment-link ceiling has to be swapped for a different one
+              or nothing can be recovered at all. The only way to do that
+              was to create a whole new merchant account. */}
+          <div className="border border-t-0 p-5" style={{ borderColor: RULE }}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[12px] font-semibold uppercase tracking-wider" style={{ color: INK_MUTED }}>
+                API key pair
+              </span>
+              {rzpKeysSaved && (
+                <span className="text-[12px] anim-fade" style={{ color: POSITIVE }}>
+                  Connected — new keys are live
+                </span>
+              )}
+            </div>
+            <p className="text-[12px] mb-3 leading-relaxed" style={{ color: INK_MUTED }}>
+              Settings → API Keys in your Razorpay dashboard. Validated against Razorpay before we store them, so a
+              typo fails here rather than on your next call. Stored encrypted; replacing them takes effect within
+              five minutes.
+            </p>
+
+            <div className="flex flex-col gap-3">
+              <input
+                type="text"
+                value={keyIdDraft}
+                onChange={(e) => setKeyIdDraft(e.target.value)}
+                placeholder="rzp_test_..."
+                autoComplete="off"
+                spellCheck={false}
+                className="border p-3 text-[13px]"
+                style={{ borderColor: RULE, borderRadius: 0, background: "transparent", fontFamily: "var(--font-geist-mono)" }}
+              />
+              <div className="flex gap-3 items-center">
+                <input
+                  type={showKeySecret ? "text" : "password"}
+                  value={keySecretDraft}
+                  onChange={(e) => setKeySecretDraft(e.target.value)}
+                  placeholder="Key secret"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="flex-1 border p-3 text-[13px] min-w-0"
+                  style={{ borderColor: RULE, borderRadius: 0, background: "transparent", fontFamily: "var(--font-geist-mono)" }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowKeySecret((v) => !v)}
+                  className="text-[11px] font-semibold uppercase tracking-wider shrink-0 px-2"
+                  style={{ color: INK_MUTED }}
+                >
+                  {showKeySecret ? "Hide" : "Show"}
+                </button>
+                <button
+                  className="onb-btn-primary shrink-0"
+                  disabled={busy || !keyIdDraft.trim() || !keySecretDraft.trim()}
+                  onClick={handleConnectRazorpay}
+                >
+                  {busy ? "Verifying…" : rzpConnected ? "Replace" : "Connect"}
+                </button>
+              </div>
+            </div>
+
+            {rzpKeyError && (
+              <p className="text-[12px] mt-2.5 leading-relaxed" style={{ color: NEGATIVE }}>
+                {rzpKeyError}
+              </p>
             )}
           </div>
         </section>
