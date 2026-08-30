@@ -96,15 +96,25 @@ async def main() -> None:
     print(_fmt("SELECT 1 on a NEW connection", fresh))
 
     if pooled and fresh:
-        handshake = statistics.median(fresh) - statistics.median(pooled)
+        warm = statistics.median(pooled)
+        handshake = statistics.median(fresh) - warm
         print()
-        print(f"  => opening a connection costs ~{handshake * 1000:.0f} ms")
-        print(f"     using an open one costs    ~{statistics.median(pooled) * 1000:.0f} ms")
-        if handshake > statistics.median(pooled) * 3:
-            print("     Handshake dominates. The fix is CONFIGURATION - region,")
-            print("     the Supavisor pooler, pool warmth - not fewer statements.")
+        print(f"  => opening a connection costs ~{handshake * 1000:.0f} ms on top")
+        print(f"     using an open one costs    ~{warm * 1000:.0f} ms")
+        print()
+        # `SELECT 1` does no work, so the warm number is not query cost - it
+        # is the round trip itself. Both figures are geography, and they are
+        # fixed by different things, so report both rather than picking a
+        # winner: pool warmth removes the handshake, fewer statements
+        # removes the round trips, and moving the backend closer removes
+        # some of each.
+        print("     Neither of those is query execution - SELECT 1 does no work.")
+        print(f"     Both are distance. A turn making 12 statements pays")
+        print(f"     ~{warm * 12 * 1000:.0f} ms of it even with every connection already open.")
+        if handshake > warm:
+            print("     Pool warmth is worth more than statement count here.")
         else:
-            print("     Query cost dominates. Fewer statements is the fix.")
+            print("     Statement count is worth more than pool warmth here.")
 
     # Concurrency, which is the shape a live call actually makes: several
     # queries at once, not one after another. FINDINGS #9 measured this
