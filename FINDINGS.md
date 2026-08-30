@@ -836,6 +836,90 @@ asserts is arithmetic nobody has done.**
 
 ---
 
+## 18. The model invented a password five times, and we had told it not to twice
+
+With the latency fixed, a call ran end to end for the first time — every turn
+between 1.4s and 3.6s. And no email arrived, because `check_offer` was never
+called. Not once. The model went straight to `issue_offer` with a token it
+made up:
+
+```
+issue_offer  REJECTED  offer_token_not_found
+issue_offer  REJECTED  offer_token_not_found
+issue_offer  REJECTED  offer_token_not_found
+issue_offer  REJECTED  offer_token_not_found
+```
+
+Between the third and the fourth it told the customer *"Your order total is
+₹1,290. I'll send that over to you right now!"*
+
+The two-phase gate held perfectly. No money moved on a token that didn't
+exist, which is the entire point of it. But the system prompt said **twice**,
+in plain words, *"call check_offer, then issue_offer with the token it gives
+you."* The tool's own description says *"Requires an offer_token from
+check_offer."* Three separate instructions, all ignored.
+
+**The refusal was the problem.** `offer_token_not_found` is a true statement
+about the past. To a model choosing its next action it reads as *"that one
+was wrong, try another"* — so it did, four times. The instruction lived in
+the system prompt, thousands of tokens back; the thing the model actually
+read at the moment of deciding was a two-word error code.
+
+So the instruction moved to where the decision happens:
+
+> There is no such offer_token. It cannot be guessed, invented or copied from
+> an example — the only valid value is one returned by a check_offer call in
+> THIS conversation. Call check_offer with requested_discount_percent=0 now,
+> then call issue_offer with the offer_token from its result. **Do not call
+> issue_offer again until you have done that.**
+
+Every token failure now names the next action, and they differ: an *expired*
+token says mint a fresh one, a *consumed* one says the link already went and
+must not be sent twice. They also carry the `REJECTED_` prefix, so a
+hallucinated token finally reaches `AgentResult.refusals` and gets counted —
+it had been invisible to every refusal tally in the system.
+
+This is #14 and #15 a third time, and the sharpest version yet. There, a rule
+lost because it sat far from the text it contradicted. Here a rule lost
+because it sat far from the *moment of decision*. **The model does not
+consult the prompt when it picks an argument; it reads the last tool result.
+That is where a rule has to be.**
+
+### What it improvised when the sanctioned path kept failing
+
+Having failed four times, the agent said this to a real person:
+
+> *"I can assist you in completing your order if you'd like to provide your
+> card details again."*
+
+It asked a customer to read their card number to an automated line. No tool
+here accepts one. No endpoint receives one. A customer who complied would
+have been reading payment credentials into a voice pipeline that logs its
+transcripts.
+
+Nobody wrote that behaviour and no prompt invited it. It is what a model does
+when the legitimate route is blocked and it still wants to help — **the
+failure mode of a blocked agent is not inaction, it is improvisation**, and
+improvisation around money is exactly what this project exists to prevent.
+
+The guard is the same shape as the placeholder guard that already exists for
+spoken lines, and for the same stated reason: *a prompt is a request, not a
+guarantee.* Any reply soliciting card data is replaced wholesale — not
+edited, because a sentence that gets there exists to make that request, and
+trimming the clause would leave the offer standing.
+
+The hard part was not catching it. It was **not** catching *"your card was
+declined by your bank"* — the single most common true thing this agent says.
+A guard that suppressed that would silence the agent on the one subject it
+was built to discuss. Eight legitimate lines are pinned in
+`tests/test_card_solicitation_guard.py` alongside eight solicitations.
+
+One footnote, because it makes the point better than the fix does: the first
+replacement line was *"I'm not able to take card details over the phone."*
+It tripped its own guard. The test caught it.
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim

@@ -349,6 +349,46 @@ def _strip_placeholder_identity(text: str) -> str:
     return cleaned or "Hello - I'm calling about the order you started with us."
 
 
+# Card data solicited over the phone.
+#
+# On a live call, after issue_offer had failed four times, the agent said:
+# "I can assist you in completing your order if you'd like to provide your
+# card details again." It asked a customer to read their card number to an
+# automated system - something no tool here can accept, nothing in this
+# codebase is authorised to receive, and which would be a serious
+# compliance problem if a customer complied.
+#
+# It reached for that because the sanctioned path kept failing, and a model
+# under pressure improvises. The instructive refusals in tools.py should
+# stop the cascade that led here; this is the structural check for when
+# something else leads there instead. Deliberately narrow: it matches
+# soliciting card DATA, not discussing a card that was declined, which the
+# agent must still be able to do.
+_CARD_SOLICITATION = re.compile(
+    r"\b(card|cvv|cvc|pin)\s*(number|details|detail|digits|info|information)\b"
+    r"|\bcvv\b|\bcvc\b"
+    r"|\b(provide|share|give|read|tell|enter|confirm|verify)\s+(me\s+)?(your|the)\s+card\b"
+    r"|\bexpiry\s*(date)?\b",
+    re.IGNORECASE,
+)
+
+# What to say instead. Not an apology for a rule - a redirect to the only
+# way this agent can actually take money, which is a link.
+#
+# Careful with the wording: an earlier version said "I can't take card
+# details over the phone", which trips the pattern above. A replacement
+# that the guard would itself catch is a replacement that cannot be trusted
+# to terminate, and a test asserts it does not.
+_CARD_SOLICITATION_REPLACEMENT = (
+    "I'm not able to take payment information over the phone - the only way I can help you pay is "
+    "with a secure link. Let me get that sorted and sent across to you."
+)
+
+
+def solicits_card_details(text: str) -> bool:
+    return bool(text) and bool(_CARD_SOLICITATION.search(text))
+
+
 def _build_system_prompt(
     customer_name: str,
     item_description: str,
@@ -829,6 +869,17 @@ async def _run_agent_turn(
             "replacing it rather than reading brackets aloud."
         )
         reply_text = _strip_placeholder_identity(reply_text)
+
+    # Never ask a customer to say their card details out loud. Replaced
+    # wholesale rather than edited: a sentence that got here is one whose
+    # whole purpose was to solicit card data, and trimming the offending
+    # clause would leave the offer standing.
+    if solicits_card_details(reply_text):
+        logger.error(
+            f"[CALL {call_id}] Model reply solicited card details ({reply_text!r}) - "
+            "replaced. Nothing in this system can accept them."
+        )
+        reply_text = _CARD_SOLICITATION_REPLACEMENT
 
     logger.info(
         f"[CALL {call_id}] Agent ({'degraded' if result.degraded else 'ok'}): {reply_text!r} | "

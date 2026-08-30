@@ -71,7 +71,12 @@ class TestOfferTokenGate:
         ctx = _ctx(merchant_id, checkout_id)
         result = await execute_tool(issue_offer, {"offer_token": "off_totally_made_up"}, ctx)
         assert result["status"] == "REJECTED"
-        assert "not_found" in result["reason"]
+        assert result["reason"] == "REJECTED_OFFER_TOKEN_NOT_FOUND"
+        # The refusal has to say what to do next, not just what went wrong.
+        # A model told only "not found" invented another token and tried
+        # again - four times, on a live call, while telling the customer
+        # the link was on its way.
+        assert "check_offer" in result["detail"]
 
     async def test_expired_token_is_rejected(self, cart_checkout):
         merchant_id, checkout_id = cart_checkout
@@ -89,7 +94,8 @@ class TestOfferTokenGate:
         ctx = _ctx(merchant_id, checkout_id)
         result = await execute_tool(issue_offer, {"offer_token": token_row["offer_token"]}, ctx)
         assert result["status"] == "REJECTED"
-        assert "expired" in result["reason"]
+        assert result["reason"] == "REJECTED_OFFER_TOKEN_EXPIRED"
+        assert "check_offer" in result["detail"]
 
     async def test_consumed_token_cannot_be_reused(self, cart_checkout):
         merchant_id, checkout_id = cart_checkout
@@ -100,7 +106,11 @@ class TestOfferTokenGate:
 
         second = await execute_tool(issue_offer, {"offer_token": checked["offer_token"]}, ctx)
         assert second["status"] == "REJECTED"
-        assert "consumed" in second["reason"]
+        assert second["reason"] == "REJECTED_OFFER_TOKEN_ALREADY_CONSUMED"
+        # Do NOT tell the model to mint another one here. The offer already
+        # went out; the correct move is to say so, not to send a second
+        # link for the same order.
+        assert "check_offer" not in second["detail"]
 
     async def test_cross_merchant_token_is_rejected(self, cart_checkout):
         from app.db.repositories import merchants as merchants_repo
@@ -123,7 +133,7 @@ class TestOfferTokenGate:
             other_merchant_ctx = _ctx(other_merchant["merchant_id"], checkout_id)
             result = await execute_tool(issue_offer, {"offer_token": checked["offer_token"]}, other_merchant_ctx)
             assert result["status"] == "REJECTED"
-            assert "merchant_mismatch" in result["reason"]
+            assert result["reason"] == "REJECTED_OFFER_TOKEN_MERCHANT_MISMATCH"
         finally:
             # Audit writes are backgrounded; drain before deleting the
             # merchant, or a row lands after its owner is gone.

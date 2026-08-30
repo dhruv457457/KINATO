@@ -409,6 +409,38 @@ check_offer = Tool(
 )
 
 
+# What to DO about each way a token can fail, written for the model that
+# just got one back. Every line names the next action, because "not found"
+# on its own reads as "try a different one" - which is exactly what a model
+# did, repeatedly, on a real call.
+_OFFER_TOKEN_REJECTION_HELP = {
+    "offer_token_not_found": (
+        "There is no such offer_token. It cannot be guessed, invented or copied from an example - "
+        "the only valid value is one returned by a check_offer call in THIS conversation. "
+        "Call check_offer with requested_discount_percent=0 now, then call issue_offer with the "
+        "offer_token from its result. Do not call issue_offer again until you have done that."
+    ),
+    "offer_token_already_consumed": (
+        "That offer was already sent - the link is with the customer. Do not send it again; "
+        "tell them it is on its way and check their spam folder."
+    ),
+    "offer_token_expired": (
+        "That offer has expired. Call check_offer again to get a fresh one, then issue_offer with it."
+    ),
+    "offer_token_was_denied": (
+        "The policy engine refused that discount, so it can never be sent. Call check_offer with a "
+        "lower requested_discount_percent, or 0 for full price."
+    ),
+    "offer_token_merchant_mismatch": (
+        "That token belongs to a different merchant and can never be spent here. "
+        "Call check_offer to mint one for this order."
+    ),
+    "offer_token_checkout_mismatch": (
+        "That token was minted for a different order. Call check_offer to mint one for this order."
+    ),
+}
+
+
 async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "email") -> Dict[str, Any]:
     """The only tool that can make an offer real. Every amount below comes
     from the token row consume_offer_token() returns - never from an
@@ -439,7 +471,31 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
             checkout_id=ctx.checkout_id,
         )
     except ValueError as e:
-        return {"status": "REJECTED", "reason": str(e)}
+        # An INSTRUCTIVE refusal, not just a code.
+        #
+        # On a live call the model invented an offer_token, was told
+        # "offer_token_not_found", and responded by inventing another one -
+        # five times, while telling the customer the link was on its way.
+        # The system prompt already said "call check_offer, then
+        # issue_offer". It said it twice. The model does not consult a
+        # prompt at the moment it is choosing arguments; it reads the tool
+        # result it just got back.
+        #
+        # So the tool result is where the instruction has to live. This is
+        # the same lesson as FINDINGS #14/#15 from the other direction: a
+        # rule far from the point of decision loses to one at it.
+        reason = str(e)
+        detail = _OFFER_TOKEN_REJECTION_HELP.get(
+            reason, "Call check_offer first and use the offer_token it returns."
+        )
+        return {
+            "status": "REJECTED",
+            # REJECTED_ prefix so this reaches AgentResult.refusals and can
+            # be counted. A token the model made up was previously
+            # invisible to every refusal tally in the system.
+            "reason": f"REJECTED_{reason.upper()}",
+            "detail": detail,
+        }
 
     # The question here is "have they told us to stop?", NOT "do we hold a
     # marketing opt-in for this particular protocol?"
