@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     VOICE_GATHER_LANGUAGE: str = Field(
         default="en-IN", description="BCP-47 language for Twilio speech recognition."
     )
+    # How the agent SPEAKS. "english" or "hinglish".
+    #
+    # Separate from VOICE_GATHER_LANGUAGE because output and input are not
+    # the same decision and have opposite constraints. The agent can speak
+    # Hinglish freely; the recogniser takes exactly one language, and
+    # mis-transcription feeds the confidence gate that blocks the money
+    # tools. So speaking Hinglish is cheap, and listening for it is not.
+    AGENT_LANGUAGE: str = Field(
+        default="english", description='How the agent speaks: "english" or "hinglish".'
+    )
     DEEPGRAM_API_KEY: str = Field(default="", description="Deepgram STT API Key")
     NGROK_URL: str = Field(default="", description="Public tunnel URL for Twilio voice webhooks")
 

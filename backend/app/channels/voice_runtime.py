@@ -421,6 +421,37 @@ def solicits_card_details(text: str) -> bool:
 _TURNS_IN_FLIGHT: set = set()
 
 
+# How the agent speaks, when the merchant has asked for Hinglish.
+#
+# Written as "produce this", never as "don't produce that". FINDINGS #15 is
+# the story of a prompt rule phrased as a prohibition that made the thing it
+# forbade MORE likely, because stating it put the forbidden text in front of
+# the model. So this describes the register to write in and stops there.
+#
+# Two constraints that are not stylistic:
+#
+#   Roman script, because the line is read aloud by an Indian-English TTS
+#   voice. Devanagari is either skipped or spelled out; the same words in
+#   Latin letters are pronounced correctly by an en-IN voice.
+#
+#   Numbers and money in English, because the amount is the one thing on
+#   this call that must be unambiguous. A mispronounced rupee figure is
+#   worse than a slightly stilted sentence, and it is the sentence the whole
+#   call exists to deliver.
+_HINGLISH_STYLE = """SPEAK HINGLISH - the everyday mix an Indian salesperson actually uses on the phone, \
+not textbook Hindi. Hindi carries the warmth and the connective words; English carries the ones people \
+genuinely say in English anyway: order, link, payment, card, email, discount, website.
+
+Write it in Roman letters, never Devanagari - your words are read aloud by an Indian-English voice, and it \
+pronounces "aapka order ready hai" correctly while Devanagari comes out as nonsense.
+
+Say every number, price and rupee amount in English. The amount is the one thing on this call that has to \
+be unambiguous.
+
+If they reply in English, stay in Hinglish anyway - warm and local is the point, and switching to match \
+them makes the call sound like a machine adjusting."""
+
+
 def _tool_succeeded(result, tool: str) -> bool:
     """Did this tool actually DO the thing, or merely get attempted?
 
@@ -479,6 +510,13 @@ def _build_system_prompt(
     # templates follow. The hard behaviour still lives in check_offer's
     # REJECTED_FULL_PRICE_FIRST; this only stops the agent sounding
     # ignorant of something it is being held to.
+    # Appended before the diagnosis and the memory brief, so the register
+    # is established before the call-specific facts arrive - a language
+    # instruction buried under two paragraphs of context gets followed less
+    # reliably than one that reads as part of the role.
+    if (settings.AGENT_LANGUAGE or "").strip().lower() == "hinglish":
+        prompt = f"{prompt}\n{_HINGLISH_STYLE}\n"
+
     diagnosis_line = failure_diagnosis.describe(failure_class, emi_available=emi_available)
     if diagnosis_line:
         prompt = f"{prompt}\n{diagnosis_line}\n"

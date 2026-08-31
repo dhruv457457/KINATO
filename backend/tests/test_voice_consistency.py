@@ -107,3 +107,60 @@ class TestRecognitionLanguage:
         lang = settings.VOICE_GATHER_LANGUAGE
         assert lang and "," not in lang and " " not in lang
         assert "-" in lang, "expected a BCP-47 tag such as en-IN"
+
+
+class TestHinglishIsOptedInto:
+    """The agent speaks Hinglish only when the merchant asks for it.
+
+    Output language and input language are separate decisions with opposite
+    costs. Speaking Hinglish is free; LISTENING for it is not - Twilio's
+    <Gather> takes exactly one BCP-47 language, and a mis-transcription
+    feeds the confidence gate that blocks the money tools. So this setting
+    changes what the agent says and deliberately leaves recognition alone.
+    """
+
+    def test_english_is_the_default(self):
+        assert type(settings).model_fields["AGENT_LANGUAGE"].default == "english"
+
+    def test_the_prompt_stays_english_unless_asked(self, monkeypatch):
+        from app.channels import voice_runtime as vr
+
+        monkeypatch.setattr(settings, "AGENT_LANGUAGE", "english")
+        prompt = vr._build_system_prompt("Dhruv", "a woven table runner", "Loomwork")
+        assert "SPEAK HINGLISH" not in prompt
+
+    def test_hinglish_is_added_when_asked(self, monkeypatch):
+        from app.channels import voice_runtime as vr
+
+        monkeypatch.setattr(settings, "AGENT_LANGUAGE", "hinglish")
+        prompt = vr._build_system_prompt("Dhruv", "a woven table runner", "Loomwork")
+        assert "SPEAK HINGLISH" in prompt
+
+    def test_the_setting_is_not_case_or_space_sensitive(self, monkeypatch):
+        """A merchant typing " Hinglish " into an env var meant it."""
+        from app.channels import voice_runtime as vr
+
+        monkeypatch.setattr(settings, "AGENT_LANGUAGE", "  Hinglish  ")
+        assert "SPEAK HINGLISH" in vr._build_system_prompt("Dhruv", "an item", "Loomwork")
+
+    def test_it_asks_for_roman_script_and_english_numbers(self, monkeypatch):
+        """Both are functional requirements, not style.
+
+        Devanagari is mangled by the en-IN TTS voice that reads these lines
+        aloud, and a mispronounced rupee amount is the worst possible error
+        on a call whose entire purpose is delivering one.
+        """
+        from app.channels import voice_runtime as vr
+
+        monkeypatch.setattr(settings, "AGENT_LANGUAGE", "hinglish")
+        prompt = vr._build_system_prompt("Dhruv", "an item", "Loomwork")
+        assert "Roman letters" in prompt
+        assert "number" in prompt and "English" in prompt
+
+    def test_recognition_language_is_untouched_by_it(self, monkeypatch):
+        """The trade-off, pinned. Speaking Hinglish must not quietly switch
+        the recogniser to hi-IN and start mis-hearing English replies."""
+        from app.channels import voice_runtime as vr  # noqa: F401
+
+        monkeypatch.setattr(settings, "AGENT_LANGUAGE", "hinglish")
+        assert settings.VOICE_GATHER_LANGUAGE == "en-IN"
