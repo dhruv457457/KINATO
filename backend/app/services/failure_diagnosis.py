@@ -219,15 +219,18 @@ def describe(failure_class: Optional[str]) -> str:
 _PROMPT_LINES = {
     SOFT_DECLINE: (
         "WHY THIS FAILED: their payment was declined by a temporary bank or gateway problem - nothing they did, "
-        "and not the price. They want to pay you. Send a working link at the full amount. Do not offer a discount."
+        "and not the price. They want to pay you. Send a working link at the full amount. Do not offer a discount. "
+        "If they sound unsure about the same card, mention the link also takes UPI."
     ),
     HARD_DECLINE: (
-        "WHY THIS FAILED: their bank refused that card outright, so that card will not work again. This is not a "
-        "price objection. Send a working link at the full amount and let them pay another way."
+        "WHY THIS FAILED: their bank refused that card outright, so that card will NOT work again - sending the "
+        "same link and saying nothing wastes their time twice. This is not a price objection. Send a working link "
+        "at the full amount and tell them plainly to use UPI or a different card."
     ),
     AUTH_DROP: (
         "WHY THIS FAILED: they reached their bank's verification step and it did not complete. Nothing was declined "
-        "and nothing was charged. Send a fresh link for the same amount. Do not offer a discount."
+        "and nothing was charged. Send a fresh link for the same amount. Do not offer a discount. UPI skips that "
+        "verification step entirely, so it is worth mentioning."
     ),
     INSUFFICIENT_FUNDS: (
         "WHY THIS FAILED: their payment was declined for insufficient funds. This one really might be about money "

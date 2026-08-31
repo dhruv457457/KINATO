@@ -38,6 +38,7 @@ from app.services.failure_diagnosis import (
     SOFT_DECLINE,
     UNKNOWN,
     USER_ABANDON,
+    describe,
     diagnose,
 )
 
@@ -233,3 +234,44 @@ class TestTheWebhookRecordsWhatItWasTold:
         # The point of storing it: a second recovery attempt days later
         # diagnoses from the same evidence instead of guessing again.
         assert checkout["failure_class"] == AUTH_DROP
+
+
+class TestCardFailuresNameTheRailThatWorks:
+    """A card that failed is a rail problem, and India has another rail.
+
+    "Let them pay another way" is advice the agent cannot act on: it does
+    not name anything, so the model either invents an option or says
+    nothing. UPI is the specific answer, and for two of these classes it is
+    not merely an alternative but a strictly better one - a hard decline
+    means that card will never work, and an auth drop means the customer
+    reached 3DS and bailed, which UPI skips entirely.
+
+    This is the honest half of "smart payment retry". A silent server-side
+    re-charge is not possible for a one-time cart payment without a saved
+    mandate, so the recoverable thing is not retrying the same rail - it is
+    naming a different one.
+    """
+
+    @pytest.mark.parametrize("failure_class", [SOFT_DECLINE, HARD_DECLINE, AUTH_DROP])
+    def test_a_card_failure_tells_the_agent_about_upi(self, failure_class):
+        assert "UPI" in describe(failure_class), (
+            f"{failure_class} leaves the agent with no rail to suggest"
+        )
+
+    def test_a_hard_decline_says_the_card_will_not_work_again(self):
+        """The one class where re-sending the same link in silence is
+        actively unhelpful - the customer would fail on the same card
+        twice."""
+        line = describe(HARD_DECLINE)
+        assert "NOT work again" in line or "not work again" in line
+
+    @pytest.mark.parametrize("failure_class", [USER_ABANDON, INSUFFICIENT_FUNDS])
+    def test_non_card_failures_do_not_push_a_rail(self, failure_class):
+        """Nobody's card failed here.
+
+        Suggesting a different payment method to someone who walked away, or
+        to someone who has no money in the account today, answers a question
+        they did not ask - and for INSUFFICIENT_FUNDS it talks past a real
+        cashflow problem.
+        """
+        assert "UPI" not in describe(failure_class)
