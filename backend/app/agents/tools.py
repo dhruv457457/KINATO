@@ -109,6 +109,27 @@ CLEARLY_HEARD_FLOOR = 0.85
 OPT_OUT_CHANNELS = ("voice", "email")
 
 
+def _say_rupees(paise: Optional[int]) -> str:
+    """The amount as a person says it, ready to be read aloud.
+
+    Every rupee figure the agent speaks comes from one of these. The model
+    is never asked to convert paise itself: on a live call it turned a
+    ₹1,290 cart into "two hundred ninety-nine thousand paise, which is two
+    hundred ninety-nine rupees" - a price no customer could act on, said
+    with complete confidence.
+
+    Whole rupees when it is whole, which it almost always is, because
+    "1,290 rupees" is what a person says and "1,290 rupees and 0 paise" is
+    what a computer says.
+    """
+    if not paise:
+        return "0 rupees"
+    rupees, remainder = divmod(int(paise), 100)
+    if remainder:
+        return f"{rupees:,} rupees and {remainder} paise"
+    return f"{rupees:,} rupees"
+
+
 def _confidence_ok(ctx: AgentContext) -> bool:
     """None means the input was not speech (keypad, email, scripted batch
     case) and so is not subject to this gate at all."""
@@ -168,10 +189,28 @@ async def _get_cart(ctx: AgentContext) -> Dict[str, Any]:
     checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
     if not checkout:
         return {"error": "checkout_not_found"}
+    # Rupees, spelled out, because this number is READ ALOUD.
+    #
+    # Handing the model paise made it do the arithmetic itself, and on a
+    # live call it said "two hundred ninety-nine thousand paise, which is
+    # two hundred ninety-nine rupees" about a cart costing 1,290. Wrong by a
+    # factor of ten and unintelligible in the same breath. A model asked to
+    # divide by 100 mid-sentence will sometimes get it wrong; a model handed
+    # the finished figure cannot.
+    #
+    # amount_paise stays for the machinery. say_amount is what the agent is
+    # told to speak.
+    amount_paise = checkout["amount_paise"]
     return {
-        "amount_paise": checkout["amount_paise"],
+        "amount_paise": amount_paise,
+        "amount_inr": round(amount_paise / 100.0, 2),
+        "say_amount": _say_rupees(amount_paise),
         "currency": checkout.get("currency", "INR"),
-        "cogs_paise": checkout.get("cogs_paise"),
+        # cogs is NOT returned. It is the merchant's cost price, it is
+        # nothing to do with what this agent says to a customer, and a model
+        # that can see it can say it out loud. The policy engine reads it
+        # straight from the database where it belongs - see
+        # policy_engine.evaluate's margin arithmetic.
         "status": checkout["status"],
     }
 
@@ -379,6 +418,9 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
         "ceiling_percent": decision.get("ceiling_percent"),
         "margin_floor_percent": decision.get("margin_floor_percent"),
         "final_amount_paise": final_amount_paise,
+        # What to SAY. The model must quote this verbatim rather than
+        # converting final_amount_paise itself - see _say_rupees.
+        "say_amount": _say_rupees(final_amount_paise),
         "offer_token": token_row["offer_token"],
         "expires_at": str(token_row["expires_at"]),
     }
@@ -677,6 +719,7 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
         "offer_token": offer_token,
         "approved_percent": approved_percent,
         "final_amount_paise": token["final_amount_paise"],
+        "say_amount": _say_rupees(token["final_amount_paise"]),
         "payment_url": payment_result["url"],
         "channel": channel,
         "email_sent": bool(customer_email and channel == "email"),
