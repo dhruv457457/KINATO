@@ -61,7 +61,7 @@ from app.agents.state import AgentContext
 from app.agents.tools import ALL_TOOLS, record_opt_out, LOW_CONFIDENCE_FLOOR
 from app.agents.audit import execute_tool
 from app.agents import runtime as agent_runtime
-from app.services.tts import voice_block as tts_voice_block, TWILIO_NEURAL_VOICE
+from app.services.tts import voice_block as tts_voice_block, TWILIO_NEURAL_VOICE, elevenlabs_active
 from app.db.repositories import conversation_turns as turns_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import checkouts as checkouts_repo
@@ -123,8 +123,8 @@ VOICE_MAX_ITERATIONS = 4
 # _respond now DERIVES the real deadline from the wall clock - see
 # _remaining_reasoning_budget - and these two only stop the derived value
 # from being absurd in either direction.
-VOICE_DEADLINE_MIN_S = 4.0
-VOICE_DEADLINE_MAX_S = 10.0
+VOICE_DEADLINE_MIN_S = 1.5
+VOICE_DEADLINE_MAX_S = 4.0
 
 # --- Surviving speech-to-text ------------------------------------------
 # Twilio posts a `Confidence` float (0.0-1.0) with every SpeechResult, and
@@ -162,17 +162,37 @@ MAX_MISHEARD_STREAK = 2
 TWILIO_WEBHOOK_DEADLINE_S = 15.0
 # Log loudly past this. Two thirds of the deadline is the point where a
 # turn is working but has stopped having any margin.
-TURN_BUDGET_WARN_S = 10.0
+TURN_BUDGET_WARN_S = 3.5
 # The whole turn, cut off here whatever it is doing. Comfortably inside
 # Twilio's deadline so there is still time to render and return a spoken
 # line after the cut - a timeout that fires at the deadline is worth
 # nothing, because answering late is the same as not answering.
 #
-# Raised 11.0 -> 12.5. The 11.0 implicitly reserved ~4s to answer after the
-# cut, but the cut-off branch returns a literal <Say> with no network call
-# at all: it costs microseconds, not seconds. That reserve was 1.5s of
-# reasoning being left on the table on every single turn for nothing.
-TURN_HARD_TIMEOUT_S = 12.5
+# MEASURED, not documented. Twilio's stated webhook budget is ~15s and this
+# deployment's real one is about FIVE, and every constant in this file was
+# tuned against the wrong number for the whole life of the project.
+#
+# Six live turns settle it:
+#
+#     1.2s  1.3s  1.5s  4.0s   call continued
+#     5.2s  5.7s  7.2s          call KILLED
+#
+# and the arithmetic on the 5.7s one is exact: the request arrived at
+# 17:17:31.4, Twilio gave up around 36.4, played "an application error has
+# occurred" for ~3.5s, and the call record ends at 17:17:40. Our reply
+# arrived at 17:17:37 - a fraction of a second after Twilio had already
+# stopped listening, which is also why that turn has no 200 in the access
+# log while every faster turn does.
+#
+# So the customer was never hanging up on dead air. We were missing a
+# deadline four times tighter than the one being designed for, on the one
+# turn that commits the sale.
+#
+# 4.5 leaves room to answer BEFORE Twilio's error rather than after it,
+# which is the whole point of having our own timeout: the cut-off branch
+# speaks a real line and the call continues. Until now that branch was
+# unreachable - Twilio always got there first.
+TURN_HARD_TIMEOUT_S = 4.5
 
 # What a turn still has to do AFTER the agent stops reasoning: render one
 # TTS line and return the TwiML. The reasoning budget is whatever is left
@@ -180,7 +200,7 @@ TURN_HARD_TIMEOUT_S = 12.5
 # by construction rather than by three constants agreeing with each other
 # by hand. tests/test_turn_budget.py asserts it.
 TTS_BUDGET_S = 2.0
-RESPONSE_RESERVE_S = 0.4
+RESPONSE_RESERVE_S = 0.3
 
 # When this turn started, per request. A ContextVar rather than a parameter
 # because the turn's start is set in the outermost handler and needed
@@ -205,7 +225,15 @@ def _remaining_reasoning_budget() -> float:
         # No turn clock (a direct unit-test call, the batch harness). Fall
         # back to the ceiling rather than inventing a number.
         return VOICE_DEADLINE_MAX_S
-    remaining = TURN_HARD_TIMEOUT_S - (time.monotonic() - started) - TTS_BUDGET_S - RESPONSE_RESERVE_S
+    # Only reserve TTS time if TTS will actually cost any.
+    #
+    # With ElevenLabs off - no voice id, or the account refused it -
+    # voice_block returns a Twilio <Say> with no network call at all. Setting
+    # aside two seconds for that hands two seconds of a five-second budget to
+    # something that takes microseconds, and takes them from the only thing
+    # left to spend them on.
+    tts_cost = TTS_BUDGET_S if elevenlabs_active() else 0.0
+    remaining = TURN_HARD_TIMEOUT_S - (time.monotonic() - started) - tts_cost - RESPONSE_RESERVE_S
     return max(VOICE_DEADLINE_MIN_S, min(VOICE_DEADLINE_MAX_S, remaining))
 
 # The keypad. This is the ONLY input path in the system that speech

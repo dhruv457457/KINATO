@@ -9,6 +9,7 @@ from app.db.repositories import consents as consents_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from app.db.database import run_db_async
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,6 +42,38 @@ class EmailService:
         item_name = (payload.get("item_name") or "").strip()
         business_name = (payload.get("business_name") or "").strip()
         customer_name = (payload.get("customer_name") or "").strip()
+
+        # Resolve the wording HERE, not on the call.
+        #
+        # issue_offer used to read the checkout and the merchant before it
+        # created the payment link, purely to fill in these two strings -
+        # two blocking round trips on the one turn that has a customer
+        # waiting in silence. Twilio's real webhook budget turned out to be
+        # about five seconds, and that turn was taking 5.7, so the call was
+        # being killed to look up a product name.
+        #
+        # Nothing about a cart's item name or a merchant's business name can
+        # change between the link being created and this email going out, so
+        # there was never a reason to know them any earlier. The email is
+        # identical; the customer simply is not waiting for it.
+        #
+        # Still no fabricated fallbacks: a lookup that fails leaves the field
+        # empty and the email says less, exactly as before.
+        if not item_name and payload.get("checkout_id"):
+            try:
+                checkout = await run_db_async(checkouts_repo.get_checkout, payload["checkout_id"])
+                line_items = json.loads((checkout or {}).get("line_items") or "[]")
+                names = [li.get("name") or li.get("product_id") for li in line_items if isinstance(li, dict)]
+                item_name = ", ".join([n for n in names if n][:3])
+            except Exception as e:
+                logger.warning(f"EmailService: could not resolve the item name ({e}); sending without it.")
+
+        if not business_name and event.get("merchant_id"):
+            try:
+                merchant = await run_db_async(merchants_repo.get_merchant, event["merchant_id"])
+                business_name = ((merchant or {}).get("name") or "").strip()
+            except Exception as e:
+                logger.warning(f"EmailService: could not resolve the business name ({e}); sending without it.")
         amount = float(payload.get("amount") or 0.0)
         discount_pct = float(payload.get("discount") or 0.0)
         base_price = float(payload.get("base_price") or amount)

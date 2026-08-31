@@ -440,9 +440,19 @@ class TestQuietHoursHoldsInsteadOfChurning:
         from app.gateway import sweeper
         from tests.conftest import wait_until
 
-        # Window wide open.
+        # Window wide open - and 24, not 23, is what that means.
+        #
+        # This test is @real_clock, so it uses the actual hour. With
+        # end_hour=23 the check is `0 <= hour < 23`, which excludes 23:00 to
+        # midnight - so it passed for twenty-three hours a day and failed for
+        # one, and only if you happened to run the suite late.
+        #
+        # That off-by-one is the exact bug FINDINGS records on the product
+        # side: 0-23 silently skips the last hour, which is why end_hour is
+        # allowed to be 24 and why the Policies screen treats 0-24 as "around
+        # the clock". The test that guards the fix was reproducing the bug.
         policies_repo.update_policy(
-            real_merchant_id, {"calling_start_hour": 0, "calling_end_hour": 23}
+            real_merchant_id, {"calling_start_hour": 0, "calling_end_hour": 24}
         )
         checkout = checkouts_repo.create_checkout(real_merchant_id, amount_paise=300_000)
         cid = checkout["checkout_id"]

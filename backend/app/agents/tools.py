@@ -527,15 +527,22 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
     approved_percent = token["approved_percent"] or 0.0
     original_amount = token["base_amount_paise"] / 100.0
 
-    # Real cart + real store name for the email that follows.
-    checkout_row = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id) if ctx.checkout_id else None
-    business_name = ""
-    try:
-        merchant_row = await run_db_async(merchants_repo.get_merchant, ctx.merchant_id)
-        business_name = ((merchant_row or {}).get("name") or "").strip()
-    except Exception:
-        business_name = ""
-
+    # The cart and the store name used to be read HERE, two blocking round
+    # trips, purely to fill in the item name and business name of the email
+    # that follows. They are resolved by the email subscriber now.
+    #
+    # This was not an optimisation, it was the bug. Twilio's real webhook
+    # budget on this deployment measures about FIVE seconds, not the 15 the
+    # documentation implies - established from six live turns, where every
+    # turn under 4s survived and every turn over 5.2s was killed with "an
+    # application error has occurred". The turn that sends the link was
+    # taking 5.7s, and roughly a third of that was these two reads. The call
+    # was being destroyed to look up a product name for an email nobody was
+    # waiting on.
+    #
+    # Nothing about a cart's items or a merchant's name can change between
+    # this moment and the email going out, so there was never a reason to
+    # know them any earlier - see email_service.handle_send_requested.
     # This runs INSIDE a live phone call, where every sequential DB round
     # trip costs ~2-2.8s from Railway to Supabase and the whole turn must
     # finish before Twilio's ~15s deadline. The customer lookup does not
@@ -635,36 +642,32 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
             logger.warning(f"issue_offer: customer lookup failed ({e}); link created, email skipped.")
 
     if customer_email and channel == "email":
-        # Real identity for the email. Without these the template fell back
-        # to hardcoded demo values and sent a customer of "Loomwork" an
-        # email branded "JIVA LIFESTYLE" about a "Handcrafted Bamboo Lamp"
-        # they had never looked at - leftovers of the deleted demo product.
-        item_name = ""
-        try:
-            line_items = json.loads(checkout_row.get("line_items") or "[]") if checkout_row else []
-            names = [li.get("name") or li.get("product_id") for li in line_items if isinstance(li, dict)]
-            names = [n for n in names if n]
-            item_name = ", ".join(names[:3])
-        except (TypeError, ValueError):
-            item_name = ""
-
-        await bus.publish(
-            event_type="email.send_requested",
-            payload={
-                "recovery_attempt_id": ctx.recovery_attempt_id,
-                "checkout_id": ctx.checkout_id,
-                "customer_email": customer_email,
-                "customer_name": (customer or {}).get("name", "") if ctx.customer_id else "",
-                "business_name": business_name,
-                "item_name": item_name,
-                "payment_url": payment_result["url"],
-                "amount": payment_result["final_amount"],
-                "base_price": original_amount,
-                "discount": approved_percent,
-            },
-            correlation_id=ctx.correlation_id,
-            merchant_id=ctx.merchant_id,
-            idempotency_key=f"email_{ctx.recovery_attempt_id or offer_token}",
+        # checkout_id and merchant_id travel instead of the strings they
+        # resolve to. The subscriber looks up the item name and business
+        # name itself, off this call's clock.
+        #
+        # The identity still has to be REAL - the template once fell back to
+        # hardcoded demo values and emailed a Loomwork customer about a
+        # "Handcrafted Bamboo Lamp" from "JIVA LIFESTYLE". That guarantee is
+        # unchanged and now lives with the code that renders the email,
+        # which is where it belongs.
+        _spawn_write(
+            bus.publish(
+                event_type="email.send_requested",
+                payload={
+                    "recovery_attempt_id": ctx.recovery_attempt_id,
+                    "checkout_id": ctx.checkout_id,
+                    "customer_email": customer_email,
+                    "customer_name": (customer or {}).get("name", "") if ctx.customer_id else "",
+                    "payment_url": payment_result["url"],
+                    "amount": payment_result["final_amount"],
+                    "base_price": original_amount,
+                    "discount": approved_percent,
+                },
+                correlation_id=ctx.correlation_id,
+                merchant_id=ctx.merchant_id,
+                idempotency_key=f"email_{ctx.recovery_attempt_id or offer_token}",
+            )
         )
     elif channel == "email":
         logger.warning(f"issue_offer for {ctx.recovery_attempt_id}: no email on file, offer link not sent anywhere")

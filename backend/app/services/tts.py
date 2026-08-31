@@ -73,6 +73,22 @@ TWILIO_NEURAL_VOICE = settings.TWILIO_VOICE_NAME
 # female line in the middle of a male call, from a cache hit.
 AUDIO_CACHE: Dict[str, str] = {}
 
+# Set once ElevenLabs has refused this ACCOUNT rather than this request -
+# see the 401/402/403 branch below for why that is treated as permanent.
+_ELEVENLABS_DISABLED = False
+
+
+def elevenlabs_active() -> bool:
+    """Will voice_block actually spend time on a network call?
+
+    The caller's turn budget depends on the answer. When ElevenLabs is off -
+    no voice id, or the account has refused it - voice_block returns a
+    Twilio <Say> immediately with no request at all, and reserving two
+    seconds for it takes those seconds away from the reasoning that is the
+    only thing left to spend them on.
+    """
+    return bool(ELEVENLABS_VOICE_ID) and not _ELEVENLABS_DISABLED and bool(settings.ELEVENLABS_API_KEY)
+
 
 async def voice_block(text: str) -> str:
     """Always returns a usable TwiML fragment - never empty, never raises,
@@ -94,6 +110,8 @@ async def generate_elevenlabs_audio(text: str) -> str:
     longer treated as fatal by callers (use voice_block() instead of this
     directly, unless you specifically need to know whether ElevenLabs
     itself succeeded)."""
+    global _ELEVENLABS_DISABLED
+
     clean_text = text.strip()
     # An empty voice id turns ElevenLabs off entirely, and every line is
     # rendered by Twilio in TWILIO_NEURAL_VOICE instead. That is a supported
@@ -101,6 +119,11 @@ async def generate_elevenlabs_audio(text: str) -> str:
     # voice for the whole call and hands back the 2s budget, at the cost of
     # some expressiveness.
     if not ELEVENLABS_VOICE_ID:
+        return ""
+    # Already told, once, that this account cannot use this voice. Asking
+    # again on every line of every call answers nothing and spends the
+    # budget to hear it.
+    if _ELEVENLABS_DISABLED:
         return ""
     cache_key = f"{ELEVENLABS_VOICE_ID}|{clean_text}"
     if cache_key in AUDIO_CACHE:
@@ -139,7 +162,27 @@ async def generate_elevenlabs_audio(text: str) -> str:
             audio_url = f"{settings.NGROK_URL}/audio/{file_id}"
             AUDIO_CACHE[cache_key] = audio_url
             return audio_url
-        logger.warning(f"ElevenLabs HTTP {res.status_code}: {res.text}")
+        # 401/402/403 are verdicts about the ACCOUNT, not about this line.
+        # A wrong key, an unpaid plan, a voice this subscription may not use
+        # - none of them become true again by trying the next sentence.
+        #
+        # Observed live: a library voice on a free plan returned
+        #   402 "Free users cannot use library voices via the API"
+        # on every single turn of a call. Four doomed round trips, each
+        # inside the 2s budget of a turn that had a customer waiting on the
+        # line, all to be told the same permanent thing.
+        #
+        # Latch it off for the process. A redeploy re-arms it, which is the
+        # right granularity: fixing a plan or a key means changing config,
+        # and changing config restarts this.
+        if res.status_code in (401, 402, 403):
+            _ELEVENLABS_DISABLED = True
+            logger.error(
+                f"ElevenLabs refused this account (HTTP {res.status_code}) - disabling it for this "
+                f"process and speaking every line in {TWILIO_NEURAL_VOICE} instead. {res.text}"
+            )
+        else:
+            logger.warning(f"ElevenLabs HTTP {res.status_code}: {res.text}")
     except Exception as e:
         logger.warning(f"ElevenLabs call failed: {e.__class__.__name__}: {e!r}")
     return ""

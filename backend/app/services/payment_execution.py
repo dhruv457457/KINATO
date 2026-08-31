@@ -10,6 +10,17 @@ from app.db.repositories.merchants import MerchantNotFoundError
 
 logger = logging.getLogger(__name__)
 
+# Strong references for fire-and-forget work. asyncio holds a running task
+# only weakly, so a bare create_task can be collected before it finishes -
+# the same hazard _spawn_write exists for elsewhere in this codebase.
+_BACKGROUND: set = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
 
 class PaymentExecutionError(Exception):
     """Raised when a real Razorpay payment link cannot be created - either
@@ -108,18 +119,30 @@ class PaymentExecutionService:
         payment_url = rzp_link["short_url"]
         logger.info(f"Created Razorpay Payment Link {payment_link_id}")
 
-        await bus.publish(
-            event_type="payment_link.created",
-            payload={
-                "recovery_attempt_id": recovery_attempt_id,
-                "checkout_id": checkout_id,
-                "payment_link_id": payment_link_id,
-                "payment_url": payment_url,
-                "final_amount": final_amount,
-            },
-            correlation_id=checkout_id,
-            merchant_id=merchant_id,
-            idempotency_key=f"plink_gen_{recovery_attempt_id}"
+        # Announced, not awaited. The link already exists - this is the
+        # record of it, and a customer on the phone should not be waiting
+        # for a database write about something that has already happened.
+        #
+        # The idempotency key stays. A keyed publish claims the key with an
+        # INSERT ... ON CONFLICT DO NOTHING before dispatching subscribers,
+        # so backgrounding the WHOLE publish keeps that ordering intact and
+        # still prevents recovered revenue being counted twice by a redeploy
+        # landing between two Razorpay retries (see event_bus). Dropping the
+        # key would have been the fast and wrong version of this.
+        _spawn(
+            bus.publish(
+                event_type="payment_link.created",
+                payload={
+                    "recovery_attempt_id": recovery_attempt_id,
+                    "checkout_id": checkout_id,
+                    "payment_link_id": payment_link_id,
+                    "payment_url": payment_url,
+                    "final_amount": final_amount,
+                },
+                correlation_id=checkout_id,
+                merchant_id=merchant_id,
+                idempotency_key=f"plink_gen_{recovery_attempt_id}",
+            )
         )
 
         return {

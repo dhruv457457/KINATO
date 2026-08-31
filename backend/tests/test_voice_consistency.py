@@ -164,3 +164,87 @@ class TestHinglishIsOptedInto:
 
         monkeypatch.setattr(settings, "AGENT_LANGUAGE", "hinglish")
         assert settings.VOICE_GATHER_LANGUAGE == "en-IN"
+
+
+class TestElevenLabsStopsAskingAfterARefusal:
+    """A 401/402/403 is a verdict about the account, not about one line.
+
+    Observed live: a library voice on a free plan returned
+    402 "Free users cannot use library voices via the API" on EVERY turn of a
+    call. Four doomed round trips, each inside the 2s budget of a turn with a
+    customer waiting on the line, all to be told the same permanent thing.
+
+    A wrong key, an unpaid plan, or a voice this subscription may not use do
+    not become true again by trying the next sentence.
+    """
+
+    async def test_a_402_disables_it_for_the_process(self, monkeypatch):
+        from app.services import tts
+
+        monkeypatch.setattr(tts, "_ELEVENLABS_DISABLED", False)
+        monkeypatch.setattr(tts, "AUDIO_CACHE", {})
+        monkeypatch.setattr(tts, "ELEVENLABS_VOICE_ID", "voice_the_account_may_not_use")
+        monkeypatch.setattr(settings, "ELEVENLABS_API_KEY", "fake-key")
+
+        calls = {"n": 0}
+
+        class _Resp:
+            status_code = 402
+            text = '{"detail":{"code":"paid_plan_required"}}'
+
+        class _Client:
+            async def post(self, *a, **k):
+                calls["n"] += 1
+                return _Resp()
+
+        monkeypatch.setattr(tts, "shared_ipv4_client", lambda *a, **k: _Client())
+
+        assert await tts.generate_elevenlabs_audio("first line") == ""
+        assert calls["n"] == 1
+
+        # Every later line must not ask again.
+        assert await tts.generate_elevenlabs_audio("second line") == ""
+        assert await tts.generate_elevenlabs_audio("third line") == ""
+        assert calls["n"] == 1, "it kept asking an account that had already refused"
+
+    async def test_a_transient_failure_is_still_retried(self, monkeypatch):
+        """The distinction that makes this safe.
+
+        A 500 or a timeout is about this REQUEST and may well succeed on the
+        next line. Latching those off would silence the good voice for the
+        rest of the process over one bad second.
+        """
+        from app.services import tts
+
+        monkeypatch.setattr(tts, "_ELEVENLABS_DISABLED", False)
+        monkeypatch.setattr(tts, "AUDIO_CACHE", {})
+        monkeypatch.setattr(tts, "ELEVENLABS_VOICE_ID", "some_voice")
+        monkeypatch.setattr(settings, "ELEVENLABS_API_KEY", "fake-key")
+
+        calls = {"n": 0}
+
+        class _Resp:
+            status_code = 500
+            text = "upstream boom"
+
+        class _Client:
+            async def post(self, *a, **k):
+                calls["n"] += 1
+                return _Resp()
+
+        monkeypatch.setattr(tts, "shared_ipv4_client", lambda *a, **k: _Client())
+
+        await tts.generate_elevenlabs_audio("first line")
+        await tts.generate_elevenlabs_audio("second line")
+        assert calls["n"] == 2, "a transient error must not disable the voice"
+        assert tts._ELEVENLABS_DISABLED is False
+
+    async def test_the_call_still_speaks_once_it_is_disabled(self, monkeypatch):
+        """The point of the fallback. Disabling ElevenLabs must never mean
+        silence - every line still renders through Twilio."""
+        from app.services import tts
+
+        monkeypatch.setattr(tts, "_ELEVENLABS_DISABLED", True)
+        block = await tts.voice_block("Great news - I've sent that to your email.")
+        assert block.startswith("<Say")
+        assert tts.TWILIO_NEURAL_VOICE in block
