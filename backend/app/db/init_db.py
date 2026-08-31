@@ -383,6 +383,19 @@ def init_db(force_reseed: bool = False) -> None:
         # only a date loses the terms it was a promise about, so a reminder
         # a week later cannot say what was agreed.
         "ALTER TABLE recovery_attempts ADD COLUMN promised_offer_token TEXT",
+        # When the payment link stops being payable.
+        #
+        # payment_execution sets expire_by to now+24h and then throws the
+        # value away, so nothing here could tell a live link from a dead
+        # one - and without that, a link can never be reused and every
+        # attempt has to mint another. Razorpay's test mode allows thirty
+        # per account in total, which this project has now exhausted twice
+        # (see FINDINGS #7), each time looking like a code regression.
+        #
+        # It cannot be inferred from updated_at: every later update_state
+        # on the attempt refreshes that, so a PROMISED write hours later
+        # would make an expired link look fresh.
+        "ALTER TABLE recovery_attempts ADD COLUMN rzp_payment_link_expires_at TIMESTAMPTZ",
     ):
         try:
             with get_db() as alter_conn:

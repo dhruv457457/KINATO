@@ -178,6 +178,53 @@ This is the concrete argument for auditing every tool call *including the ones
 that fail* — the audit trail is what distinguishes "our code is wrong" from
 "the world changed."
 
+### It happened again, which is the actual finding
+
+The same wall, a second time, months later — and this time **mid-call**, with a
+customer on the line who had just said *"yes, send it"*:
+
+```
+check_offer   ALLOW     approved 0%, token minted
+issue_offer   REJECTED  "test mode limit of 30 reached for payment_link"
+```
+
+Reading the first occurrence as "an external quota impersonated a regression"
+was correct and also insufficient. It explained the symptom and left the cause
+alone: **every recovery attempt minted a brand-new payment link, including a
+retry of a cart where nothing had changed.** Thirty attempts and the account is
+finished, permanently — Razorpay's test cap counts links ever created, not
+links currently live, which is why the dashboard showed thirty *expired* links
+and still refused to mint the thirty-first.
+
+The fix is to stop asking for a new one. A live link for the same cart at the
+same price is reused instead: same merchant, same `checkout_id`, exact match on
+`final_amount_paise`. A customer sent that URL twice receives the thing they
+were already promised, so the shared link is the correct artifact rather than a
+workaround.
+
+Two details did the actual work.
+
+**Expiry was computed and thrown away.** `payment_execution` set
+`expire_by = now + 24h` as a local variable and never stored it, so nothing in
+the database could tell a live link from a dead one — and without that, no link
+could ever be safely reused. It is a stored column now. It cannot be inferred
+from `updated_at`, because every later `update_state` on the attempt refreshes
+that, and a `PROMISED` write hours later would make a dead link look fresh.
+
+**The amount match is exact, in integer paise.** This is the condition that
+matters, and it points the opposite way from the bug: a link *carries* an
+amount, and Razorpay will charge whatever it says. A reused link at the wrong
+price takes money nobody approved — worse than any number of exhausted quotas.
+Six of the eight tests in `test_link_reuse.py` assert a **refusal** to reuse,
+which is the right ratio for a feature whose failure mode is charging the wrong
+person the wrong amount.
+
+The general lesson is about how the first finding was written. "An external
+quota impersonated a code regression" is a true and useful sentence about
+*diagnosis*, and stopping there meant the same quota exhausted itself again
+under identical conditions. **A finding that explains a symptom without
+naming what consumed the resource is half a finding.**
+
 ---
 
 ## 8. We measured the obvious optimisation and did not ship it
@@ -991,6 +1038,87 @@ from this tracker.
 The general shape, for the third time in this file: **a list that means
 "attempted" must never be read as a list that means "succeeded"**, and the
 distance between those two readings is exactly one word of a variable name.
+
+---
+
+## 20. Two features that were built, tested, shipped — and not running
+
+Both of these passed their tests. Both were wired into the code paths that use
+them. Neither was doing its job in production, and nothing anywhere would have
+said so.
+
+### The classifier that saw 0.7% of traffic
+
+`failure_diagnosis.py` is pure, deterministic, tested, and drives a real
+refusal: `REJECTED_FULL_PRICE_FIRST` structurally prevents the agent
+discounting a customer whose card merely broke. It has six classes, including
+`USER_ABANDON` for a cart someone walked away from.
+
+In production:
+
+```
+failure_class = NULL           604 of 608 checkouts
+failure_class = SOFT_DECLINE     4   (test rows)
+
+REJECTED_FULL_PRICE_FIRST has fired   3 times, ever
+check_offer has run                 206 times
+```
+
+`record_failure()` was called from exactly one place — the `payment.failed`
+webhook. Every cart the sweeper timed out reached the agent with NULL. And
+because the demo flow is *abandonment*, not payment failure, essentially no
+real traffic ever produced the input the feature needed.
+
+The class it should have had existed the whole time and nothing assigned it.
+`diagnose(None)` has always returned `USER_ABANDON`; the sweeper simply never
+asked. It classifies in the same statement that claims the row now, with
+`COALESCE(failure_class, 'USER_ABANDON')` — because `record_failure`
+overwrites unconditionally, and a version of this that assigned instead of
+coalescing would have downgraded every genuine bank decline to "they wandered
+off", losing the one class that *forbids* discounting them. That would have
+been FINDINGS #1 again, introduced by the fix for this.
+
+Backfilled: **539 rows**, 0 ambiguous. Every unpaid checkout is classified
+now. The 65 that remain NULL are all `paid` — a paid cart has no failure to
+describe.
+
+What makes this worth writing down is that no test could have caught it. Every
+test that exercises the classifier *passes it a failure object*. The bug was
+that production never did.
+
+### Two voices that matched by luck
+
+The agent used ElevenLabs "Sarah" (female) with `Polly.Kajal-Neural` (female)
+as its fallback. They agreed, so nobody looked closer.
+
+They are not alternatives. The opening turn plays the ElevenLabs block and
+then appends the keypad note as a Twilio `<Say>` — **both are heard on every
+single call**, back to back — and any later turn flips to the fallback
+whenever the 2s budget overruns. Nothing in the code required them to match,
+nothing checked, and nothing would have noticed if one changed. Editing one
+constant to get a male voice would have produced a caller who changes sex
+mid-sentence.
+
+The cache was the same shape of latent bug: keyed on the spoken text alone, so
+it outlived a voice change within a process. New lines in the new voice, and
+previously-cached lines still playing in the old one.
+
+Both voices are settings-backed and tested together now. An empty voice id is
+a supported mode rather than a broken one: everything renders through the
+Twilio voice, which guarantees consistency by construction and hands back the
+2-second budget.
+
+One incidental finding while choosing the replacement: **Polly has no male
+`en-IN` neural voice.** Twilio exposes Google's voices alongside Amazon's, and
+that is where the male Indian options live — `Google.en-IN-Neural2-B`.
+
+### The shared shape
+
+A test proves a component works *when it is called with the inputs the test
+supplies*. It says nothing about whether production supplies those inputs, or
+whether a value it depends on is still what someone assumed a month ago. Both
+of these were correct code, correctly tested, quietly not running — and in
+both cases the evidence was a single query away and nobody ran it.
 
 ---
 

@@ -52,6 +52,39 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = Field(default="", description="Twilio Auth Token")
     TWILIO_PHONE_NUMBER: str = Field(default="", description="Twilio outbound caller ID")
     ELEVENLABS_API_KEY: str = Field(default="", description="ElevenLabs TTS API Key")
+    # Who the agent sounds like. These two must describe the SAME PERSON.
+    #
+    # A call does not use one voice: the opening turn plays an ElevenLabs
+    # block and then a Twilio <Say> keypad note back to back, so both are
+    # heard on every single call, and any later turn flips to the fallback
+    # whenever the 2s budget overruns. They were previously matched (both
+    # female) by luck, with nothing requiring it and nothing noticing if
+    # one changed.
+    #
+    # An empty ELEVENLABS_VOICE_ID disables ElevenLabs entirely and renders
+    # every line through TWILIO_VOICE_NAME - one consistent voice, no 2s
+    # budget to overrun, less expressive. A supported configuration, not a
+    # broken one.
+    ELEVENLABS_VOICE_ID: str = Field(
+        default="", description="ElevenLabs voice id. Empty = render everything with the Twilio voice."
+    )
+    # Google.en-IN-Neural2-B: male, Indian English, neural. Polly has no
+    # male en-IN neural voice - Twilio exposes Google's voices alongside
+    # Amazon's, and that is where the male Indian options are.
+    TWILIO_VOICE_NAME: str = Field(
+        default="Google.en-IN-Neural2-B", description="Twilio <Say> voice, and the TTS fallback."
+    )
+    # What Twilio's recogniser expects to hear. ONE BCP-47 value - <Gather>
+    # has no bilingual mode, so this is a genuine either/or.
+    #
+    # en-IN rather than hi-IN deliberately: Indian English transcribes
+    # code-switched Hinglish far better than Hindi transcribes English, and
+    # a mis-transcription here is not cosmetic. It feeds misheard_streak and
+    # the REJECTED_LOW_CONFIDENCE gate that stops the money tools running,
+    # so getting it wrong degrades the money path, not just the transcript.
+    VOICE_GATHER_LANGUAGE: str = Field(
+        default="en-IN", description="BCP-47 language for Twilio speech recognition."
+    )
     DEEPGRAM_API_KEY: str = Field(default="", description="Deepgram STT API Key")
     NGROK_URL: str = Field(default="", description="Public tunnel URL for Twilio voice webhooks")
 

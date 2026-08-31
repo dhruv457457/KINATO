@@ -68,10 +68,24 @@ async def test_sweep_is_idempotent_across_repeated_passes(real_merchant_id, uniq
         real_merchant_id, amount_paise=349900, checkout_id=unique_checkout_id, customer_id="cust_1"
     )
 
-    await sweep_once()
-    first_count = len(_events("checkout.abandoned"))
-    await sweep_once()
-    second_count = len(_events("checkout.abandoned"))
+    def _fired_for_this_checkout() -> int:
+        return len(
+            [e for e in _events("checkout.abandoned")
+             if e["payload"]["checkout_id"] == unique_checkout_id]
+        )
 
+    await sweep_once()
+    first_count = _fired_for_this_checkout()
+    await sweep_once()
+    second_count = _fired_for_this_checkout()
+
+    # Scoped to THIS checkout, like every other test in this file.
+    #
+    # It used to count every checkout.abandoned event in the bus log, which
+    # made it an assertion about how much the sweeper swept globally rather
+    # than about idempotency. sweep_once() sweeps every merchant, and these
+    # tests run against a shared database - so one unrelated stale row left
+    # by anything else was enough to fail a test about re-firing. It did,
+    # once, in a full-suite run and never in isolation.
     assert first_count == 1
     assert second_count == first_count, "a second sweep pass must not re-fire abandonment for the same checkout"

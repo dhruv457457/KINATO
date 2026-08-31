@@ -548,20 +548,58 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
         if ctx.customer_id else None
     )
 
-    try:
-        payment_result = await payment_execution.generate_recovery_checkout(
-            merchant_id=ctx.merchant_id,
-            checkout_id=ctx.checkout_id or "",
-            customer_id=ctx.customer_id or "",
-            recovery_attempt_id=ctx.recovery_attempt_id or "",
-            original_amount=original_amount,
-            approved_discount_percent=approved_percent,
-            offer_token=offer_token,
+    # Reuse a live link for this exact cart at this exact price, rather than
+    # minting a second one that says the same thing.
+    #
+    # Razorpay's test mode caps an account at thirty payment links FOREVER,
+    # and this project has exhausted that twice - both times presenting as a
+    # broken integration rather than an exhausted quota (FINDINGS #7). The
+    # cause is that every attempt minted a fresh link, including a retry of
+    # a cart nothing about which had changed.
+    #
+    # A customer sent the same URL twice receives the thing they were
+    # already promised, so this is the correct artifact and not a
+    # workaround. The offer token is still consumed either way: the offer
+    # was spent, only the link is shared.
+    reused = None
+    if ctx.checkout_id:
+        try:
+            reused = await run_db_async(
+                recovery_attempts_repo.find_reusable_payment_link,
+                ctx.merchant_id,
+                ctx.checkout_id,
+                token["final_amount_paise"],
+            )
+        except Exception as e:
+            # A lookup that fails must not stop the sale - mint instead.
+            logger.warning(f"issue_offer: reusable-link lookup failed ({e}); minting a new one.")
+
+    if reused:
+        logger.info(
+            f"issue_offer: reusing live payment link {reused['rzp_payment_link_id']} "
+            f"for {ctx.checkout_id} at {token['final_amount_paise']} paise."
         )
-    except PaymentExecutionError as e:
-        if customer_task:
-            customer_task.cancel()
-        return {"status": "REJECTED", "reason": f"payment_execution_failed: {e}"}
+        payment_result = {
+            "payment_link_id": reused["rzp_payment_link_id"],
+            "url": reused["rzp_payment_link_url"],
+            "final_amount": token["final_amount_paise"] / 100.0,
+            "expires_at": reused["rzp_payment_link_expires_at"],
+        }
+    else:
+        try:
+            payment_result = await payment_execution.generate_recovery_checkout(
+                merchant_id=ctx.merchant_id,
+                checkout_id=ctx.checkout_id or "",
+                customer_id=ctx.customer_id or "",
+                recovery_attempt_id=ctx.recovery_attempt_id or "",
+                original_amount=original_amount,
+                approved_discount_percent=approved_percent,
+                offer_token=offer_token,
+            )
+        except PaymentExecutionError as e:
+            if customer_task:
+                customer_task.cancel()
+            return {"status": "REJECTED", "reason": f"payment_execution_failed: {e}"}
 
     # Bookkeeping, not the money action - the link already exists and the
     # customer is waiting on the line. Don't hold the call open for it.
@@ -581,6 +619,9 @@ async def _issue_offer(ctx: AgentContext, offer_token: str, channel: str = "emai
                     final_amount_paise=token["final_amount_paise"],
                     rzp_payment_link_id=payment_result["payment_link_id"],
                     rzp_payment_link_url=payment_result["url"],
+                    # Stored so a later attempt can tell this link from a
+                    # dead one. Without it no link is ever reusable.
+                    rzp_payment_link_expires_at=payment_result.get("expires_at"),
                 )
             )
         )

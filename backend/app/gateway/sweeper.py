@@ -23,6 +23,9 @@ from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories.merchants import is_rail_degraded
 from app.services import outreach_guards
+# The class the classifier already returns for "no error object at all" -
+# imported rather than written as a literal so there is one spelling of it.
+from app.services.failure_diagnosis import USER_ABANDON
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +76,32 @@ async def sweep_once() -> int:
 
         with get_db() as conn:
             cursor = conn.cursor()
+            # Classify while claiming, in the same statement.
+            #
+            # failure_class was only ever written by the payment.failed
+            # webhook, so a cart that timed out here arrived at the agent
+            # with NULL - and 604 of 608 checkouts in production were NULL.
+            # The classifier has had a USER_ABANDON class the whole time and
+            # nothing ever assigned it: diagnose() returns USER_ABANDON for
+            # exactly this input (no error object at all), so the value is
+            # not invented here, only recorded.
+            #
+            # It matters because NULL and USER_ABANDON are not equivalent
+            # downstream. Both leave a discount permissible - neither is in
+            # FULL_PRICE_FIRST_CLASSES - but describe(None) returns an empty
+            # string while describe("USER_ABANDON") returns a real sentence.
+            # A NULL costs the agent its opening context and it has to ask
+            # the customer something it could have known.
+            #
+            # COALESCE, not assignment: record_failure overwrites
+            # unconditionally, and a cart whose payment genuinely failed
+            # before it was swept must keep its SOFT_DECLINE rather than
+            # being downgraded to "they just wandered off".
             cursor.execute(
-                "UPDATE checkouts SET status = 'abandoned', abandoned_at = NOW() "
+                "UPDATE checkouts SET status = 'abandoned', abandoned_at = NOW(), "
+                "failure_class = COALESCE(failure_class, %s) "
                 "WHERE checkout_id = %s AND status = 'started'",
-                (checkout_id,),
+                (USER_ABANDON, checkout_id),
             )
             claimed = cursor.rowcount > 0
 

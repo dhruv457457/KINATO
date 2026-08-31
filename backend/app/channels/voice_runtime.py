@@ -544,7 +544,7 @@ def _gather_twiml(voice_block: str, retry_message: str = "Are you still there?")
     """
     attrs = (
         f'input="speech dtmf" numDigits="1" action="{settings.NGROK_URL}/voice/respond" '
-        f'method="POST" speechTimeout="auto" timeout="5" language="en-IN"'
+        f'method="POST" speechTimeout="auto" timeout="5" language="{settings.VOICE_GATHER_LANGUAGE}"'
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'

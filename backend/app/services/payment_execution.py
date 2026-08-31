@@ -125,7 +125,13 @@ class PaymentExecutionService:
         return {
             "payment_link_id": payment_link_id,
             "url": payment_url,
-            "final_amount": final_amount
+            "final_amount": final_amount,
+            # Returned so the caller can STORE it. This was computed above
+            # and thrown away, which meant nothing downstream could tell a
+            # live link from a dead one - so no link could ever be reused,
+            # and every attempt minted another against Razorpay's
+            # thirty-per-account test ceiling.
+            "expires_at": expires_at,
         }
 
 

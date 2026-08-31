@@ -83,6 +83,56 @@ def list_active_for_checkout(checkout_id: str) -> list:
         return cursor.fetchall()
 
 
+def find_reusable_payment_link(
+    merchant_id: str, checkout_id: str, final_amount_paise: int
+) -> Optional[Dict[str, Any]]:
+    """A live payment link already minted for this exact cart at this exact price.
+
+    Every attempt used to mint a brand-new Razorpay link, including a retry
+    of the same cart at the same amount. Razorpay's test mode caps an
+    account at thirty links in total, forever - and this project has hit
+    that wall twice, each time presenting as a broken integration rather
+    than as an exhausted quota (FINDINGS #7).
+
+    The same link for the same cart at the same price is not a workaround,
+    it is the correct artifact: a customer who is sent it twice receives
+    the thing they were already promised.
+
+    Three conditions, and every one of them is load-bearing:
+
+      merchant_id  - a link belongs to the merchant's own Razorpay account.
+      checkout_id  - it is payable for one specific order.
+      amount       - EXACT match, never "close enough". A link reused at the
+                     wrong price charges a customer an amount nobody
+                     approved, which is worse than any number of extra
+                     links. This is why the comparison is on
+                     final_amount_paise (integer paise) rather than on the
+                     discount percent, which is a float and rounds.
+
+    Expiry is read from the stored column, not inferred: updated_at is
+    refreshed by every later update_state on the attempt.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT * FROM recovery_attempts
+            WHERE merchant_id = %s
+              AND checkout_id = %s
+              AND final_amount_paise = %s
+              AND rzp_payment_link_url IS NOT NULL
+              AND rzp_payment_link_id IS NOT NULL
+              AND rzp_payment_link_expires_at IS NOT NULL
+              AND rzp_payment_link_expires_at > CURRENT_TIMESTAMP
+            ORDER BY rzp_payment_link_expires_at DESC
+            LIMIT 1
+            """,
+            (merchant_id, checkout_id, final_amount_paise),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
 def expire_stale_calls(older_than_minutes: int = 10) -> list:
     """Closes out attempts stuck mid-call.
 

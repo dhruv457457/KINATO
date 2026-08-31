@@ -48,8 +48,29 @@ ELEVENLABS_BUDGET_S = 2.0
 
 logger = logging.getLogger(__name__)
 
-ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"  # Sarah: warm, expressive
-TWILIO_NEURAL_VOICE = "Polly.Kajal-Neural"  # Indian-English neural voice
+# Both voices are configurable, and both MUST describe the same person.
+#
+# A call does not use one voice. The opening turn plays the ElevenLabs block
+# and then appends the keypad note as Twilio <Say> (voice_runtime), so both
+# are heard back to back every single time. Any later turn flips to the
+# fallback whenever the 2s budget overruns. These were "Sarah" (ElevenLabs,
+# female) and "Polly.Kajal-Neural" (female) - matched by luck rather than by
+# anything enforcing it, and nothing said they had to be.
+#
+# Settings-backed because a voice is a merchant-facing choice, not a code
+# constant. Note config.py uses extra="ignore", so before these existed an
+# ELEVENLABS_VOICE_ID in .env was silently dropped.
+ELEVENLABS_VOICE_ID = settings.ELEVENLABS_VOICE_ID
+# Google.en-IN-Neural2-B: male, Indian English, neural. Polly has no male
+# en-IN neural voice - Twilio exposes Google's alongside Amazon's, and this
+# is the one that matches an Indian male ElevenLabs voice.
+TWILIO_NEURAL_VOICE = settings.TWILIO_VOICE_NAME
+
+# Keyed on (voice, text), not text alone.
+#
+# The cache outlives a voice change within a process, so after switching
+# voices the agent would keep serving mp3s recorded in the old one - a
+# female line in the middle of a male call, from a cache hit.
 AUDIO_CACHE: Dict[str, str] = {}
 
 
@@ -74,8 +95,16 @@ async def generate_elevenlabs_audio(text: str) -> str:
     directly, unless you specifically need to know whether ElevenLabs
     itself succeeded)."""
     clean_text = text.strip()
-    if clean_text in AUDIO_CACHE:
-        return AUDIO_CACHE[clean_text]
+    # An empty voice id turns ElevenLabs off entirely, and every line is
+    # rendered by Twilio in TWILIO_NEURAL_VOICE instead. That is a supported
+    # configuration, not a broken one: it guarantees a single consistent
+    # voice for the whole call and hands back the 2s budget, at the cost of
+    # some expressiveness.
+    if not ELEVENLABS_VOICE_ID:
+        return ""
+    cache_key = f"{ELEVENLABS_VOICE_ID}|{clean_text}"
+    if cache_key in AUDIO_CACHE:
+        return AUDIO_CACHE[cache_key]
     if not settings.ELEVENLABS_API_KEY:
         return ""
 
@@ -108,7 +137,7 @@ async def generate_elevenlabs_audio(text: str) -> str:
             with open(file_path, "wb") as f:
                 f.write(res.content)
             audio_url = f"{settings.NGROK_URL}/audio/{file_id}"
-            AUDIO_CACHE[clean_text] = audio_url
+            AUDIO_CACHE[cache_key] = audio_url
             return audio_url
         logger.warning(f"ElevenLabs HTTP {res.status_code}: {res.text}")
     except Exception as e:
