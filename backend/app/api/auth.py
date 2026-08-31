@@ -102,8 +102,33 @@ async def login(payload: LoginRequest, response: Response, request: Request):
 
 
 @auth_router.post("/logout")
-async def logout(response: Response):
-    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+async def logout(response: Response, request: Request):
+    """Clear the session cookie - with the SAME attributes it was set with.
+
+    This is the whole bug. A browser matches a deletion against the
+    original cookie's path, SameSite and Secure; get any of them wrong and
+    it treats the Set-Cookie as describing a DIFFERENT cookie, quietly
+    stores that expired one, and leaves the real session untouched.
+
+    The cookie is written cross-site (dashboard on Vercel or localhost, API
+    on Railway) so it carries `SameSite=None; Secure` - see _cookie_kwargs.
+    Deleting it with only `path="/"` therefore did nothing at all. Sign-out
+    returned 200, the app redirected to /login, and navigating straight back
+    to /dashboard was still fully authenticated. Verified in a browser
+    against the deployed API.
+
+    Worse than a missing button: a logout that reports success and does not
+    log you out is one the person believes. On a shared machine that is the
+    next person reading someone else's customers.
+    """
+    kwargs = _cookie_kwargs(request)
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path=kwargs["path"],
+        httponly=kwargs["httponly"],
+        samesite=kwargs["samesite"],
+        secure=kwargs["secure"],
+    )
     return {"status": "ok"}
 
 
