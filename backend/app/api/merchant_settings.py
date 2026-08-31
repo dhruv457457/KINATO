@@ -7,6 +7,7 @@ dashboard/trigger routes (see policy_engine.py's docstring for why).
 """
 import csv
 import io
+import json
 import logging
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from pydantic import BaseModel, Field
@@ -20,6 +21,7 @@ from app.db.repositories import api_keys as api_keys_repo
 from app.db.repositories import products as products_repo
 from app.db.repositories import policies as policies_repo
 from app.db.repositories import events as events_repo
+from app.db.database import run_db_async
 from app.services.razorpay_client_factory import validate_credentials_live, invalidate_cache
 
 logger = logging.getLogger(__name__)
@@ -295,6 +297,16 @@ class PolicyUpdateRequest(BaseModel):
     # alternative (0-0) meant never.
     calling_end_hour: Optional[int] = Field(None, ge=0, le=24)
     auto_approval_threshold_inr: Optional[float] = Field(None, ge=0)
+    # Whether this merchant actually has EMI enabled on their Razorpay
+    # account. The agent offers instalments before a discount when this is
+    # on (see failure_diagnosis.describe) - and offering instalments a
+    # checkout cannot provide tells a customer something untrue about their
+    # money, so it stays off until a human says otherwise.
+    emi_available: Optional[bool] = None
+
+
+class PolicyProposalRequest(BaseModel):
+    instruction: str = Field(..., min_length=3, max_length=500)
 
 
 @merchant_router.get("/policy")
@@ -306,6 +318,145 @@ async def get_policy(current_merchant: dict = Depends(get_current_merchant)):
 async def update_policy(payload: PolicyUpdateRequest, current_merchant: dict = Depends(get_current_merchant)):
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     return policies_repo.update_policy(current_merchant["merchant_id"], updates)
+
+
+# The fields a merchant may describe in words. Anything the model returns
+# outside this set is dropped, not merged - a policy is the one object in
+# this system where an unexpected key is a security question rather than a
+# convenience.
+_PROPOSABLE_FIELDS = {
+    "max_discount_percent",
+    "minimum_margin_percent",
+    "calling_start_hour",
+    "calling_end_hour",
+    "auto_approval_threshold_inr",
+    "emi_available",
+}
+
+_POLICY_PROPOSAL_PROMPT = """You translate a merchant's plain-English instruction into changes to their \
+recovery policy. You do not decide anything; you only read what they asked for.
+
+Their current policy:
+{current}
+
+What they said:
+"{instruction}"
+
+Return ONLY a JSON object with a "changes" object and a "summary" string. Put a field in "changes" ONLY if \
+their instruction clearly asks for it - never restate a value that is not changing, and never fill in a \
+field they did not mention.
+
+Fields you may set:
+  max_discount_percent        0-100. The most the agent may ever discount.
+  minimum_margin_percent      0-100. Discounts are capped further to protect this margin.
+  calling_start_hour          0-23, IST.
+  calling_end_hour            0-24, IST. Use start 0 and end 24 for round-the-clock.
+  auto_approval_threshold_inr rupees. The most the agent may give away on one cart unattended. 0 = no limit.
+  emi_available               true/false. Only set true if they say EMI/instalments ARE available on their \
+Razorpay account - it makes the agent offer instalments, and offering what a checkout cannot do is worse \
+than staying quiet.
+
+"summary" is one plain sentence saying what will change, in the merchant's own terms. If you cannot tell \
+what they want, return an empty "changes" object and say so in "summary".
+
+Never invent a number they did not give. "Be more generous" without a figure is not a number - say you need \
+one."""
+
+
+@merchant_router.post("/policy/propose")
+async def propose_policy(
+    payload: PolicyProposalRequest, current_merchant: dict = Depends(get_current_merchant)
+):
+    """Turn "never discount more than 10%" into a proposed policy change.
+
+    **This endpoint writes nothing.** It returns a diff for a human to look
+    at and approve, and that is the entire design, not caution for its own
+    sake.
+
+    Every guarantee this project makes rests on one arrangement: the model
+    argues, and a deterministic policy engine decides. A model that can
+    write the policy sets the ceiling it will later be bound by - the
+    guardrail becomes model output one level up, and the ablation study
+    stops meaning what it says. So the model reads an instruction and
+    proposes; the merchant confirms; the existing PUT applies it.
+
+    The proposal is validated through PolicyUpdateRequest - the SAME model
+    the manual sliders go through - so a hallucinated 500% ceiling is
+    rejected by bounds that already existed rather than by a second set
+    written here that could drift from them.
+    """
+    merchant_id = current_merchant["merchant_id"]
+    current = await run_db_async(policies_repo.get_policy, merchant_id)
+
+    if not settings.OPENROUTER_API_KEY:
+        return {
+            "changes": {},
+            "summary": "No language model is configured, so this cannot read your instruction. "
+                       "The controls below still work.",
+            "degraded": True,
+        }
+
+    readable = {k: current.get(k) for k in sorted(_PROPOSABLE_FIELDS) if k in current}
+    prompt = _POLICY_PROPOSAL_PROMPT.format(
+        current=json.dumps(readable, indent=1, default=str), instruction=payload.instruction
+    )
+
+    try:
+        from openai import AsyncOpenAI
+        from app.core.net import shared_ipv4_client
+
+        client = AsyncOpenAI(
+            base_url=settings.LLM_BASE_URL,
+            api_key=settings.OPENROUTER_API_KEY,
+            http_client=shared_ipv4_client("llm"),
+        )
+        response = await client.chat.completions.create(
+            model=settings.LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=400,
+            timeout=20.0,
+        )
+        raw = json.loads(response.choices[0].message.content or "{}")
+    except Exception as e:
+        logger.warning(f"Policy proposal failed for {merchant_id}: {e}")
+        return {
+            "changes": {},
+            "summary": "Could not read that just now. The controls below still work.",
+            "degraded": True,
+        }
+
+    # Drop anything not proposable, then run what is left through the same
+    # validation the manual form uses. Two filters on purpose: the first
+    # stops an unexpected key reaching a money object at all, the second
+    # stops an in-range-looking value that is not.
+    proposed = {
+        k: v for k, v in (raw.get("changes") or {}).items()
+        if k in _PROPOSABLE_FIELDS and v is not None
+    }
+    try:
+        validated = PolicyUpdateRequest(**proposed).model_dump()
+    except Exception as e:
+        logger.warning(f"Policy proposal for {merchant_id} failed validation: {e}")
+        return {
+            "changes": {},
+            "summary": "That would put a value outside what this policy allows, so nothing was proposed.",
+            "degraded": False,
+        }
+
+    changes = {
+        k: v for k, v in validated.items()
+        if v is not None and k in proposed and v != current.get(k)
+    }
+    return {
+        "changes": changes,
+        # What it currently is, so the UI can show before -> after rather
+        # than a number with no context.
+        "current": {k: current.get(k) for k in changes},
+        "summary": str(raw.get("summary") or "")[:300],
+        "degraded": False,
+    }
 
 
 @merchant_router.post("/onboarding/complete")

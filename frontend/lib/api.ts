@@ -317,6 +317,32 @@ export function connectRazorpay(
   });
 }
 
+export interface PolicyProposal {
+  /** Only the fields that would actually change. Empty when the instruction
+   *  could not be read, which is a valid answer rather than an error. */
+  changes: Record<string, number | boolean>;
+  /** What those same fields are today, so the UI can show before -> after. */
+  current?: Record<string, number | boolean>;
+  summary: string;
+  degraded: boolean;
+}
+
+/** Reads a plain-English instruction and PROPOSES policy changes.
+ *
+ *  Writes nothing. The merchant sees a before -> after diff and confirms,
+ *  and only then does the normal PUT apply it.
+ *
+ *  That split is the point, not caution: every guarantee this product makes
+ *  rests on the model arguing while a deterministic policy engine decides.
+ *  A model that could write the policy would be setting the ceiling it is
+ *  later bound by. */
+export function proposePolicy(instruction: string): Promise<PolicyProposal> {
+  return apiFetch("/api/merchant/policy/propose", {
+    method: "POST",
+    body: JSON.stringify({ instruction }),
+  });
+}
+
 /** Ends the session. The cookie is httpOnly, so only the server can clear
  *  it - a client-side "log out" that just redirects would leave the
  *  session valid and the next visitor signed in as this merchant. */

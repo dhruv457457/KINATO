@@ -1,13 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, proposePolicy, PolicyProposal } from "@/lib/api";
 import {
   PageHeader,
   PageBody,
   SectionTitle,
+  RULE,
   RULE_SOFT,
+  INK,
   INK_MUTED,
+  WASH,
   POSITIVE,
   NEGATIVE,
 } from "@/components/dashboard/primitives";
@@ -18,6 +21,29 @@ interface Policy {
   calling_start_hour: number;
   calling_end_hour: number;
   auto_approval_threshold_inr: number;
+  emi_available: boolean;
+}
+
+/** How each proposable field should read to a human.
+ *  A diff that says `auto_approval_threshold_inr: 500 -> 1000` is a diff
+ *  about a database column. A merchant is approving a change to their own
+ *  money, so it has to read like one. */
+const FIELD_LABELS: Record<string, string> = {
+  max_discount_percent: "Max discount ceiling",
+  minimum_margin_percent: "Minimum margin",
+  calling_start_hour: "Calling starts",
+  calling_end_hour: "Calling ends",
+  auto_approval_threshold_inr: "Auto-approve threshold",
+  emi_available: "EMI offered",
+};
+
+function formatValue(field: string, value: number | boolean | undefined): string {
+  if (value === undefined || value === null) return "—";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (field.endsWith("_percent")) return `${value}%`;
+  if (field.endsWith("_inr")) return `₹${value.toLocaleString("en-IN")}`;
+  if (field.endsWith("_hour")) return `${String(value).padStart(2, "0")}:00`;
+  return String(value);
 }
 
 /** A policy slider with its live value read out in Playfair, so the number
@@ -54,6 +80,154 @@ function PolicySlider({
       <div className="text-xs mt-2" style={{ color: INK_MUTED }}>
         {hint}
       </div>
+    </div>
+  );
+}
+
+/** Describe the policy you want; approve the numbers it proposes.
+ *
+ *  Deliberately a PROPOSAL, not an action. The agent never writes here - it
+ *  reads the instruction, and the merchant approves a before -> after diff
+ *  before anything is saved.
+ *
+ *  That is the same rule the whole product runs on, applied to itself: the
+ *  model argues, a deterministic engine decides, and a human sees every
+ *  number that constrains money before it binds. A model that could write
+ *  this page's values would be setting the ceiling it is later judged
+ *  against. */
+function PolicyAssistant({
+  onApply,
+  disabled,
+}: {
+  onApply: (changes: Record<string, number | boolean>) => Promise<void>;
+  disabled: boolean;
+}) {
+  const [instruction, setInstruction] = useState("");
+  const [proposal, setProposal] = useState<PolicyProposal | null>(null);
+  const [thinking, setThinking] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [error, setError] = useState("");
+
+  async function ask() {
+    if (!instruction.trim()) return;
+    setThinking(true);
+    setError("");
+    setProposal(null);
+    try {
+      setProposal(await proposePolicy(instruction.trim()));
+    } catch {
+      setError("Could not reach the assistant. The controls below still work.");
+    } finally {
+      setThinking(false);
+    }
+  }
+
+  async function apply() {
+    if (!proposal) return;
+    setApplying(true);
+    try {
+      await onApply(proposal.changes);
+      setProposal(null);
+      setInstruction("");
+    } catch {
+      setError("Could not save those changes.");
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  const changeKeys = proposal ? Object.keys(proposal.changes) : [];
+
+  return (
+    <div className="border mb-10" style={{ borderColor: RULE }}>
+      <div className="p-5">
+        <div className="text-[11.5px] font-semibold uppercase tracking-wider mb-2" style={{ color: INK_MUTED }}>
+          Set it in your own words
+        </div>
+        <p className="text-[12px] mb-3 leading-relaxed" style={{ color: INK_MUTED }}>
+          Describe what you want and it will propose the numbers.{" "}
+          <strong>Nothing is saved until you approve it</strong> — these are the limits your AI is held
+          to, so you see every figure before it binds.
+        </p>
+
+        <div className="flex gap-3 items-stretch">
+          <input
+            type="text"
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") ask();
+            }}
+            placeholder="Never discount more than 10%, and don't call before 9am"
+            className="flex-1 min-w-0 border p-3 text-[13px]"
+            style={{ borderColor: RULE, borderRadius: 0, background: "transparent" }}
+          />
+          <button
+            className="onb-btn-primary shrink-0"
+            disabled={thinking || disabled || !instruction.trim()}
+            onClick={ask}
+          >
+            {thinking ? "Reading…" : "Propose"}
+          </button>
+        </div>
+
+        {error && (
+          <p className="text-[12px] mt-2.5" style={{ color: NEGATIVE }}>
+            {error}
+          </p>
+        )}
+      </div>
+
+      {proposal && (
+        <div className="border-t p-5 anim-rise" style={{ borderColor: RULE, background: WASH }}>
+          <p className="text-[13px] mb-4 leading-relaxed">{proposal.summary}</p>
+
+          {changeKeys.length === 0 ? (
+            <p className="text-[12px]" style={{ color: INK_MUTED }}>
+              Nothing to change. Try naming a specific number.
+            </p>
+          ) : (
+            <>
+              {/* Before -> after, per field. The number a merchant is
+                  agreeing to is the loudest thing here; the sentence above
+                  is context, not the record. */}
+              <div className="mb-4">
+                {changeKeys.map((key) => (
+                  <div
+                    key={key}
+                    className="flex items-baseline justify-between py-2 border-b text-[13px]"
+                    style={{ borderColor: RULE_SOFT }}
+                  >
+                    <span style={{ color: INK_MUTED }}>{FIELD_LABELS[key] || key}</span>
+                    <span className="tabular-nums">
+                      <span style={{ color: INK_MUTED }}>
+                        {formatValue(key, proposal.current?.[key])}
+                      </span>
+                      <span style={{ color: INK_MUTED }}> → </span>
+                      <span className="font-semibold" style={{ color: INK }}>
+                        {formatValue(key, proposal.changes[key])}
+                      </span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button className="onb-btn-primary" disabled={applying} onClick={apply}>
+                  {applying ? "Saving…" : "Apply these changes"}
+                </button>
+                <button
+                  className="text-[11px] font-semibold uppercase tracking-wider"
+                  style={{ color: INK_MUTED }}
+                  onClick={() => setProposal(null)}
+                >
+                  Discard
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -102,6 +276,24 @@ export default function PoliciesPage() {
 
         {policy && (
           <>
+            <PolicyAssistant
+              disabled={saving}
+              onApply={async (changes) => {
+                const next = { ...policy, ...changes } as Policy;
+                // Saved through the SAME endpoint the sliders use, so the
+                // proposal gets no privileged path into the policy - it
+                // ends up as an ordinary merchant edit, validated by the
+                // same bounds and recorded the same way.
+                await apiFetch("/api/merchant/policy", {
+                  method: "PUT",
+                  body: JSON.stringify(next),
+                });
+                setPolicy(next);
+                setSaved(true);
+                setTimeout(() => setSaved(false), 2500);
+              }}
+            />
+
             <PolicySlider
               label="Max discount ceiling"
               value={policy.max_discount_percent}
@@ -128,6 +320,45 @@ export default function PoliciesPage() {
               />
               <div className="hint">The most the AI may give away on one cart without you. Leave at 0 for no
                 limit; the ceiling and margin floor still apply either way.</div>
+            </div>
+
+            {/* EMI. Off by default and deliberately worded around what the
+                checkout can actually do: the agent offers instalments
+                BEFORE a discount when this is on, which keeps the full sale
+                instead of giving away margin - but only if Razorpay will
+                really take the payment that way. Promising instalments a
+                checkout cannot provide is the same class of untruth as
+                claiming a link was sent. */}
+            <div className="mb-8 pb-8 border-b" style={{ borderColor: RULE_SOFT }}>
+              <div className="flex items-start justify-between gap-6">
+                <div>
+                  <div
+                    className="text-[11.5px] font-semibold uppercase tracking-wider mb-1.5"
+                    style={{ color: INK_MUTED }}
+                  >
+                    Offer EMI before a discount
+                  </div>
+                  <div className="text-xs leading-relaxed" style={{ color: INK_MUTED }}>
+                    When someone says the price is too much right now, instalments keep the whole sale —
+                    a discount gives away margin to solve the same problem. Only turn this on if EMI is
+                    genuinely enabled on your Razorpay account; the agent will offer it out loud.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={policy.emi_available}
+                  onClick={() => setPolicy({ ...policy, emi_available: !policy.emi_available })}
+                  className="shrink-0 px-4 py-2 text-[11px] font-semibold uppercase tracking-wider border transition-colors"
+                  style={{
+                    borderColor: policy.emi_available ? POSITIVE : RULE,
+                    color: policy.emi_available ? POSITIVE : INK_MUTED,
+                    borderRadius: 0,
+                  }}
+                >
+                  {policy.emi_available ? "On" : "Off"}
+                </button>
+              </div>
             </div>
 
             <SectionTitle>Calling hours</SectionTitle>
