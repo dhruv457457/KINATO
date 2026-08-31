@@ -114,6 +114,41 @@ while reporting full compliance.
 A `rule_breaks` counter now appears on the dashboard and in the batch report.
 It is not a metric to improve — any non-zero value means a guarantee broke.
 
+### Four more of them, found while looking for something else
+
+This finding was written about two columns. Searching the schema for a place
+to put a concession setting turned up four more of exactly the same kind:
+
+```
+merchant_policies.free_shipping_allowed     DEFAULT TRUE    read by nothing
+merchant_policies.bundle_upsell_allowed     DEFAULT FALSE   read by nothing
+merchant_policies.bundle_product_id                         read by nothing
+merchant_policies.bundle_discount_percent                   read by nothing
+```
+
+They are deserialised into a bool by `policies.py` and then consulted by no
+service, no tool, and no screen. `free_shipping_allowed` defaults to TRUE, so
+**every merchant on the platform has free shipping "allowed"** and it has
+never once bound anything.
+
+They are being **left in place and left unwired**, deliberately, because
+wiring them honestly is not a small change: `checkouts` carries only
+`amount_paise`. There is no shipping line to waive and no bundle to offer.
+The columns are not a control that broke — they are a control that was never
+built, and the schema promised it anyway.
+
+`auto_approval_threshold_inr` was the same shape and *was* wired (it is the
+third limit in the policy engine now). The difference is that it was
+expressible: a rupee cap can be compared against a cart total. These four
+cannot be, until the cart model can describe what they act on.
+
+The pattern is worth naming, because this codebase has now produced it three
+times: **a column in a schema is a promise, and a default value is a promise
+with a number on it.** `free_shipping_allowed = TRUE` reads, to anyone
+looking at the database, as a live guarantee. Nothing distinguishes a setting
+that works from one that does not, except reading every caller — which is how
+all six of these were found, and none of them by a test.
+
 ---
 
 ## 5. One dropped call blocked that cart from ever recovering

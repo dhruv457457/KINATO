@@ -35,6 +35,7 @@ from app.gateway.event_bus import bus
 from app.services.identity_service import identity_service
 from app.services import customer_memory
 from app.services import outreach_guards
+from app.services.policy_engine import policy_engine
 from app.services.voice_dispatch import place_outbound_call, VoiceDispatchError
 from app.services.tts import voice_block as tts_voice_block
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
@@ -183,10 +184,26 @@ class CallOrchestrator:
         # system - so pay for them here, where paying costs nothing.
         await prewarm_pool()
 
+        # Whether this merchant can actually offer instalments. Resolved
+        # here, on the deadline-free side of the dial, for the same reason
+        # the voice block and the memory brief are: it cannot change while
+        # the phone is ringing, so asking for it mid-call would buy nothing
+        # and cost a round trip inside Twilio's window.
+        emi_available = False
+        try:
+            emi_available = bool(
+                (await run_db_async(policy_engine.get_policy, merchant_id) or {}).get("emi_available")
+            )
+        except Exception as e:
+            # False is the safe direction: the agent stays quiet about EMI
+            # rather than offering instalments that may not exist.
+            logger.warning(f"Could not read the EMI policy (non-fatal, assuming unavailable): {e}")
+
         plan = {
             **plan,
             "voice_block": await tts_voice_block(opening_line),
             "memory_brief": memory_brief,
+            "emi_available": emi_available,
         }
         recovery_attempts_repo.update_state(recovery_attempt_id, "OUTREACH_APPROVED", plan=_to_json(plan))
 

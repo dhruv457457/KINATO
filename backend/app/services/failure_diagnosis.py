@@ -207,14 +207,47 @@ def diagnose(failure: Optional[Dict[str, Any]], rail_degraded: bool = False) -> 
     )
 
 
-def describe(failure_class: Optional[str]) -> str:
+def describe(failure_class: Optional[str], emi_available: bool = False) -> str:
     """The one line the agent's system prompt gets. Empty when there is
     nothing useful to say, so the prompt simply omits the section rather
-    than asserting something hollow."""
+    than asserting something hollow.
+
+    `emi_available` adds instalments to the ONE class where the barrier is
+    genuinely cashflow rather than price. It is a parameter and not a
+    constant because EMI has to be enabled on the merchant's own Razorpay
+    account: offering instalments a checkout cannot provide tells a customer
+    something untrue about their money, which is the failure this codebase
+    keeps finding. Defaults False, so silence is what happens when nobody
+    has said otherwise.
+    """
     if not failure_class or failure_class == UNKNOWN:
         return ""
-    return _PROMPT_LINES.get(failure_class, "")
+    line = _PROMPT_LINES.get(failure_class, "")
+    # Only INSUFFICIENT_FUNDS. A declined card is not a money problem, and
+    # someone who simply wandered off has not said anything about price -
+    # offering either of them instalments answers a question they did not
+    # ask. This is the same restraint as not pushing UPI at a walk-away.
+    if line and emi_available and failure_class == INSUFFICIENT_FUNDS:
+        line = f"{line} {_EMI_LINE}"
+    return line
 
+
+# Instalments, offered before money off.
+#
+# "I can't afford that right now" is a CASHFLOW objection, and a discount is
+# the most expensive possible answer to it: the merchant loses margin on a
+# sale EMI would have closed at full revenue. The policy engine only knows
+# one instrument - a discount percent - so the cheaper instrument has to be
+# reached for here, in what the agent says, before the expensive one is
+# reached for in what it does.
+#
+# Deliberately phrased as "if that helps", not as a pitch. Someone who has
+# just been told they have insufficient funds does not need to be sold to.
+_EMI_LINE = (
+    "This merchant offers EMI, so if the issue is paying it all at once, say they can split it into "
+    "monthly instalments on the same link - offer that BEFORE any discount, because it costs them "
+    "nothing and you keep the full sale."
+)
 
 _PROMPT_LINES = {
     SOFT_DECLINE: (

@@ -424,6 +424,7 @@ def _build_system_prompt(
     business_name: str = "",
     failure_class: Optional[str] = None,
     memory_brief: str = "",
+    emi_available: bool = False,
 ) -> str:
     """Builds the live-call system prompt.
 
@@ -446,7 +447,7 @@ def _build_system_prompt(
     # templates follow. The hard behaviour still lives in check_offer's
     # REJECTED_FULL_PRICE_FIRST; this only stops the agent sounding
     # ignorant of something it is being held to.
-    diagnosis_line = failure_diagnosis.describe(failure_class)
+    diagnosis_line = failure_diagnosis.describe(failure_class, emi_available=emi_available)
     if diagnosis_line:
         prompt = f"{prompt}\n{diagnosis_line}\n"
     # What we already know about this person, from earlier attempts. Bounded
@@ -516,6 +517,11 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
         # webhook answers inside Twilio's ~15s deadline, and blowing that
         # deadline does not degrade the call, it ENDS it.
         "memory_brief": plan.get("memory_brief") or "",
+        # Same pre-dial plan, same reason. False when absent, which covers
+        # every attempt created before this existed - and False is the safe
+        # direction, because the failure mode of guessing True is promising
+        # a customer instalments their checkout cannot give them.
+        "emi_available": bool(plan.get("emi_available")),
         "turns": 0,
         # Zero for a fresh call, which costs no query; _rehydrate_session
         # overrides it with the real value read from the transcript, the
@@ -667,6 +673,7 @@ async def _outbound(request: Request):
             session.get("business_name", ""),
             session.get("failure_class"),
             session.get("memory_brief", ""),
+            session.get("emi_available", False),
         ),
         session["opening_line"],
     )
@@ -774,6 +781,7 @@ def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
             session.get("business_name", ""),
             session.get("failure_class"),
             session.get("memory_brief", ""),
+            session.get("emi_available", False),
         ),
         turns,
     )
@@ -842,6 +850,7 @@ async def _run_agent_turn(
             session.get("business_name", ""),
             session.get("failure_class"),
             session.get("memory_brief", ""),
+            session.get("emi_available", False),
         ),
         user_message=user_message,
         ctx=turn_ctx,

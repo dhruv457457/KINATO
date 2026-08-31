@@ -275,3 +275,50 @@ class TestCardFailuresNameTheRailThatWorks:
         cashflow problem.
         """
         assert "UPI" not in describe(failure_class)
+
+
+class TestInstalmentsBeforeDiscount:
+    """The cheapest instrument the agent has, offered before the dearest one.
+
+    "I can't afford that right now" is a CASHFLOW objection, and a discount
+    is the most expensive possible answer to it - the merchant loses margin
+    on a sale that EMI would have closed at full revenue. The policy engine
+    knows exactly one instrument, a discount percent, so the cheaper one has
+    to be reached for in what the agent SAYS before the expensive one is
+    reached for in what it DOES.
+
+    The gate on it is the point. EMI has to be enabled on the merchant's own
+    Razorpay account, and an agent that offers instalments the checkout
+    cannot provide has told a customer something untrue about their money -
+    the failure this codebase keeps finding (#2, #19). Silence is the
+    default; the merchant opts in.
+    """
+
+    def test_instalments_are_offered_when_the_merchant_has_emi(self):
+        line = describe(INSUFFICIENT_FUNDS, emi_available=True)
+        assert "EMI" in line or "instalment" in line
+        # And explicitly ahead of a discount, not merely alongside one.
+        assert "BEFORE any discount" in line
+
+    def test_nothing_is_promised_when_the_merchant_has_no_emi(self):
+        """The default, and the safe direction."""
+        line = describe(INSUFFICIENT_FUNDS, emi_available=False)
+        assert "EMI" not in line and "instalment" not in line
+        assert describe(INSUFFICIENT_FUNDS) == line, "emi_available must default to False"
+
+    @pytest.mark.parametrize(
+        "failure_class", [SOFT_DECLINE, HARD_DECLINE, AUTH_DROP, USER_ABANDON, RAIL_DOWN]
+    )
+    def test_instalments_are_not_offered_to_anyone_else(self, failure_class):
+        """Only the class where money is genuinely the barrier.
+
+        A declined card is not a cashflow problem and a walk-away has said
+        nothing about price. Offering either of them instalments answers a
+        question they did not ask - the same restraint as not pushing UPI at
+        someone who simply wandered off.
+        """
+        assert "EMI" not in describe(failure_class, emi_available=True)
+
+    def test_an_unknown_class_still_says_nothing_at_all(self):
+        assert describe(UNKNOWN, emi_available=True) == ""
+        assert describe(None, emi_available=True) == ""

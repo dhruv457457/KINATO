@@ -396,6 +396,17 @@ def init_db(force_reseed: bool = False) -> None:
         # on the attempt refreshes that, so a PROMISED write hours later
         # would make an expired link look fresh.
         "ALTER TABLE recovery_attempts ADD COLUMN rzp_payment_link_expires_at TIMESTAMPTZ",
+        # Whether this merchant actually has EMI enabled on their Razorpay
+        # account.
+        #
+        # Defaults FALSE, and that direction is the whole point. EMI is the
+        # right answer to "I can't afford that today" - it recovers the sale
+        # at FULL revenue where a discount would cost margin - but only if it
+        # exists. An agent that offers instalments the checkout cannot
+        # provide has told a customer something untrue about their money,
+        # which is the failure this codebase keeps finding (see #2, #19).
+        # Silence is the safe default; the merchant turns it on.
+        "ALTER TABLE merchant_policies ADD COLUMN emi_available BOOLEAN NOT NULL DEFAULT FALSE",
     ):
         try:
             with get_db() as alter_conn:

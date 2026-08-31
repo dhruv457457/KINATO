@@ -40,7 +40,7 @@ class PolicyNotFoundError(Exception):
 
 
 _JSON_FIELDS = ("offer_ladder", "excluded_products")
-_BOOL_FIELDS = ("free_shipping_allowed", "bundle_upsell_allowed")
+_BOOL_FIELDS = ("free_shipping_allowed", "bundle_upsell_allowed", "emi_available")
 
 
 def _deserialize(row: Dict[str, Any]) -> Dict[str, Any]:
