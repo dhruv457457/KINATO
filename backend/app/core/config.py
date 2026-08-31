@@ -23,6 +23,23 @@ class Settings(BaseSettings):
     # set LLM_MODEL degraded every agent run and looked like a model
     # problem rather than a missing config line.
     LLM_MODEL: str = Field(default="openai/gpt-4o-mini", description="LLM Model")
+    # How OpenRouter picks between the providers serving LLM_MODEL:
+    # "" (their default), "throughput", "latency" or "price".
+    #
+    # This matters here for a reason that is not cost. A voice turn's whole
+    # problem is DEAD AIR: the customer hears nothing while the model
+    # thinks, and seven seconds of silence on a phone is indistinguishable
+    # from a dropped call - which is how two live calls ended, with the
+    # customer hanging up and Twilio recording a clean "completed".
+    #
+    # Note that 20 providers serve gpt-oss-120b and several do NOT support
+    # tool calling. OpenRouter only routes to tool-capable providers when
+    # the request carries `tools`, which every agent call here does - so
+    # sorting for speed cannot silently land on one that would strip the
+    # agent of its tools.
+    LLM_PROVIDER_SORT: str = Field(
+        default="", description='OpenRouter provider sort: "", "throughput", "latency" or "price".'
+    )
 
     # Razorpay Credentials (Loaded strictly from .env)
     RAZORPAY_KEY_ID: str = Field(default="", description="Razorpay Key ID")

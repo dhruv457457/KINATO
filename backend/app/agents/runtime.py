@@ -170,6 +170,15 @@ def _build_graph(
             return state
 
         try:
+            # Provider routing, when the merchant has asked for it. Passed
+            # via extra_body because it is an OpenRouter extension the
+            # OpenAI SDK knows nothing about; an empty setting sends
+            # nothing at all, so the default path is byte-identical to
+            # before.
+            extra: Dict[str, Any] = {}
+            if settings.LLM_PROVIDER_SORT:
+                extra["provider"] = {"sort": settings.LLM_PROVIDER_SORT}
+
             response = await client.chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=state["messages"],
@@ -177,6 +186,7 @@ def _build_graph(
                 temperature=LLM_TEMPERATURE,
                 max_tokens=LLM_MAX_TOKENS,
                 timeout=6.0,
+                **({"extra_body": extra} if extra else {}),
             )
         except Exception as e:
             logger.warning(f"Agent LLM call failed, degrading this run: {e}")
