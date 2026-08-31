@@ -58,11 +58,39 @@ async def razorpay_webhook(merchant_id: str, request: Request):
     payload = event_data.get("payload", {})
     payment_entity = payload.get("payment", {}).get("entity", {})
     order_entity = payload.get("order", {}).get("entity", {})
-    notes = payment_entity.get("notes") or order_entity.get("notes") or {}
+    # The payment LINK's own entity. This is where a `payment_link.paid`
+    # event carries its metadata, and it was never read.
+    #
+    # payment_execution puts recovery_attempt_id in the link's `notes` AND
+    # in its `reference_id`, so everything attribution needs was being sent
+    # correctly - it just arrived under a key nothing looked at. A customer
+    # who actually paid a recovery link left the attempt sitting at
+    # PAYMENT_LINK_SENT forever, and the dashboard reported the money as
+    # never recovered. Confirmed live: link plink_TWQ6dr4mx3R7gI paid in
+    # full, attempt still "Offer sent".
+    #
+    # Link notes are NOT copied onto the payment entity by Razorpay, which
+    # is why the payment-first lookup below silently found nothing.
+    link_entity = payload.get("payment_link", {}).get("entity", {})
+    notes = (
+        payment_entity.get("notes")
+        or link_entity.get("notes")
+        or order_entity.get("notes")
+        or {}
+    )
 
     checkout_id = notes.get("checkout_id")
-    recovery_attempt_id = notes.get("recovery_attempt_id")
-    correlation_id = checkout_id or payment_entity.get("order_id") or order_entity.get("id") or "unknown"
+    # reference_id as a fallback: it is set to the recovery_attempt_id at
+    # link creation, so attribution survives even a link whose notes were
+    # stripped or never stored.
+    recovery_attempt_id = notes.get("recovery_attempt_id") or link_entity.get("reference_id")
+    correlation_id = (
+        checkout_id
+        or payment_entity.get("order_id")
+        or order_entity.get("id")
+        or link_entity.get("id")
+        or "unknown"
+    )
 
     # --- PRIMARY: payment.failed - zero-code recovery trigger ---
     if event_name == "payment.failed":
@@ -176,7 +204,14 @@ async def razorpay_webhook(merchant_id: str, request: Request):
         await bus.publish(
             event_type="payment.succeeded",
             payload={
-                "amount": payment_entity.get("amount", 0),
+                # amount_paid off the link is the fallback, not decoration:
+                # attribution writes this straight into
+                # attributed_revenue_paise, so a missing payment entity on a
+                # payment_link.paid would record a real recovery worth zero
+                # rupees - which is worse than not recording it, because the
+                # dashboard would then report the recovery rate correctly and
+                # the revenue wrongly.
+                "amount": payment_entity.get("amount") or link_entity.get("amount_paid") or 0,
                 "payment_id": payment_entity.get("id"),
                 "order_id": payment_entity.get("order_id"),
                 "checkout_id": checkout_id,
