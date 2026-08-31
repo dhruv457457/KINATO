@@ -963,7 +963,33 @@ async def _run_agent_turn(
     # customer's NEXT turn is an answer to it and the discount path opens.
     # This is a state machine over real tool refusals, not an inference
     # about what the customer meant.
-    if any(r.get("reason") == "REJECTED_UNCONFIRMED_BARRIER" for r in result.refusals):
+    # REJECTED_FULL_PRICE_FIRST belongs here too, and its absence was a bug.
+    #
+    # check_offer's own comment says the rule is "full price FIRST, not full
+    # price forever", and it opens the gate on ctx.barrier_confirmed. But
+    # only UNCONFIRMED_BARRIER ever set that flag, so on a SOFT_DECLINE the
+    # gate had no key at all.
+    #
+    # Live, on a cart the customer had already told us was too expensive:
+    #
+    #   customer: "I found that too much expensive for me"
+    #   customer: "can I get any discount over here?"
+    #   customer: "I want a discount because I found that too much expensive"
+    #   check_offer: DENY REJECTED_FULL_PRICE_FIRST
+    #   agent: "the checkout failed due to a temporary issue, not the price"
+    #
+    # Told three times, and the agent argued with them - because the failure
+    # class said the payment broke, and nothing could ever record that the
+    # customer had since said otherwise. That is FINDINGS #1 in the
+    # direction that costs a sale rather than a margin: refusing to
+    # negotiate with someone who is plainly negotiating.
+    #
+    # Both refusals mean the same thing operationally - the agent has to put
+    # the barrier to the customer and hear it confirmed before money moves -
+    # so both open the same gate. The confirmation itself is still required;
+    # this only makes it POSSIBLE.
+    bounced = {"REJECTED_UNCONFIRMED_BARRIER", "REJECTED_FULL_PRICE_FIRST"}
+    if any(r.get("reason") in bounced for r in result.refusals):
         session["discount_bounced"] = True
         logger.info(
             f"[CALL {call_id}] Discount bounced pending barrier confirmation - "
