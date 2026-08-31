@@ -100,6 +100,42 @@ def consume_offer_token(offer_token: str, merchant_id: str, checkout_id: Optiona
     a specific reason on any failure - the caller (issue_offer tool) turns
     that into a REJECTED tool result, never a silent fallback amount.
     """
+    # One statement on the path that succeeds.
+    #
+    # This used to be three round trips - read, update, read again - and it
+    # sits inside issue_offer, on the single turn of a live call that has to
+    # finish inside Twilio's ~5s webhook budget. Three round trips to spend
+    # a token is most of a second the call does not have.
+    #
+    # Every check that was done in Python is now a WHERE clause, which makes
+    # them stronger rather than weaker: the merchant and checkout checks are
+    # inside the same atomic UPDATE as the consumed/expired ones, so two
+    # concurrent callers cannot both pass validation and then race on the
+    # write.
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE offer_tokens SET consumed_at = NOW()
+            WHERE offer_token = %s
+              AND merchant_id = %s
+              AND (%s IS NULL OR checkout_id IS NULL OR checkout_id = %s)
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+              AND decision <> 'DENY'
+            RETURNING *
+            """,
+            (offer_token, merchant_id, checkout_id, checkout_id),
+        )
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+
+    # Only now, on the path that is already going to refuse, is it worth a
+    # second read to say WHY. A caller that gets "offer_token_expired" when
+    # the real reason was a merchant mismatch cannot act on it, and these
+    # reasons are what tools.py turns into the instructions the model
+    # follows - see _OFFER_TOKEN_REJECTION_HELP.
     token = get_offer_token(offer_token)
     if not token:
         raise ValueError("offer_token_not_found")
@@ -107,21 +143,8 @@ def consume_offer_token(offer_token: str, merchant_id: str, checkout_id: Optiona
         raise ValueError("offer_token_merchant_mismatch")
     if checkout_id is not None and token["checkout_id"] not in (None, checkout_id):
         raise ValueError("offer_token_checkout_mismatch")
-    if token["consumed_at"] is not None:
-        raise ValueError("offer_token_already_consumed")
     if token["decision"] == "DENY":
         raise ValueError("offer_token_was_denied")
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE offer_tokens SET consumed_at = NOW()
-            WHERE offer_token = %s AND consumed_at IS NULL AND expires_at > NOW()
-            """,
-            (offer_token,),
-        )
-        if cursor.rowcount == 0:
-            raise ValueError("offer_token_expired")
-        cursor.execute("SELECT * FROM offer_tokens WHERE offer_token = %s", (offer_token,))
-        return dict(cursor.fetchone())
+    if token["consumed_at"] is not None:
+        raise ValueError("offer_token_already_consumed")
+    raise ValueError("offer_token_expired")

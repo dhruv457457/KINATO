@@ -63,6 +63,22 @@ def _stale_started_checkouts() -> list:
         return cursor.fetchall()
 
 
+def _a_call_is_mid_turn() -> bool:
+    """Is a customer waiting on a webhook response right now?
+
+    Deliberately imported inside the function: sweeper is imported by
+    main.py at startup and voice_runtime imports plenty of its own things,
+    so a module-level import here is a circular-import risk for a check that
+    runs twice a minute.
+    """
+    try:
+        from app.channels.voice_runtime import _TURNS_IN_FLIGHT
+
+        return bool(_TURNS_IN_FLIGHT)
+    except Exception:
+        return False
+
+
 async def sweep_once() -> int:
     """Runs one sweep pass. Returns how many checkouts were marked abandoned.
     Exposed as its own function (not just the loop) so tests can call it
@@ -271,7 +287,26 @@ async def run_sweeper_loop(interval_seconds: int = SWEEP_INTERVAL_SECONDS):
     logger.info(f"Abandonment sweeper started (interval={interval_seconds}s).")
     while True:
         try:
-            await sweep_once()
+            # Never sweep while a customer is mid-sentence.
+            #
+            # Measured on a live call: this loop fired at 18:05:16, in the
+            # middle of the turn that sends the payment link, and spent
+            # ~1.3s marking a checkout abandoned and re-running eligibility.
+            # The Razorpay call happening at the same moment took 1.85s
+            # instead of its usual ~0.7s, and the turn was cut off at 4.5s
+            # having done all the work.
+            #
+            # The sweeper competes for the same connection pool and the same
+            # event loop, and it is the only party in that contest with
+            # nothing to lose: nothing it does is time-critical to within 30
+            # seconds, and the other party is a person on a phone.
+            #
+            # Skipping the tick, not delaying it - the next one is 30s away
+            # and a call rarely lasts longer than a few ticks.
+            if _a_call_is_mid_turn():
+                logger.debug("Sweeper: a call is mid-turn, skipping this tick.")
+            else:
+                await sweep_once()
         except Exception as e:
             logger.error(f"Sweeper pass failed (will retry next tick): {e}", exc_info=True)
         await asyncio.sleep(interval_seconds)
