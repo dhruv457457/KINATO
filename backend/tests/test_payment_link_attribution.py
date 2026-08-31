@@ -1,9 +1,8 @@
 """A paid recovery link has to become recovered revenue.
 
 Found live. A customer paid a real Razorpay recovery link in full - ₹2,990,
-link `plink_TWQ6dr4mx3R7gI`, status `paid` per Razorpay's own API - and the
-attempt sat at PAYMENT_LINK_SENT with the dashboard reporting the money as
-never recovered.
+status `paid` per Razorpay's own API - and the attempt sat at
+PAYMENT_LINK_SENT with the dashboard reporting the money as never recovered.
 
 Everything needed was being sent correctly. `payment_execution` writes
 `recovery_attempt_id` into the link's `notes` AND into its `reference_id`.
@@ -17,8 +16,14 @@ None, and attribution logged "Organic revenue" and returned. The single most
 important number this product reports - money actually recovered - was
 silently zero for every link anyone paid.
 
-The payloads below are shaped from the real thing: the notes are the exact
-keys payment_execution writes, and the reference_id is a real attempt id.
+The payloads below carry the exact KEYS payment_execution writes, with
+synthetic ids. The first version of this file used the real ones from the
+call that exposed the bug, which was a mistake twice over: it ties a test to
+one customer's data, and a secret scanner flagged the offer token in it as a
+high-entropy credential. It was neither live nor a credential - single-use,
+already consumed at the moment that payment went through, and expired inside
+fifteen minutes - but a test proving a payload SHAPE never needed a real
+value to do it.
 """
 import pytest
 
@@ -49,15 +54,15 @@ def _extract(payload: dict) -> dict:
     }
 
 
-REAL_NOTES = {
-    "checkout_id": "order_TWQ4AmXmGMqRXZ",
-    "customer_id": "cust_5265de24815d",
+LINK_NOTES = {
+    "checkout_id": "chk_example_cart",
+    "customer_id": "cust_example",
     "discount_percent": "0",
     "kinato_touchpoint": "voice_recovery",
-    "merchant_id": "mch_cbd92fc843c4",
-    "offer_token": "off_a676919d8283",
+    "merchant_id": "mch_example",
+    "offer_token": "off_example_token",
     "original_amount_paise": "299000",
-    "recovery_attempt_id": "rec_792855d4348d",
+    "recovery_attempt_id": "rec_example_attempt",
 }
 
 
@@ -67,18 +72,18 @@ class TestPaymentLinkPaid:
         payload = {
             "payment_link": {
                 "entity": {
-                    "id": "plink_TWQ6dr4mx3R7gI",
+                    "id": "plink_example",
                     "status": "paid",
                     "amount_paid": 299000,
-                    "reference_id": "rec_792855d4348d",
-                    "notes": REAL_NOTES,
+                    "reference_id": "rec_example_attempt",
+                    "notes": LINK_NOTES,
                 }
             },
-            "payment": {"entity": {"id": "pay_TWQ8JkJBIP1ezG", "amount": 299000, "notes": {}}},
+            "payment": {"entity": {"id": "pay_example", "amount": 299000, "notes": {}}},
         }
         got = _extract(payload)
-        assert got["recovery_attempt_id"] == "rec_792855d4348d"
-        assert got["checkout_id"] == "order_TWQ4AmXmGMqRXZ"
+        assert got["recovery_attempt_id"] == "rec_example_attempt"
+        assert got["checkout_id"] == "chk_example_cart"
         assert got["amount"] == 299000
 
     def test_reference_id_rescues_a_link_whose_notes_are_gone(self):
@@ -90,10 +95,10 @@ class TestPaymentLinkPaid:
         """
         payload = {
             "payment_link": {
-                "entity": {"amount_paid": 299000, "reference_id": "rec_792855d4348d", "notes": {}}
+                "entity": {"amount_paid": 299000, "reference_id": "rec_example_attempt", "notes": {}}
             }
         }
-        assert _extract(payload)["recovery_attempt_id"] == "rec_792855d4348d"
+        assert _extract(payload)["recovery_attempt_id"] == "rec_example_attempt"
 
     def test_the_amount_never_falls_back_to_zero_when_the_link_knows_it(self):
         """A recovery recorded at zero rupees is worse than none recorded.
@@ -104,7 +109,7 @@ class TestPaymentLinkPaid:
         """
         payload = {
             "payment_link": {
-                "entity": {"amount_paid": 299000, "reference_id": "rec_x", "notes": REAL_NOTES}
+                "entity": {"amount_paid": 299000, "reference_id": "rec_x", "notes": LINK_NOTES}
             }
         }
         assert _extract(payload)["amount"] == 299000
