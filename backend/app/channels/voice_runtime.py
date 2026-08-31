@@ -389,6 +389,38 @@ def solicits_card_details(text: str) -> bool:
     return bool(text) and bool(_CARD_SOLICITATION.search(text))
 
 
+# One agent turn at a time, per call.
+#
+# When a webhook takes longer than Twilio is willing to wait, Twilio RETRIES
+# the POST with identical parameters - and nothing here noticed. The retry
+# rehydrated the session and ran the agent AGAIN on the same sentence, which
+# on the wrong turn means a second offer token and a second payment link for
+# one thing the customer said once. Every other duplicate-delivery path in
+# this system is guarded (the event bus has durable idempotency keys, the
+# payment webhook dedupes on payment_id); this one, the only path a customer
+# actually hears, was not.
+#
+# An in-flight guard rather than a replay cache, deliberately. Two designs
+# were tried and this is the only one that is correct:
+#
+#   Keying on the turn index does not work at all - the first attempt
+#   increments `turns`, so a retry never matches the key the original wrote.
+#
+#   Keying on the SPOKEN WORDS alone works for retries and is wrong for
+#   people: a customer who says "yes" twice in twenty seconds is not Twilio
+#   retrying, and replaying the previous answer to a different question is
+#   its own bug.
+#
+# What actually distinguishes the two is concurrency. Twilio only retries
+# when it received NO response, so a retry arrives while the original is
+# still running. A human always speaks after we have answered. So: refuse to
+# start a second turn while one is in flight, and let anything that arrives
+# after we answered through as the new turn it is.
+#
+# In-process, like CALL_SESSIONS, with the same single-worker caveat.
+_TURNS_IN_FLIGHT: set = set()
+
+
 def _tool_succeeded(result, tool: str) -> bool:
     """Did this tool actually DO the thing, or merely get attempted?
 
@@ -1109,6 +1141,47 @@ async def _respond(request: Request):
             media_type="text/xml",
         )
 
+    # A turn for this call is already running, so this is Twilio retrying a
+    # webhook it thinks we failed to answer - not the customer saying
+    # something new. Running the agent again here is how one "yes" becomes
+    # two payment links.
+    #
+    # <Pause> then <Redirect> rather than a spoken line: the original turn
+    # is about to answer, and talking over it would have the customer hear
+    # two different replies to one sentence. This just holds the line and
+    # asks Twilio to come back.
+    if call_id in _TURNS_IN_FLIGHT:
+        logger.warning(
+            f"[CALL {call_id}] A turn is already in flight - this is a Twilio retry, "
+            "not a new utterance. Holding rather than running the agent twice."
+        )
+        return Response(
+            content=(
+                '<?xml version="1.0" encoding="UTF-8"?><Response>'
+                '<Pause length="2"/>'
+                f'<Redirect method="POST">{settings.NGROK_URL}/voice/respond</Redirect>'
+                "</Response>"
+            ),
+            media_type="text/xml",
+        )
+    _TURNS_IN_FLIGHT.add(call_id)
+    try:
+        return await _respond_turn(session, call_id, customer_speech, digits, confidence)
+    finally:
+        _TURNS_IN_FLIGHT.discard(call_id)
+
+
+async def _respond_turn(
+    session: Dict[str, Any],
+    call_id: str,
+    customer_speech: str,
+    digits: str,
+    confidence: Optional[float],
+):
+    """The turn itself. Split out so the in-flight guard above owns a single
+    try/finally around the whole thing - a guard that can leak its own flag
+    on an exception is worse than no guard, because the call would then
+    refuse every remaining turn."""
     session["turns"] += 1
     logger.info(
         f"[CALL {call_id}] Customer: {customer_speech!r} "
