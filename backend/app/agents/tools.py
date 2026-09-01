@@ -273,6 +273,40 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
     checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
     if not checkout:
         return {"error": "checkout_not_found"}
+    # THE SALE COMES FIRST - and a callback is a way of losing one.
+    #
+    # A declined card, a dropped auth or an errored checkout is not a timing
+    # problem any more than it is a price problem. That customer wants to
+    # pay you today; they need a link that works. Offering them a date
+    # instead trades a sale you had already won for a maybe.
+    #
+    # This is not hypothetical. Adding this tool cost exactly that on the
+    # batch: "Card declined, wants to retry" went from RECOVERED_FULL_PRICE
+    # to NO_SALE because the agent reached for get_timing_plan and
+    # record_promise_to_pay instead of check_offer and issue_offer. The
+    # prompt already said to send a link, in capitals. It was not enough,
+    # which is the entire argument for putting rules here instead - see
+    # FINDINGS #1 and REJECTED_FULL_PRICE_FIRST, the same rule for
+    # discounts.
+    #
+    # Once a link HAS been sent, timing becomes legitimate: they have the
+    # thing they needed and still cannot pay, so when is a real question.
+    failure_class = checkout.get("failure_class")
+    if failure_class in FULL_PRICE_FIRST_CLASSES:
+        link_sent = await run_db_async(
+            recovery_attempts_repo.a_payment_link_was_sent_for, ctx.checkout_id
+        )
+        if not link_sent:
+            return {
+                "windows": [],
+                "reason": "REJECTED_FULL_PRICE_FIRST",
+                "guidance": (
+                    "Their payment broke - they did not tell you the timing was wrong. "
+                    "Send them a working link now with check_offer and issue_offer. "
+                    "Only discuss a later date if they still cannot pay once they have it."
+                ),
+            }
+
     policy = await run_db_async(policy_engine.get_policy, ctx.merchant_id)
 
     # There is no failed_at column. abandoned_at is set by the sweeper when a
@@ -288,7 +322,7 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
         anchor = anchor.replace(tzinfo=timezone.utc)
 
     windows = timing_planner.plan_windows(
-        checkout.get("failure_class"),
+        failure_class,
         anchor,
         calling_start_hour=int(policy.get("calling_start_hour", 10)),
         calling_end_hour=int(policy.get("calling_end_hour", 20)),

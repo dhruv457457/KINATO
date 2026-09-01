@@ -83,6 +83,28 @@ def list_active_for_checkout(checkout_id: str) -> list:
         return cursor.fetchall()
 
 
+def a_payment_link_was_sent_for(checkout_id: str) -> bool:
+    """Has this checkout ever been given a working link, at any price?
+
+    Deliberately looser than find_reusable_payment_link, which matches an
+    exact amount because it is choosing an artifact to re-send. This one
+    answers a different question - "have we done the obvious thing for this
+    customer yet?" - and the answer must not depend on the price, or an
+    agent could dodge the gate by discussing a different figure.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1 FROM recovery_attempts
+            WHERE checkout_id = %s AND rzp_payment_link_url IS NOT NULL
+            LIMIT 1
+            """,
+            (checkout_id,),
+        )
+        return cursor.fetchone() is not None
+
+
 def find_reusable_payment_link(
     merchant_id: str, checkout_id: str, final_amount_paise: int
 ) -> Optional[Dict[str, Any]]:

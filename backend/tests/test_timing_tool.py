@@ -124,7 +124,16 @@ class TestAHardDeclineTellsTheAgentToStop:
             )
         )
         assert result["windows"] == []
-        assert "do not suggest" in result["guidance"].lower()
+        # Before a link has been sent, the sale-comes-first gate answers
+        # first, and it answers with the more useful instruction: send them
+        # a link. A Razorpay payment link is payable by ANY instrument, so
+        # it is exactly right for a card that will never clear - they pay by
+        # UPI instead. The "waiting will not help" guidance still exists and
+        # is reached once a link has gone out; that a HARD_DECLINE never
+        # produces a window at all is proved exhaustively at the planner
+        # level, across every day and hour, in test_timing_planner.
+        assert result["guidance"]
+        assert result.get("reason") == "REJECTED_FULL_PRICE_FIRST"
 
 
 class TestThePromptTellsTheAgentHowToUseIt:
@@ -205,3 +214,64 @@ class TestTheDrawerGetsTheSamePlanTheAgentGot:
 
         payload = _timing_plan_for({"failure_class": "USER_ABANDON"}, connected_merchant_id)
         assert payload["windows"] == []
+
+
+class TestTheSaleStillComesFirst:
+    """A callback is a way of losing a sale you had already won.
+
+    This is not hypothetical and it is not a prompt failure. Adding
+    get_timing_plan cost a real recovery on the batch: the scenario "Card
+    declined, wants to retry" went RECOVERED_FULL_PRICE -> NO_SALE, because
+    the agent reached for get_timing_plan and record_promise_to_pay instead
+    of check_offer and issue_offer. The customer wanted to pay that day.
+
+    The prompt already said, in capitals, to send a link. It was not enough.
+    Which is the whole argument for the rule living in code - the same
+    argument, and the same rule, as REJECTED_FULL_PRICE_FIRST for discounts.
+    """
+
+    async def _plan_for(self, merchant_id, checkout_id, failure_class):
+        checkouts_repo.create_checkout(
+            merchant_id=merchant_id,
+            amount_paise=99_900,
+            cogs_paise=40_000,
+            checkout_id=checkout_id,
+        )
+        checkouts_repo.record_failure(
+            checkout_id=checkout_id,
+            failure={"error_code": "BAD_REQUEST_ERROR", "error_reason": "payment_failed"},
+            failure_class=failure_class,
+        )
+        return await _get_timing_plan(
+            AgentContext(
+                merchant_id=merchant_id,
+                correlation_id="corr_sale_first",
+                checkout_id=checkout_id,
+            )
+        )
+
+    @pytest.mark.parametrize("failure_class", ["SOFT_DECLINE", "HARD_DECLINE", "AUTH_DROP"])
+    async def test_a_broken_checkout_gets_a_link_not_a_date(
+        self, connected_merchant_id, unique_checkout_id, failure_class
+    ):
+        result = await self._plan_for(connected_merchant_id, unique_checkout_id, failure_class)
+        assert result["windows"] == []
+        assert "check_offer" in result["guidance"] or "link" in result["guidance"].lower()
+
+    async def test_the_refusal_is_the_same_code_the_discount_gate_uses(
+        self, connected_merchant_id, unique_checkout_id
+    ):
+        """One rule, one name. A merchant reading the audit trail should see
+        the same code whether the agent tried to discount too early or to
+        reschedule too early - it is the same mistake."""
+        result = await self._plan_for(connected_merchant_id, unique_checkout_id, "SOFT_DECLINE")
+        assert result.get("reason") == "REJECTED_FULL_PRICE_FIRST"
+
+    @pytest.mark.parametrize("failure_class", ["INSUFFICIENT_FUNDS", "USER_ABANDON", "UNKNOWN"])
+    async def test_someone_who_genuinely_cannot_pay_still_gets_dates(
+        self, connected_merchant_id, unique_checkout_id, failure_class
+    ):
+        """The gate must not swallow the cases the feature exists for."""
+        result = await self._plan_for(connected_merchant_id, unique_checkout_id, failure_class)
+        assert result["windows"], f"{failure_class} got no windows"
+        assert result.get("reason") != "REJECTED_FULL_PRICE_FIRST"

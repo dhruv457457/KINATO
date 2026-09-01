@@ -1245,6 +1245,118 @@ no test that fails when it is.
 
 ---
 
+## 22. Three ways a safe feature was wrong anyway
+
+The timing planner was built deliberately narrow: pure, deterministic,
+unable to schedule or contact anything. It was still wrong three times. Two
+were caught by *reading the output* rather than by running the tests, and
+the third by the batch harness — all three while the test suite was green.
+
+### A horizon that excluded the only case that mattered
+
+`plan_windows` suggests when a failed payment is worth another approach.
+`HORIZON_DAYS = 7` looked like a courtesy: do not propose a date so far away
+that it reads as a brush-off.
+
+But the class the feature exists for is `INSUFFICIENT_FUNDS` — "I don't have
+it until payday" — and a failure on the 2nd targets the 15th. Thirteen days.
+Every payday window the planner could name fell outside its own horizon and
+was silently dropped, and a generic mid-week window sorted ahead of it and
+took the slot. So the one class of customer whose objection is *purely about
+timing* was the one class that never received a timing suggestion. It always
+returned something, so nothing looked broken.
+
+Two changes. `INSUFFICIENT_FUNDS` reaches 35 days, because when the customer
+has told you the date themselves, waiting is not a brush-off — it is the
+answer. And that class now suggests paydays *only*: a courtesy call on
+Thursday to somebody with no money until the 15th is precisely the pointless
+contact the feature was built to prevent.
+
+### A sentence that was false two times in three
+
+Each window carries a `say_reason` the agent reads aloud. They were a fixed
+map from `reason_code` to phrase — except `payday_proximity` covers three
+different dates, the 1st, the 15th and month-end. So the planner produced:
+
+> *"Tuesday the 15th of September ... just after the usual end-of-month date"*
+
+The 15th is not the end of the month. Specific, confident, and false, said
+to a customer. The same shape as #2 and the misquoted rupee amount: not a
+model hallucinating, but **code handing the model a sentence that was wrong
+before the model ever saw it.** A guard against invented justifications had
+already been written and passed the whole time, because it only banned
+claims about how *banks* behave. It never occurred to it to check whether
+the calendar claim was true.
+
+The phrase is now derived from the date it is attached to.
+
+### The one that cost a sale
+
+The two above were caught before anything ran. This one was not, and it is
+the most useful of the three because the guard that should have stopped it
+already existed — as a sentence.
+
+With the planner wired in, the batch was run three times. Two runs matched
+the previous scoreboard exactly. The third did not:
+
+```
+scenario:  "Card declined, wants to retry"
+before:    RECOVERED_FULL_PRICE   tools: ['check_offer', 'issue_offer']
+after:     NO_SALE                tools: ['get_timing_plan', 'record_promise_to_pay']
+```
+
+The agent booked a callback for a customer who wanted to pay that day. A
+₹999 cart, lost to helpfulness. `rule_breaks` stayed 0 the whole time — no
+rule was broken. It simply took the worse of two legitimate actions.
+
+**A declined card is not a timing problem, for exactly the reason it is not
+a price problem.** That customer is trying to give you money; they need a
+link that works. FINDINGS #1 is that lesson, learned about discounts, and
+the system prompt has carried it in capitals ever since. It did not hold.
+Handed a new tool, the model found a new way to be accommodating in the
+wrong direction — and prose cannot enumerate the wrong directions in
+advance.
+
+So `get_timing_plan` now refuses for `SOFT_DECLINE`, `HARD_DECLINE` and
+`AUTH_DROP` while no payment link has been sent, and it refuses with
+`REJECTED_FULL_PRICE_FIRST` — deliberately the *same* code the discount gate
+uses. One rule, one name in the audit trail: a merchant should see the same
+refusal whether the agent tried to discount too early or to reschedule too
+early, because it is the same mistake wearing a different coat. Once a link
+has gone out and they still cannot pay, "when" becomes a real question and
+the tool answers it.
+
+The gate is written not to swallow what the feature exists for:
+`INSUFFICIENT_FUNDS`, `USER_ABANDON` and `UNKNOWN` still get dates, with
+tests pinning that so a later tightening cannot quietly kill the capability
+while leaving it looking installed.
+
+**What this says about the harness.** A 581-test suite was green across this
+entire regression. Nothing was broken in any unit; a tool that worked
+perfectly was simply chosen at the wrong moment, and only a run of whole
+conversations end-to-end can see that. This is the third time the batch has
+found something the test suite was happy with (see #13 and #14) — and the
+first time it caught a bug in a feature that had been built specifically to
+be safe.
+
+It also argues for the three-run rule. One run would have had a 2-in-3
+chance of reporting no change at all.
+
+### The shape all three share
+
+The planner is pure, deterministic, and was covered by two hundred passing
+tests before any of these was found. None is a logic error a test would
+naturally catch, because in every case the code did exactly what it was
+written to do. The *specification* was wrong — visible only in the sentence
+a customer would actually hear, or in the choice the agent made when it had
+two reasonable options and picked the worse one.
+
+Two habits caught all three, and neither is a test: print the real output
+and read it once before believing the green, and run whole conversations
+end to end three times before believing a scoreboard.
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim
