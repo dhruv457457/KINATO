@@ -35,6 +35,9 @@ from app.db.repositories import offer_tokens as offer_tokens_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
+from datetime import datetime, timezone
+
+from app.services import timing_planner
 from app.services.failure_diagnosis import FULL_PRICE_FIRST_CLASSES
 from app.services.policy_engine import policy_engine
 from app.services.payment_execution import payment_execution, PaymentExecutionError
@@ -249,6 +252,92 @@ get_policy_limits = Tool(
     parameters={},
     required=[],
     fn=_get_policy_limits,
+    mutating=False,
+)
+
+
+async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
+    """When this failure is worth another approach - computed, not guessed.
+
+    Read-only in the strongest sense: it schedules nothing, contacts nobody,
+    and writes no row. It hands back dates the agent may OFFER. The only
+    thing that turns one into a commitment is the customer agreeing, which
+    goes through record_promise_to_pay exactly as it always has.
+
+    That distinction is the whole reason this tool is safe to add. A planner
+    that could dispatch would be a second route to a customer's phone, and
+    every stopping rule in outreach_guards would need re-proving against it.
+    """
+    if not ctx.checkout_id:
+        return {"error": "no_checkout_in_context"}
+    checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
+    if not checkout:
+        return {"error": "checkout_not_found"}
+    policy = await run_db_async(policy_engine.get_policy, ctx.merchant_id)
+
+    # There is no failed_at column. abandoned_at is set by the sweeper when a
+    # cart is given up on and is the closest thing we have to "when this went
+    # wrong"; started_at is the fallback for a payment that failed outright,
+    # where the checkout began and ended in the same few minutes anyway.
+    anchor = checkout.get("abandoned_at") or checkout.get("started_at")
+    if not anchor:
+        return {"error": "no_timestamp_to_plan_from"}
+    if isinstance(anchor, str):
+        anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+
+    windows = timing_planner.plan_windows(
+        checkout.get("failure_class"),
+        anchor,
+        calling_start_hour=int(policy.get("calling_start_hour", 10)),
+        calling_end_hour=int(policy.get("calling_end_hour", 20)),
+    )
+
+    if not windows:
+        # An empty plan is a real answer, not a failure to produce one, and
+        # the agent must be told so explicitly - otherwise a model handed an
+        # empty list will invent a date to fill it.
+        return {
+            "windows": [],
+            "guidance": (
+                "Do NOT suggest trying again later. This payment will not "
+                "succeed on the same card no matter when it is retried. Help "
+                "them pay another way instead."
+            ),
+        }
+
+    return {
+        "windows": [
+            {
+                # The finished phrase, for the same reason say_amount exists.
+                "say_window": w.say_window,
+                "say_reason": w.say_reason,
+                "reason_code": w.reason_code,
+            }
+            for w in windows if not w.is_past
+        ],
+        "guidance": (
+            "These are times you may OFFER. Read say_window exactly as written - "
+            "do not restate or recalculate the date. Nothing is scheduled and "
+            "nothing will be retried automatically, so never tell them we will "
+            "try again by ourselves. If they agree to one, call "
+            "record_promise_to_pay with that date."
+        ),
+    }
+
+
+get_timing_plan = Tool(
+    name="get_timing_plan",
+    description=(
+        "Suggest when this customer could be approached again, based on why their payment "
+        "failed and the merchant's calling hours. Use when they say they cannot pay right "
+        "now - especially 'not until payday'. Returns dates you may OFFER; it schedules "
+        "nothing. If they accept one, call record_promise_to_pay."
+    ),
+    parameters={},
+    required=[],
+    fn=_get_timing_plan,
     mutating=False,
 )
 
@@ -902,7 +991,7 @@ record_opt_out = Tool(
 
 
 ALL_TOOLS: List[Tool] = [
-    get_cart, get_policy_limits, check_offer, issue_offer,
+    get_cart, get_policy_limits, get_timing_plan, check_offer, issue_offer,
     record_promise_to_pay, record_opt_out,
 ]
 TOOLS_BY_NAME: Dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
