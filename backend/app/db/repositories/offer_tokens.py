@@ -10,6 +10,28 @@ from app.db.database import get_db
 from app.core.ids import new_id
 
 
+def concessions_already_made(merchant_id: str, checkout_id: str) -> int:
+    """How many offers this cart has already been quoted.
+
+    The step on the concession ladder. Counting minted tokens rather than
+    keeping a counter is deliberate: a token IS the record that a price was
+    computed and put in front of the customer, so the count cannot drift
+    from what actually happened, and it survives a restart mid-call.
+
+    Tokens that were never spent still count. The customer was quoted that
+    number and turned it down - that is exactly the event the ladder exists
+    to respond to.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM offer_tokens WHERE merchant_id = %s AND checkout_id = %s",
+            (merchant_id, checkout_id),
+        )
+        row = cursor.fetchone()
+        return int((dict(row) if row else {}).get("n") or 0)
+
+
 def create_offer_token(
     merchant_id: str,
     decision: str,

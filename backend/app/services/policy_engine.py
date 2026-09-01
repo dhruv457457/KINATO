@@ -147,6 +147,41 @@ class OfferPolicyEngine:
         if approval_cap_inr > 0:
             limits.append(((approval_cap_inr / cart_total) * 100, "REJECTED_APPROVAL_THRESHOLD"))
 
+        # THE CONCESSION LADDER - the fifth dead policy column, and the
+        # most expensive one.
+        #
+        # `offer_ladder` has been in the schema since it was written,
+        # defaulting to [3,7,10], is deserialised by policies.py, and is
+        # handed to the model by get_policy_limits. Nothing enforced it. So
+        # the engine answered every over-ask with min(requested, ceiling) -
+        # the model asked for 40%, and got the merchant's FULL CEILING on
+        # the first sentence of the negotiation.
+        #
+        # That is not a negotiation, it is a vending machine. Every
+        # discounted recovery cost the maximum the merchant had authorised,
+        # whether or not the customer would have taken 3%.
+        #
+        # Same shape as FINDINGS #4 and as auto_approval_threshold_inr,
+        # noted twenty lines above: a control the merchant believed existed,
+        # a number the model was told about, and nothing binding either.
+        #
+        # The step is how many offers this cart has ALREADY been quoted, so
+        # a customer who turns down 3% can be met at 7% and then at 10%.
+        # Rung zero is where a negotiation should open.
+        ladder = merchant_policy.get("offer_ladder") or []
+        if ladder:
+            try:
+                step = max(0, int(customer_context.get("concessions_made", 0)))
+                rung = float(ladder[min(step, len(ladder) - 1)])
+                limits.append((rung, "REJECTED_LADDER_STEP"))
+            except (TypeError, ValueError, IndexError):
+                # A malformed ladder must not be able to block every
+                # discount on the platform - it is a negotiation aid, not a
+                # safety limit. The ceiling and the margin floor are the
+                # limits that must never fail open, and neither is touched
+                # here.
+                logger.warning(f"Ignoring unusable offer_ladder: {ladder!r}")
+
         effective_max_discount, binding_reason = min(limits, key=lambda pair: pair[0])
         effective_max_discount = max(0.0, effective_max_discount)
 

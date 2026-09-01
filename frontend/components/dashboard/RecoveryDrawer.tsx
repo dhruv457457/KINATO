@@ -66,6 +66,8 @@ const REFUSAL_COPY: Record<string, string> = {
   REJECTED_LOW_CONFIDENCE: "the line was too unclear to act on",
   REJECTED_UNCONFIRMED_BARRIER: "they hadn't confirmed price was the problem yet",
   REJECTED_INVALID_CART_TOTAL: "the cart total was not usable",
+  REJECTED_LADDER_STEP: "opened at the first step of your offer ladder",
+  REJECTED_APPROVAL_THRESHOLD: "above what the agent may approve unreviewed",
 };
 
 export function RecoveryState({ state }: { state: string }) {

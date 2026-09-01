@@ -256,23 +256,24 @@ get_policy_limits = Tool(
 )
 
 
-async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
-    """When this failure is worth another approach - computed, not guessed.
+async def _offerable_windows(ctx: AgentContext):
+    """(windows, refusal) - the single place that decides what may be offered.
 
-    Read-only in the strongest sense: it schedules nothing, contacts nobody,
-    and writes no row. It hands back dates the agent may OFFER. The only
-    thing that turns one into a commitment is the customer agreeing, which
-    goes through record_promise_to_pay exactly as it always has.
+    Split out so that get_timing_plan and the window-token resolver cannot
+    disagree about what was on the table. Two functions computing "which
+    dates is this customer allowed to be offered" is exactly how a gate ends
+    up enforced on one path and not the other.
 
-    That distinction is the whole reason this tool is safe to add. A planner
-    that could dispatch would be a second route to a customer's phone, and
-    every stopping rule in outreach_guards would need re-proving against it.
+    Returns Window objects, not the model-facing dicts: those deliberately
+    carry no machine-readable timestamp, because handing a model an ISO
+    string is handing it a date to restate incorrectly.
     """
     if not ctx.checkout_id:
-        return {"error": "no_checkout_in_context"}
+        return [], {"error": "no_checkout_in_context"}
     checkout = await run_db_async(checkouts_repo.get_checkout, ctx.checkout_id)
     if not checkout:
-        return {"error": "checkout_not_found"}
+        return [], {"error": "checkout_not_found"}
+
     # THE SALE COMES FIRST - and a callback is a way of losing one.
     #
     # A declined card, a dropped auth or an errored checkout is not a timing
@@ -297,7 +298,7 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
             recovery_attempts_repo.a_payment_link_was_sent_for, ctx.checkout_id
         )
         if not link_sent:
-            return {
+            return [], {
                 "windows": [],
                 "reason": "REJECTED_FULL_PRICE_FIRST",
                 "guidance": (
@@ -315,7 +316,7 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
     # where the checkout began and ended in the same few minutes anyway.
     anchor = checkout.get("abandoned_at") or checkout.get("started_at")
     if not anchor:
-        return {"error": "no_timestamp_to_plan_from"}
+        return [], {"error": "no_timestamp_to_plan_from"}
     if isinstance(anchor, str):
         anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
     if anchor.tzinfo is None:
@@ -327,12 +328,11 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
         calling_start_hour=int(policy.get("calling_start_hour", 10)),
         calling_end_hour=int(policy.get("calling_end_hour", 20)),
     )
-
     if not windows:
         # An empty plan is a real answer, not a failure to produce one, and
         # the agent must be told so explicitly - otherwise a model handed an
         # empty list will invent a date to fill it.
-        return {
+        return [], {
             "windows": [],
             "guidance": (
                 "Do NOT suggest trying again later. This payment will not "
@@ -340,6 +340,24 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
                 "them pay another way instead."
             ),
         }
+    return [w for w in windows if not w.is_past], None
+
+
+async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
+    """When this failure is worth another approach - computed, not guessed.
+
+    Read-only in the strongest sense: it schedules nothing, contacts nobody,
+    and writes no row. It hands back dates the agent may OFFER. The only
+    thing that turns one into a commitment is the customer agreeing, which
+    goes through record_promise_to_pay exactly as it always has.
+
+    That distinction is the whole reason this tool is safe to add. A planner
+    that could dispatch would be a second route to a customer's phone, and
+    every stopping rule in outreach_guards would need re-proving against it.
+    """
+    windows, refusal = await _offerable_windows(ctx)
+    if refusal is not None:
+        return refusal
 
     return {
         "windows": [
@@ -348,15 +366,23 @@ async def _get_timing_plan(ctx: AgentContext) -> Dict[str, Any]:
                 "say_window": w.say_window,
                 "say_reason": w.say_reason,
                 "reason_code": w.reason_code,
+                # What the agent hands back if the customer agrees to this
+                # one. The model never formats the date itself - it names a
+                # window and code resolves the moment, exactly as
+                # offer_token does for an amount. Note there is no machine-
+                # readable timestamp here on purpose: an ISO string in front
+                # of a model is a date waiting to be restated wrongly.
+                "window_token": f"win_{i}",
             }
-            for w in windows if not w.is_past
+            for i, w in enumerate(windows, start=1)
         ],
         "guidance": (
             "These are times you may OFFER. Read say_window exactly as written - "
             "do not restate or recalculate the date. Nothing is scheduled and "
             "nothing will be retried automatically, so never tell them we will "
             "try again by ourselves. If they agree to one, call "
-            "record_promise_to_pay with that date."
+            "record_promise_to_pay with that window_token - not with a date you "
+            "typed yourself."
         ),
     }
 
@@ -483,10 +509,18 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
         "cogs": (checkout.get("cogs_paise") or 0) / 100.0,
         "product_ids": product_ids,
     }
+    # Which rung of the concession ladder this cart is on. Counted from the
+    # offer tokens already minted for it, because a token IS the record that
+    # a price was quoted - so the step cannot drift from what the customer
+    # was actually told, and it survives a restart mid-call.
+    concessions = await run_db_async(
+        offer_tokens_repo.concessions_already_made, ctx.merchant_id, ctx.checkout_id
+    )
     decision = policy_engine.evaluate(
         requested_discount=requested_discount_percent,
         merchant_policy=policy,
         cart_details=cart_details,
+        customer_context={"concessions_made": concessions},
     )
 
     if decision["decision"] == "DENY":
@@ -887,10 +921,16 @@ def _parse_promise_date(raw: str):
     text = str(raw).strip().lower()
     now = datetime.now(_tz.utc)
 
-    if text in ("today", "tonight"):
-        return now + timedelta(hours=8)
-    if text in ("tomorrow", "tmrw"):
+    # Substring, not equality. A model passing the customer's own sentence
+    # through - "I'll pay tomorrow" - is the normal case, and matching only
+    # the bare word refused it. "day after tomorrow" is checked first
+    # because it contains "tomorrow" and means something else.
+    if "day after tomorrow" in text:
+        return now + timedelta(days=2)
+    if "tomorrow" in text or "tmrw" in text:
         return now + timedelta(days=1)
+    if "today" in text or "tonight" in text:
+        return now + timedelta(hours=8)
 
     m = _re.search(r"(\d+)\s*day", text)
     if m:
@@ -906,7 +946,83 @@ def _parse_promise_date(raw: str):
             return None
         return parsed
     except ValueError:
+        pass
+
+    # --- The ways people actually say a date --------------------------
+    #
+    # Everything above understands relative time and ISO. Nothing above
+    # understood a CALENDAR date said out loud - "on the 1st", "next
+    # Friday", "end of month" - which is the single most common way a
+    # customer names a payday, and is what the tool's own description had
+    # been advertising as an example while refusing it.
+    #
+    # Reasoned in IST: these are Indian customers naming a day, and "the
+    # 1st" means their 1st. Deciding it in UTC puts the boundary five and a
+    # half hours into their evening.
+    ist = _tz(timedelta(hours=5, minutes=30))
+    local = now.astimezone(ist)
+
+    def _at(d):
+        """Late morning, so a stored promise is not a midnight boundary."""
+        return d.replace(hour=10, minute=0, second=0, microsecond=0)
+
+    def _horizon(candidate):
+        return candidate if candidate <= now + timedelta(days=60) else None
+
+    if "next month" in text:
+        first = (local.replace(day=1) + timedelta(days=32)).replace(day=1)
+        return _horizon(_at(first))
+
+    # "last Tuesday" is a mishearing, not a commitment - this function has
+    # said so in its docstring since it was written, and the weekday branch
+    # below would cheerfully have resolved it to NEXT Tuesday. Checked here
+    # so that "last day of the month" still reaches the branch under it.
+    if "last" in text and "last day" not in text:
         return None
+
+    if (
+        "end of month" in text
+        or "month end" in text
+        or "end of the month" in text
+        or "last day" in text
+    ):
+        import calendar as _cal
+        last = _cal.monthrange(local.year, local.month)[1]
+        candidate = _at(local.replace(day=last))
+        if candidate <= now:
+            nxt = (local.replace(day=1) + timedelta(days=32))
+            last = _cal.monthrange(nxt.year, nxt.month)[1]
+            candidate = _at(nxt.replace(day=last))
+        return _horizon(candidate)
+
+    _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    # A day-of-month is checked BEFORE a weekday name, because the planner's
+    # own phrase contains both ("Tuesday the 15th of September") and the
+    # number is the specific half.
+    m = _re.search(r"\b(\d{1,2})\s*(?:st|nd|rd|th)\b", text)
+    if m:
+        day = int(m.group(1))
+        if not 1 <= day <= 31:
+            return None
+        candidate = local
+        for _ in range(3):
+            import calendar as _cal
+            if day <= _cal.monthrange(candidate.year, candidate.month)[1]:
+                dated = _at(candidate.replace(day=day))
+                if dated > now:
+                    return _horizon(dated)
+            candidate = (candidate.replace(day=1) + timedelta(days=32))
+        return None
+
+    for i, name in enumerate(_WEEKDAYS):
+        if name in text:
+            ahead = (i - local.weekday()) % 7
+            # "friday" said on a Friday means the next one, not today - a
+            # promise for a day already underway pauses nothing.
+            ahead = ahead or 7
+            return _horizon(_at(local + timedelta(days=ahead)))
+
+    return None
 
 async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
     """"Don't contact me again" - across every channel, not just this one.
@@ -936,9 +1052,35 @@ async def _record_opt_out(ctx: AgentContext) -> Dict[str, Any]:
 
 
 
+async def _resolve_window_token(ctx: AgentContext, token: str) -> Optional[datetime]:
+    """The moment a window token refers to, or None if it refers to nothing.
+
+    Deliberately re-derived by calling get_timing_plan rather than by
+    reading a stored row. plan_windows is pure and anchored on the
+    failure's own timestamp, so the same checkout produces the same windows
+    on every call - which means the token needs no storage and cannot go
+    stale against a plan that has since changed.
+
+    Reusing the whole tool, not just the planner, is the load-bearing part.
+    Every refusal the tool applies applies here too: a broken checkout that
+    was told to send a link instead of a date has no windows, so a token
+    for one resolves to nothing. Resolving against the bare planner would
+    have left the sale-comes-first gate walkable in one step - offer
+    nothing, then hand back win_1 anyway.
+    """
+    windows, refusal = await _offerable_windows(ctx)
+    if refusal is not None:
+        return None
+    for i, w in enumerate(windows, start=1):
+        if f"win_{i}" == token:
+            return w.at
+    return None
+
+
 async def _record_promise_to_pay(
     ctx: AgentContext,
-    pay_date: str,
+    pay_date: str = "",
+    window_token: str = "",
     amount_inr: float = 0.0,
     customer_words: str = "",
     offer_token: str = "",
@@ -955,9 +1097,33 @@ async def _record_promise_to_pay(
     if not ctx.recovery_attempt_id:
         return {"status": "REJECTED", "reason": "no_recovery_attempt_in_context"}
 
-    parsed = _parse_promise_date(pay_date)
+    # The token first, always. It is the only path where what the customer
+    # HEARD and what lands in the database are guaranteed to be the same
+    # moment, because neither was ever formatted by the model.
+    parsed = None
+    if window_token:
+        parsed = await _resolve_window_token(ctx, window_token)
+        if parsed is None:
+            return {
+                "status": "REJECTED",
+                "reason": "REJECTED_UNKNOWN_WINDOW",
+                "detail": (
+                    f"{window_token!r} is not a window that was offered for this "
+                    "checkout. Call get_timing_plan and use a window_token from it."
+                ),
+            }
+    elif pay_date:
+        parsed = _parse_promise_date(pay_date)
+
     if parsed is None:
-        return {"status": "REJECTED", "reason": f"unparseable_date: {pay_date!r}"}
+        return {
+            "status": "REJECTED",
+            "reason": f"unparseable_date: {pay_date!r}",
+            "detail": (
+                "Say the date back to them and ask them to confirm it, or call "
+                "get_timing_plan and offer them one of its windows instead."
+            ),
+        }
 
     await run_db_async(
         lambda: recovery_attempts_repo.update_state(
@@ -992,9 +1158,21 @@ record_promise_to_pay = Tool(
         "not yet. Still send them the payment link so it is waiting for them."
     ),
     parameters={
+        "window_token": {
+            "type": "string",
+            "description": (
+                "PREFERRED. The window_token of the date from get_timing_plan that they "
+                "agreed to. Use this whenever you offered them a time - it records exactly "
+                "the date you read out, with no date for you to retype."
+            ),
+        },
         "pay_date": {
             "type": "string",
-            "description": "When they said they will pay: an ISO date (2026-09-01), or 'today', 'tomorrow', or a number of days ('in 3 days').",
+            "description": (
+                "Only when they named a date you did NOT offer them. Their words are fine: "
+                "'tomorrow', 'in 3 days', 'on the 1st', 'next Friday', 'end of month', or an "
+                "ISO date."
+            ),
         },
         "amount_inr": {"type": "number", "description": "Amount they said they would pay, if they named one. 0 if not."},
         "customer_words": {"type": "string", "description": "Their own words, quoted as closely as you heard them."},
@@ -1006,7 +1184,10 @@ record_promise_to_pay = Tool(
             ),
         },
     },
-    required=["pay_date"],
+    # Neither is required on its own: a promise arrives either as a window
+    # we offered or as a date they named, and demanding pay_date was what
+    # made the token path look optional when it is the safe one.
+    required=[],
     fn=_record_promise_to_pay,
     mutating=True,
 )

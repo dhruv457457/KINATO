@@ -232,7 +232,18 @@ class TestTheShapeOfWhatComesBack:
             assert not re.search(r"\d{4}-\d{2}-\d{2}", w.say_window), w.say_window
             assert "T00:" not in w.say_window and "+05:30" not in w.say_window
             # "the 3th of September" is a machine talking.
-            assert not re.search(r"\d*[123]th", w.say_window), w.say_window
+            # Computed here, independently, NOT by calling _ordinal - a
+            # test that asks the code under test what the answer should be
+            # agrees with it by construction and proves nothing.
+            #
+            # The regex that used to stand here was corrupted into matching
+            # nothing and passed vacuously for as long as it existed. A test
+            # that cannot fail is worse than no test, because it is counted
+            # as coverage.
+            day = w.at.day
+            suffix = {1: "st", 2: "nd", 3: "rd", 21: "st", 22: "nd",
+                      23: "rd", 31: "st"}.get(day, "th")
+            assert f"the {day}{suffix} of" in w.say_window, w.say_window
 
     def test_a_window_already_gone_by_is_marked_rather_than_hidden(self):
         failed = at(2026, 9, 2, 11)
