@@ -34,7 +34,15 @@ from app.payments.webhooks import payments_router
 from app.gateway.event_bus import bus
 from app.gateway.sweeper import run_sweeper_loop
 from app.core.config import settings
+from app.api.google_auth import google_router
 from app.core.dynamic_cors import dynamic_cors_middleware
+from app.core.auth import (
+    SESSION_COOKIE_NAME,
+    create_session_token,
+    decode_session_token,
+    session_cookie_kwargs,
+    session_needs_renewal,
+)
 from app.db.init_db import init_db
 
 # Import deterministic services & agents to ensure they subscribe to the event bus
@@ -120,7 +128,58 @@ for _origin in settings.cors_origins_list:
 # would otherwise reject any merchant's real storefront origin.
 app.middleware("http")(dynamic_cors_middleware)
 
+
+@app.middleware("http")
+async def renew_active_sessions(request, call_next):
+    """Push a live session's expiry forward while the merchant is using it.
+
+    The session is a seven-day JWT that was issued once at login and never
+    touched again, so a merchant who signed in a week ago was logged out
+    mid-action - no warning, no renewal, and whatever was in the form went
+    with it. Seven days of INACTIVITY is a fair thing to end a session on;
+    seven days since you last typed your password is a different rule, and
+    it was the one being enforced.
+
+    Three deliberate limits:
+
+      * Only a token that still verifies is renewed. An expired session
+        stays expired - renewal extends a live session, it does not raise a
+        dead one.
+      * Only past halfway through its life, so responses do not all carry a
+        pointless Set-Cookie.
+      * Never on a response that is already writing this cookie itself.
+        Login and logout both do, and a renewal landing on the logout
+        response would hand back a live session to somebody who just signed
+        out. That is the logout bug wearing a different hat, so it is
+        checked rather than reasoned about.
+    """
+    response = await call_next(request)
+
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token or not session_needs_renewal(token):
+        return response
+
+    already_setting = any(
+        v.startswith(f"{SESSION_COOKIE_NAME}=")
+        for k, v in response.headers.items()
+        if k.lower() == "set-cookie"
+    )
+    if already_setting:
+        return response
+
+    merchant_id = decode_session_token(token)
+    if not merchant_id:
+        return response
+
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        create_session_token(merchant_id),
+        **session_cookie_kwargs(request),
+    )
+    return response
+
 # Register routers
+app.include_router(google_router)
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
 app.include_router(trigger_router, prefix="/api")

@@ -57,6 +57,21 @@ def get_merchant_by_email(email: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def set_auth_provider(merchant_id: str, provider: str) -> None:
+    """How this merchant signs in - 'password' or 'google'.
+
+    Recorded rather than inferred, because a Google account holds a random
+    unusable password hash and nothing downstream can tell that apart from a
+    real one by looking. A password-reset flow needs to know the difference
+    before it mails a reset for a login that does not take one.
+    """
+    with get_db() as conn:
+        conn.cursor().execute(
+            "UPDATE merchants SET auth_provider = %s WHERE merchant_id = %s",
+            (provider, merchant_id),
+        )
+
+
 def set_onboarding_step(merchant_id: str, step: str) -> None:
     with get_db() as conn:
         cursor = conn.cursor()

@@ -60,6 +60,62 @@ def create_session_token(merchant_id: str) -> str:
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
+def session_cookie_kwargs(request: Request) -> Dict[str, Any]:
+    """Session cookie attributes, decided per request.
+
+    Lives here rather than beside the login route because THREE places now
+    write this cookie - login, logout and renewal - and a browser matches a
+    cookie on its path, SameSite and Secure. Any two of them disagreeing
+    means one writes a second, different cookie and leaves the first alone.
+    That is not a hypothetical failure mode in this codebase: it is exactly
+    how logout came to report success without logging anybody out.
+
+    The dashboard and the API do not necessarily share a site - the frontend
+    can run on Vercel or localhost while the API runs on Railway - which
+    makes the session cookie CROSS-SITE, and a browser silently refuses to
+    store a cross-site cookie unless it is `SameSite=None; Secure`. Over
+    plain HTTP (local development) that combination is itself rejected, so
+    there we keep Lax.
+    """
+    is_https = (
+        request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto") == "https"
+    )
+    return dict(
+        httponly=True,
+        samesite="none" if is_https else "lax",
+        secure=is_https,
+        max_age=settings.JWT_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+
+
+def session_needs_renewal(token: str) -> bool:
+    """True when a still-valid session is past halfway through its life.
+
+    Halfway, rather than on every request, because rewriting the cookie
+    every time puts a Set-Cookie on every response for no benefit. And
+    renewal only ever applies to a token that still verifies - an expired
+    session is someone who signs in again, not someone the server quietly
+    lets back in.
+    """
+    try:
+        secret = _require_jwt_secret()
+        payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+    except (jwt.PyJWTError, AuthNotConfiguredError):
+        return False
+
+    exp = payload.get("exp")
+    iat = payload.get("iat")
+    if not exp or not iat:
+        return False
+    lifetime = exp - iat
+    if lifetime <= 0:
+        return False
+    remaining = exp - datetime.now(timezone.utc).timestamp()
+    return 0 < remaining < lifetime / 2
+
+
 def decode_session_token(token: str) -> Optional[str]:
     """Returns the merchant_id if the token is valid, else None. Never raises -
     an invalid/expired/malformed cookie should behave like "not logged in",

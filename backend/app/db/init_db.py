@@ -354,6 +354,11 @@ def init_db(force_reseed: bool = False) -> None:
         # identical sales call. Stored on the checkout because it is a
         # fact about the payment, not about any one recovery attempt -
         # a second attempt must diagnose from the same evidence.
+        # How this merchant signs in. A Google account has no usable
+        # password, and a password-reset flow must be able to tell the
+        # difference rather than mailing a reset for a login that does not
+        # take one.
+        "ALTER TABLE merchants ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'password'",
         "ALTER TABLE checkouts ADD COLUMN error_code TEXT",
         "ALTER TABLE checkouts ADD COLUMN error_reason TEXT",
         "ALTER TABLE checkouts ADD COLUMN error_description TEXT",

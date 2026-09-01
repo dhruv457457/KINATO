@@ -54,6 +54,22 @@ class Settings(BaseSettings):
     # token. Auth endpoints refuse with a clear error if this is unset, rather
     # than silently signing with a weak, guessable value.)
     JWT_SECRET_KEY: str = Field(default="", description="Secret used to sign merchant session JWTs")
+
+    # Sign in with Google. Both of these belong to the SERVER, not the
+    # dashboard: the client secret is exactly what its name says, and it
+    # was previously sitting in frontend/.env.local under a comment
+    # claiming Google sign-in was "required" - for a feature that had no
+    # backend route, no next-auth, and no button anywhere in the UI.
+    #
+    # Empty is a supported state. The button is only offered when the
+    # server says it is configured, so a deployment without these shows a
+    # dashboard that simply does not mention Google, rather than one with a
+    # button that fails.
+    GOOGLE_CLIENT_ID: str = Field(default="", description="Google OAuth client id (server-side)")
+    GOOGLE_CLIENT_SECRET: str = Field(default="", description="Google OAuth client secret (server-side)")
+    # Where the browser lands after Google is done. The dashboard's origin,
+    # which is not necessarily this server's.
+    FRONTEND_URL: str = Field(default="http://localhost:3000", description="Dashboard origin, for post-login redirects")
     JWT_EXPIRE_MINUTES: int = Field(default=60 * 24 * 7, description="Session JWT lifetime in minutes (default 7 days)")
 
     # Encryption-at-rest key for merchant-supplied Razorpay credentials.
