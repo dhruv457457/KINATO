@@ -125,3 +125,31 @@ class TestAHardDeclineTellsTheAgentToStop:
         )
         assert result["windows"] == []
         assert "do not suggest" in result["guidance"].lower()
+
+
+class TestThePromptTellsTheAgentHowToUseIt:
+    """Mirrors the say_amount prompt test. A tool the prompt never mentions
+    is a tool the model will not reach for, and guidance that lives only in
+    the tool's return value arrives too late to shape the turn."""
+
+    def test_the_prompt_names_the_tool_and_the_field_to_read(self):
+        from app.channels.voice_runtime import SYSTEM_PROMPT_TEMPLATE
+
+        assert "get_timing_plan" in SYSTEM_PROMPT_TEMPLATE
+        assert "say_window" in SYSTEM_PROMPT_TEMPLATE
+
+    def test_the_prompt_forbids_claiming_an_automatic_retry(self):
+        """The single most dangerous thing the agent could say about this
+        feature is that it does something it does not do."""
+        from app.channels.voice_runtime import SYSTEM_PROMPT_TEMPLATE
+
+        assert "NOTHING IS SCHEDULED" in SYSTEM_PROMPT_TEMPLATE
+        assert "record_promise_to_pay" in SYSTEM_PROMPT_TEMPLATE
+
+    def test_the_prompt_routes_cashflow_away_from_discounting(self):
+        """"I can't pay till payday" is the one objection where waiting is
+        the right instrument and money off is the wrong one."""
+        from app.channels.voice_runtime import SYSTEM_PROMPT_TEMPLATE
+
+        assert "timing \
+problem, not a price problem" in SYSTEM_PROMPT_TEMPLATE or                "not a price problem" in SYSTEM_PROMPT_TEMPLATE
