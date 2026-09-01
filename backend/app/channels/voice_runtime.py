@@ -352,6 +352,12 @@ imperfect phone transcription, so it may be garbled or clipped; judge intent, no
 if you genuinely cannot tell whether they said yes or no, or if they sound confused about what you offered \
 - and if so ask once, simply ("Shall I send it across?"), never repeatedly.
 
+YOU MAY NEVER SAY A DISCOUNT IS UNAVAILABLE UNLESS check_offer HAS JUST REFUSED ONE. You do not know the \
+merchant's limits and you are not the one who decides them. If the customer asks for a discount, or confirms \
+the price is what is stopping them, CALL check_offer - even if you asked them a confirming question last turn \
+and they have now answered it. That answer is what the question was for. Saying "I can't offer a discount" \
+without calling it is telling them an answer nobody worked out.
+
 If a tool refuses you, it will say why in a REJECTED_ code, and the code tells you what to do next: ask them \
 to repeat themselves, read the barrier back, or send full price. Do exactly that - never argue with it and never \
 guess your way past it.
@@ -431,6 +437,56 @@ _CARD_SOLICITATION_REPLACEMENT = (
 
 def solicits_card_details(text: str) -> bool:
     return bool(text) and bool(_CARD_SOLICITATION.search(text))
+
+
+# Saying no to a discount is a decision, and it belongs to the policy
+# engine. This catches the agent making it alone.
+#
+# From a live call, on a merchant whose ceiling was 8% and whose ladder
+# opens at 3%:
+#
+#   customer: "No, I was thinking to getting any discount."   (heard at 0.90)
+#   agent:    "Unfortunately, I can't offer a discount at this time."
+#   tools:    []
+#
+# The barrier gate had already opened on the previous turn - the state
+# machine did its job - and the model walked straight past it, declined on
+# its own authority, and told a customer a policy outcome no policy engine
+# had produced. A discount was available. It never asked.
+#
+# The negated forms are the whole pattern: "can't offer", "unable to give",
+# "no discount available". An OFFER of a discount contains most of the same
+# words and must not trip it, which is why the negation has to be adjacent
+# rather than anywhere in the sentence.
+_DISCOUNT_REFUSAL = re.compile(
+    r"\b(?:"
+    r"can(?:'|’)?t|cannot|can not|unable to|not able to|won(?:'|’)?t be able|"
+    r"no|not|don(?:'|’)?t have|isn(?:'|’)?t|aren(?:'|’)?t"
+    r")\b[^.!?]{0,40}?\b(?:discount|off the price|reduction|lower(?:ed)? price)\b"
+    r"|\bno\s+discount\b"
+    r"|\bdiscount[^.!?]{0,25}\b(?:not available|unavailable|isn(?:'|’)?t available)\b",
+    re.IGNORECASE,
+)
+
+
+def claims_discount_refused(text: str) -> bool:
+    """True when the reply tells the customer no discount is possible.
+
+    Only meaningful alongside "and no tool refused one this turn" - the
+    caller checks that. A refusal the policy engine actually produced is a
+    fact the agent SHOULD be relaying.
+    """
+    return bool(text) and bool(_DISCOUNT_REFUSAL.search(text))
+
+
+# What to say instead. Deliberately not the opposite claim: promising a
+# discount the engine may be about to refuse would be the same bug pointed
+# the other way, and the customer would hear a number that never arrives.
+# This commits to exactly one thing - looking - which is the thing that was
+# skipped.
+_DISCOUNT_REFUSAL_REPLACEMENT = (
+    "Let me check what I can do on the price for you - one moment."
+)
 
 
 # One agent turn at a time, per call.
@@ -1063,6 +1119,31 @@ async def _run_agent_turn(
             "replaced. Nothing in this system can accept them."
         )
         reply_text = _CARD_SOLICITATION_REPLACEMENT
+
+    # Saying no to a discount is the policy engine's decision to make, and
+    # the agent has now been caught making it alone. Live, on a merchant
+    # whose ceiling was 8% and whose ladder opens at 3%:
+    #
+    #   customer: "No, I was thinking to getting any discount."  (heard 0.90)
+    #   agent:    "Unfortunately, I can't offer a discount at this time."
+    #   tools:    []
+    #
+    # A discount was available. The barrier gate had opened on the previous
+    # turn, exactly as the state machine intends, and the model walked past
+    # it and declined on its own authority - a claim about money that was
+    # not true about anything that happened, which is FINDINGS #2's shape
+    # pointed at the merchant's revenue instead of the customer's trust.
+    #
+    # Only when NOTHING refused this turn. A refusal the engine really
+    # produced is a fact the agent should be relaying, and rewriting that
+    # would hide the one thing the customer needs to hear.
+    if claims_discount_refused(reply_text) and not result.refusals:
+        logger.error(
+            f"[CALL {call_id}] Model declined a discount it never asked for "
+            f"({reply_text!r}) - replaced. tools={result.tool_calls_made}. "
+            "Only check_offer may refuse a discount."
+        )
+        reply_text = _DISCOUNT_REFUSAL_REPLACEMENT
 
     logger.info(
         f"[CALL {call_id}] Agent ({'degraded' if result.degraded else 'ok'}): {reply_text!r} | "
