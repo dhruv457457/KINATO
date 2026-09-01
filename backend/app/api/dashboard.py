@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -15,6 +16,8 @@ from app.db.repositories import customers as customers_repo
 from app.db.repositories import products as products_repo
 from app.db.repositories import events as events_repo
 from app.services.identity_service import identity_service
+from app.services import timing_planner
+from app.services.policy_engine import policy_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -148,10 +151,62 @@ async def get_recovery_detail(recovery_attempt_id: str, current_merchant: dict =
     attempt["failure_class"] = (checkout or {}).get("failure_class")
     attempt["error_description"] = (checkout or {}).get("error_description")
 
+    # Recomputed here rather than stored anywhere. plan_windows is pure and
+    # anchored on the failure's own timestamp, so this returns exactly what
+    # the agent was offered on the call - today, or a month from now. A
+    # stored copy would be a second version of the same fact, free to drift
+    # from the row it came from.
     return {
         "recovery_attempt": attempt,
         "audit_trail": audit_rows,
         "transcript": transcript,
+        "timing_plan": _timing_plan_for(checkout, current_merchant["merchant_id"]),
+    }
+
+
+def _timing_plan_for(checkout: Optional[Dict[str, Any]], merchant_id: str) -> Dict[str, Any]:
+    """The follow-up windows this failure earns, for the drawer.
+
+    Returns `windows: []` with a reason rather than nothing at all when the
+    answer is "never". A stopping rule the merchant cannot see is a stopping
+    rule they have to take on trust.
+    """
+    if not checkout:
+        return {"windows": [], "no_window_reason": None}
+    anchor = checkout.get("abandoned_at") or checkout.get("started_at")
+    if not anchor:
+        return {"windows": [], "no_window_reason": None}
+    if isinstance(anchor, str):
+        try:
+            anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+        except ValueError:
+            return {"windows": [], "no_window_reason": None}
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+
+    policy = policy_engine.get_policy(merchant_id)
+    start = int(policy.get("calling_start_hour", 10))
+    end = int(policy.get("calling_end_hour", 20))
+    windows = timing_planner.plan_windows(
+        checkout.get("failure_class"), anchor, calling_start_hour=start, calling_end_hour=end
+    )
+    return {
+        "windows": [
+            {
+                "at": w.at.isoformat(),
+                "say_window": w.say_window,
+                "say_reason": w.say_reason,
+                "reason_code": w.reason_code,
+                "is_past": w.is_past,
+            }
+            for w in windows
+        ],
+        "no_window_reason": (
+            "This decline will not clear on the same card, so no follow-up time is suggested."
+            if not windows and checkout.get("failure_class") == "HARD_DECLINE"
+            else None
+        ),
+        "calling_hours": f"{start:02d}:00-{end:02d}:00 IST",
     }
 
 

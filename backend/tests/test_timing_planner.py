@@ -184,6 +184,15 @@ class TestTransientFailuresGetAQuickRetry:
         assert windows
         assert windows[0].at - failed <= timedelta(hours=24)
 
+    def test_the_suggested_minute_is_one_a_person_would_say(self):
+        """The quick retry is the only window derived by arithmetic on the
+        failure rather than from a calendar date, so it used to inherit the
+        exact minute the payment broke - "around 4:17 in the afternoon".
+        Nobody offers somebody 4:17."""
+        for minute in (0, 7, 17, 29, 30, 31, 45, 59):
+            windows = plan_windows(SOFT_DECLINE, at(2026, 9, 2, 10, minute))
+            assert windows[0].at.minute in (0, 30), windows[0].at
+
     def test_a_rail_outage_is_treated_as_transient_too(self):
         windows = plan_windows(RAIL_DOWN, at(2026, 9, 2, 11))
         assert any(w.reason_code == "transient_quick_retry" for w in windows)

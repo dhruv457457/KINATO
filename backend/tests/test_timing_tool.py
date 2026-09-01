@@ -153,3 +153,55 @@ class TestThePromptTellsTheAgentHowToUseIt:
 
         assert "timing \
 problem, not a price problem" in SYSTEM_PROMPT_TEMPLATE or                "not a price problem" in SYSTEM_PROMPT_TEMPLATE
+
+
+class TestTheDrawerGetsTheSamePlanTheAgentGot:
+    """The dashboard recomputes rather than reading a stored copy.
+
+    plan_windows is pure and anchored on the failure's own timestamp, so the
+    drawer shows what the agent was actually offered on the call - not a
+    snapshot taken at write time that has since drifted from the row it came
+    from. Two sources of truth for one fact is how a merchant ends up
+    reading a plan the agent never had.
+    """
+
+    def test_the_endpoint_helper_matches_the_planner(self, connected_merchant_id):
+        from datetime import datetime, timezone
+
+        from app.api.dashboard import _timing_plan_for
+        from app.services.policy_engine import policy_engine
+        from app.services.timing_planner import plan_windows
+
+        anchor = datetime(2026, 9, 2, 11, 0, tzinfo=timezone.utc)
+        checkout = {"abandoned_at": anchor, "failure_class": "INSUFFICIENT_FUNDS"}
+
+        payload = _timing_plan_for(checkout, connected_merchant_id)
+        policy = policy_engine.get_policy(connected_merchant_id)
+        direct = plan_windows(
+            "INSUFFICIENT_FUNDS",
+            anchor,
+            calling_start_hour=int(policy.get("calling_start_hour", 10)),
+            calling_end_hour=int(policy.get("calling_end_hour", 20)),
+        )
+        assert [w["say_window"] for w in payload["windows"]] == [w.say_window for w in direct]
+
+    def test_a_hard_decline_reaches_the_drawer_as_a_visible_reason(self, connected_merchant_id):
+        """Not as a bare empty list. A stopping rule the merchant cannot see
+        is a stopping rule they have to take on trust."""
+        from datetime import datetime, timezone
+
+        from app.api.dashboard import _timing_plan_for
+
+        payload = _timing_plan_for(
+            {"abandoned_at": datetime(2026, 9, 2, 11, 0, tzinfo=timezone.utc),
+             "failure_class": "HARD_DECLINE"},
+            connected_merchant_id,
+        )
+        assert payload["windows"] == []
+        assert payload["no_window_reason"]
+
+    def test_a_checkout_with_no_timestamp_does_not_explode(self, connected_merchant_id):
+        from app.api.dashboard import _timing_plan_for
+
+        payload = _timing_plan_for({"failure_class": "USER_ABANDON"}, connected_merchant_id)
+        assert payload["windows"] == []

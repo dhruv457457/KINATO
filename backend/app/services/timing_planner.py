@@ -262,7 +262,15 @@ def plan_windows(
     candidates: List[tuple] = []
 
     if failure_class in (SOFT_DECLINE, RAIL_DOWN):
-        candidates.append((failed_at + timedelta(hours=QUICK_RETRY_HOURS), "transient_quick_retry"))
+        # Rounded to the next half hour. This one window is derived by
+        # arithmetic on the failure rather than from a calendar date, so
+        # without rounding it inherits the exact minute the payment broke -
+        # and "around 4:17 in the afternoon" is not a time anybody offers
+        # somebody. Every other window already lands on :30 by construction.
+        quick = failed_at + timedelta(hours=QUICK_RETRY_HOURS)
+        quick = quick.replace(second=0, microsecond=0)
+        quick += timedelta(minutes=(-quick.minute) % 30)
+        candidates.append((quick, "transient_quick_retry"))
         candidates += [(m, "business_hours") for m in _next_midweek_openings(failed_at, start, 2)]
     elif failure_class == INSUFFICIENT_FUNDS:
         # Paydays only, deliberately. A midweek courtesy call to someone who

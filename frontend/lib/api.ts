@@ -176,9 +176,34 @@ export function getRecoveries(): Promise<{ recoveries: RecoveryRow[] }> {
   return apiFetch("/api/dashboard/recoveries");
 }
 
-export function getRecoveryDetail(
-  id: string
-): Promise<{ recovery_attempt: any; audit_trail: AuditRow[]; transcript: TranscriptTurn[] }> {
+/** One suggested moment to approach this customer again.
+ *
+ *  Computed by the backend on every read rather than stored: plan_windows is
+ *  pure and anchored on the failure's own timestamp, so what the drawer
+ *  shows is what the agent was offered on the call, not a snapshot that has
+ *  since drifted from the row it came from. */
+export interface TimingWindow {
+  at: string;
+  say_window: string;
+  say_reason: string;
+  reason_code: "transient_quick_retry" | "payday_proximity" | "business_hours";
+  is_past: boolean;
+}
+
+export interface TimingPlan {
+  windows: TimingWindow[];
+  /** Set when the correct answer is "never" - a stopping rule the merchant
+   *  should be able to see rather than infer from an empty list. */
+  no_window_reason: string | null;
+  calling_hours?: string;
+}
+
+export function getRecoveryDetail(id: string): Promise<{
+  recovery_attempt: any;
+  audit_trail: AuditRow[];
+  transcript: TranscriptTurn[];
+  timing_plan?: TimingPlan;
+}> {
   return apiFetch(`/api/dashboard/recoveries/${id}`);
 }
 

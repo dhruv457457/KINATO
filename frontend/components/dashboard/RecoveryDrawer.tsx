@@ -27,6 +27,7 @@ import {
   AuditRow,
   TranscriptTurn,
   ExplainResult,
+  TimingPlan,
 } from "@/lib/api";
 import {
   StatusPill,
@@ -236,6 +237,79 @@ function PromiseNote({ attempt }: { attempt: any }) {
   );
 }
 
+/** When this customer could be approached again, and why that moment.
+ *
+ *  Sits directly above PromiseNote on purpose: they are the same story in
+ *  two states. This is what the agent was allowed to OFFER; the promise
+ *  below is what the customer actually agreed to. Nothing here is
+ *  scheduled, and the card says so rather than letting a merchant assume
+ *  otherwise - in Tier 1 there is no dispatcher, so a card implying one
+ *  would be the interface telling the same lie the agent is forbidden to.
+ */
+function TimingPlanNote({ plan }: { plan?: TimingPlan }) {
+  if (!plan) return null;
+
+  // "Never" is a real answer and worth showing. A stopping rule the
+  // merchant cannot see is a stopping rule they have to take on trust.
+  if (plan.no_window_reason) {
+    return (
+      <div className="mb-8 border p-4" style={{ borderColor: RULE }}>
+        <div
+          className="text-[10.5px] font-semibold uppercase tracking-widest mb-2"
+          style={{ color: INK_MUTED }}
+        >
+          Follow-up timing
+        </div>
+        <div className="text-[13px] leading-relaxed" style={{ color: INK_MUTED }}>
+          {plan.no_window_reason}
+        </div>
+      </div>
+    );
+  }
+
+  if (!plan.windows.length) return null;
+
+  return (
+    <div className="mb-8 border p-4" style={{ borderColor: RULE }}>
+      <div
+        className="text-[10.5px] font-semibold uppercase tracking-widest mb-2"
+        style={{ color: INK_MUTED }}
+      >
+        Follow-up timing
+      </div>
+      <ul className="space-y-1.5">
+        {plan.windows.map((w) => (
+          <li key={w.at} className="text-[13px] leading-relaxed">
+            <strong className="tabular-nums" style={{ opacity: w.is_past ? 0.5 : 1 }}>
+              {new Date(w.at).toLocaleString("en-IN", {
+                weekday: "short",
+                day: "numeric",
+                month: "short",
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </strong>
+            <span style={{ color: INK_MUTED }}> — {w.say_reason}</span>
+            {w.is_past && (
+              <span
+                className="text-[10px] uppercase font-semibold tracking-wide ml-2"
+                style={{ color: INK_MUTED }}
+              >
+                passed
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <div className="text-[12px] mt-3 leading-relaxed" style={{ color: INK_MUTED }}>
+        Suggested only — nothing is scheduled and no card is retried automatically. A date
+        holds only once the customer agrees to it.
+        {plan.calling_hours ? ` Kept inside your calling hours (${plan.calling_hours}).` : ""}
+      </div>
+    </div>
+  );
+}
+
 type TimelineItem =
   | { kind: "turn"; at: number; turn: TranscriptTurn }
   | { kind: "tool"; at: number; row: AuditRow };
@@ -306,6 +380,7 @@ export function RecoveryDrawer({
     recovery_attempt: any;
     audit_trail: AuditRow[];
     transcript: TranscriptTurn[];
+    timing_plan?: TimingPlan;
   } | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -417,6 +492,8 @@ export function RecoveryDrawer({
               </div>
 
               {explainOnOpen && <Explanation recoveryAttemptId={recoveryAttemptId} />}
+
+              <TimingPlanNote plan={detail.timing_plan} />
 
               <PromiseNote attempt={detail.recovery_attempt} />
 
