@@ -497,7 +497,29 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
             "detail": "this checkout has already been paid - there is nothing to recover",
         }
 
-    policy = await run_db_async(policy_engine.get_policy, ctx.merchant_id)
+    # Both reads at once, not one after the other.
+    #
+    # The concession count is a second query on the money path, and this
+    # path runs inside a live phone call with about five seconds for the
+    # whole turn. Awaiting it after the policy read added a full database
+    # round trip to every check_offer - and from a container that is not
+    # beside its database, a round trip is not free (FINDINGS #17: a single
+    # indexed SELECT timed at 2365ms). Nothing here depends on the other, so
+    # nothing should wait for it.
+    #
+    # This was not caught by reading the code. It showed up as
+    # conversation-memory tests failing intermittently, in a DIFFERENT place
+    # each run, which is what a latency regression looks like from the
+    # outside and what a logic bug does not.
+    policy, concessions = await asyncio.gather(
+        run_db_async(policy_engine.get_policy, ctx.merchant_id),
+        # Which rung of the concession ladder this cart is on. Counted from
+        # the offer tokens already minted for it, because a token IS the
+        # record that a price was quoted - so the step cannot drift from
+        # what the customer was actually told, and it survives a restart
+        # mid-call.
+        run_db_async(offer_tokens_repo.concessions_already_made, ctx.merchant_id, ctx.checkout_id),
+    )
     product_ids = []
     try:
         line_items = json.loads(checkout.get("line_items") or "[]")
@@ -509,13 +531,6 @@ async def _check_offer(ctx: AgentContext, requested_discount_percent: float, rea
         "cogs": (checkout.get("cogs_paise") or 0) / 100.0,
         "product_ids": product_ids,
     }
-    # Which rung of the concession ladder this cart is on. Counted from the
-    # offer tokens already minted for it, because a token IS the record that
-    # a price was quoted - so the step cannot drift from what the customer
-    # was actually told, and it survives a restart mid-call.
-    concessions = await run_db_async(
-        offer_tokens_repo.concessions_already_made, ctx.merchant_id, ctx.checkout_id
-    )
     decision = policy_engine.evaluate(
         requested_discount=requested_discount_percent,
         merchant_policy=policy,
