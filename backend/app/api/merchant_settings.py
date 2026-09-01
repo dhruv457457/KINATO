@@ -5,13 +5,11 @@ account, and issuing/revoking the pk_/sk_ API keys used for event ingestion
 is no unauthenticated fallback merchant here, unlike the still-transitional
 dashboard/trigger routes (see policy_engine.py's docstring for why).
 """
-import csv
-import io
 import json
 import logging
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File, status
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Dict, List, Optional
 
 from app.core.auth import get_current_merchant
 from app.core.config import settings
@@ -22,6 +20,7 @@ from app.db.repositories import products as products_repo
 from app.db.repositories import policies as policies_repo
 from app.db.repositories import events as events_repo
 from app.db.database import run_db_async
+from app.services import catalog_ingest
 from app.services.razorpay_client_factory import validate_credentials_live, invalidate_cache
 
 logger = logging.getLogger(__name__)
@@ -209,60 +208,217 @@ async def onboarding_integrate_skip(current_merchant: dict = Depends(get_current
     return {"onboarding_step": "catalog", "verified": False}
 
 
-@merchant_router.post("/onboarding/catalog")
-async def upload_catalog(
+_CATALOG_HEADER_PROMPT = """A merchant uploaded a product catalogue. These column headers could not be
+matched to any known field by our own synonym list:
+
+{unknown}
+
+The fields we need are:
+  sku         - the product's own code or identifier
+  name        - what the product is called
+  price       - what the customer is charged
+  cogs        - what the merchant PAID for it (cost price)
+  inventory   - units in stock
+  description - free text about the product
+
+Here are up to three example values from each unmatched column, which are often
+more informative than the header:
+
+{samples}
+
+Already matched, do not propose these again: {taken}
+
+Reply with JSON only: {{"mapping": {{"<field>": "<exact header>"}}}}
+Only include a field you are confident about. Omit anything you are unsure of -
+an unmapped column is corrected by the merchant in one click, a wrongly mapped
+one is not noticed. Never map two fields to the same header."""
+
+
+async def _ask_model_about_headers(
+    unknown: List[str], samples: Dict[str, List[str]], taken: List[str]
+) -> Dict[str, str]:
+    """Last resort, for headers our synonym list did not recognise.
+
+    Deliberately narrow. The model is not shown the file, is not asked to
+    read any values into fields, and cannot cause anything to be written -
+    it returns column names, which are then checked against the columns
+    that actually exist. On a normal export it is never called at all,
+    which is why catalogue upload works with no API key configured.
+    """
+    if not unknown or not settings.OPENROUTER_API_KEY:
+        return {}
+    try:
+        from openai import AsyncOpenAI
+        from app.core.net import shared_ipv4_client
+
+        client = AsyncOpenAI(
+            base_url=settings.LLM_BASE_URL,
+            api_key=settings.OPENROUTER_API_KEY,
+            http_client=shared_ipv4_client("llm"),
+        )
+        response = await client.chat.completions.create(
+            model=settings.LLM_MODEL,
+            messages=[{"role": "user", "content": _CATALOG_HEADER_PROMPT.format(
+                unknown="\n".join(f"  - {h}" for h in unknown),
+                samples=json.dumps(samples, indent=1, ensure_ascii=False)[:1500],
+                taken=", ".join(taken) or "(none)",
+            )}],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=300,
+            timeout=15.0,
+        )
+        raw = json.loads(response.choices[0].message.content or "{}")
+    except Exception as e:
+        logger.warning(f"Catalogue header assist failed: {e}")
+        return {}
+
+    # Everything it says is checked against reality: a field we actually
+    # have, a header the file actually contains, and nothing already taken.
+    out: Dict[str, str] = {}
+    for f, header in (raw.get("mapping") or {}).items():
+        if f in catalog_ingest.ALL_FIELDS and header in unknown and header not in out.values():
+            out[f] = header
+    return out
+
+
+@merchant_router.post("/onboarding/catalog/propose")
+async def propose_catalog_mapping(
     file: UploadFile = File(...), current_merchant: dict = Depends(get_current_merchant)
 ):
-    """Parses a merchant-uploaded CSV and upserts real product rows,
-    including cogs_paise - the field the old hardcoded
-    `cart_details = {"cogs": 1500.0}` had no real backing for. Rejects
-    (rather than silently skipping) a file missing the required columns or
-    containing no parseable rows, since a silently-empty catalog looks
-    identical to "skipped" from the merchant's side."""
+    """Read a catalogue of unknown shape and say what we think it is.
+
+    **Writes nothing.** It returns the mapping it worked out, a preview of
+    the rows that would be created, and every row that would be rejected
+    with the reason why. The merchant confirms, and the existing upload
+    endpoint applies it.
+
+    That split is not caution for its own sake. `cogs_paise` is what the
+    merchant paid for the goods and it is one of the two inputs to the
+    margin floor, so a column mapped wrongly here changes which discounts
+    are legal for that merchant on every future call. It is exactly the
+    kind of decision that should be shown to a person before it binds -
+    the same arrangement as /policy/propose, where the model argues and a
+    human decides.
+    """
     raw = await file.read()
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is not valid UTF-8 text.")
 
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CSV has no header row.")
+    headers, rows, header_row = catalog_ingest.read_table(text)
+    if not headers:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That file has no readable rows.")
 
-    columns = {c.strip().lower() for c in reader.fieldnames}
-    missing = _REQUIRED_CATALOG_COLUMNS - columns
+    proposal = catalog_ingest.propose_mapping(headers, header_row)
+
+    # Only the leftovers reach the model, and only when something we need is
+    # still missing. A file our own synonyms fully understood never leaves
+    # the machine.
+    assisted: Dict[str, str] = {}
+    if proposal.unresolved_headers and not proposal.is_usable:
+        samples = {
+            h: [r.get(h, "") for r in rows[:3] if r.get(h)]
+            for h in proposal.unresolved_headers
+        }
+        assisted = await _ask_model_about_headers(
+            proposal.unresolved_headers,
+            samples,
+            [h for h in proposal.mapping.values() if h],
+        )
+        for f, header in assisted.items():
+            if not proposal.mapping.get(f):
+                proposal.mapping[f] = header
+
+    products, rejected = catalog_ingest.build_products(rows, proposal.mapping)
+    return {
+        "header_row": header_row,
+        "columns": headers,
+        "mapping": proposal.mapping,
+        # Which of them a model suggested, so the UI can mark those for a
+        # closer look rather than presenting every guess with equal weight.
+        "model_suggested": list(assisted.keys()),
+        "unmapped_columns": [h for h in proposal.unresolved_headers if h not in assisted.values()],
+        "notes": proposal.notes,
+        "usable": all(proposal.mapping.get(f) for f in catalog_ingest.REQUIRED_FIELDS),
+        "preview": products[:10],
+        "total_rows": len(products),
+        "rejected": rejected[:20],
+        "rejected_total": len(rejected),
+    }
+
+
+@merchant_router.post("/onboarding/catalog")
+async def upload_catalog(
+    file: UploadFile = File(...),
+    mapping: Optional[str] = Form(None),
+    current_merchant: dict = Depends(get_current_merchant),
+):
+    """Applies a catalogue upload, upserting real product rows.
+
+    Reads through catalog_ingest, so a file whose header row is not row one,
+    whose columns are called "SKU Code" and "Selling Price", and whose
+    prices read "Rs. 1,299/-" all import. Previously each of those rejected
+    the whole file and told the merchant to go and edit their spreadsheet.
+
+    `mapping` is the JSON the merchant confirmed on the propose step. When
+    it is absent the same deterministic matching is re-run - so the endpoint
+    still works for a straightforward file posted directly, and the confirm
+    step is a safeguard rather than a hoop.
+    """
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is not valid UTF-8 text.")
+
+    headers, rows, header_row = catalog_ingest.read_table(text)
+    if not headers:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That file has no readable rows.")
+
+    chosen: Dict[str, Optional[str]] = {}
+    if mapping:
+        try:
+            supplied = json.loads(mapping)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mapping is not valid JSON.")
+        if not isinstance(supplied, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mapping must be an object.")
+        # Only fields we have, only columns the file actually contains. A
+        # confirmed mapping still arrives over the wire, so it is checked
+        # against the file rather than trusted.
+        chosen = {
+            f: h for f, h in supplied.items()
+            if f in catalog_ingest.ALL_FIELDS and (h is None or h in headers)
+        }
+    if not all(chosen.get(f) for f in catalog_ingest.REQUIRED_FIELDS):
+        chosen = catalog_ingest.propose_mapping(headers, header_row).mapping
+
+    missing = [f for f in catalog_ingest.REQUIRED_FIELDS if not chosen.get(f)]
     if missing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"CSV is missing required column(s): {', '.join(sorted(missing))}. "
-                   f"Expected at least: sku, name, price (cogs and inventory optional but recommended).",
+            detail=(
+                f"Could not work out which column holds the {', '.join(missing)}. "
+                f"Columns found: {', '.join(headers)}."
+            ),
         )
 
-    def _to_paise(value: Optional[str]) -> Optional[int]:
-        if value is None or value.strip() == "":
-            return None
-        try:
-            return round(float(value) * 100)
-        except ValueError:
-            return None
-
-    imported, skipped = [], []
-    for row in reader:
-        row = {k.strip().lower(): (v or "").strip() for k, v in row.items()}
-        sku, name = row.get("sku"), row.get("name")
-        price_paise = _to_paise(row.get("price"))
-        if not sku or not name or price_paise is None:
-            skipped.append(row.get("sku") or "(missing sku)")
-            continue
-        product = products_repo.upsert_product(
+    products, rejected = catalog_ingest.build_products(rows, chosen)
+    imported = []
+    for product in products:
+        saved = products_repo.upsert_product(
             merchant_id=current_merchant["merchant_id"],
-            product_id=sku,
-            name=name,
-            price_paise=price_paise,
-            cogs_paise=_to_paise(row.get("cogs")),
-            inventory_count=int(row["inventory"]) if row.get("inventory", "").isdigit() else 0,
+            product_id=product["product_id"],
+            name=product["name"],
+            price_paise=product["price_paise"],
+            cogs_paise=product["cogs_paise"],
+            inventory_count=product["inventory_count"],
+            description=product["description"],
         )
-        imported.append(product["product_id"])
+        imported.append(saved["product_id"])
+    skipped = [r["row"] for r in rejected]
 
     if not imported:
         raise HTTPException(

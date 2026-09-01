@@ -1357,6 +1357,95 @@ end to end three times before believing a scoreboard.
 
 ---
 
+## 23. The negotiation that conceded everything in its first sentence
+
+The fifth dead policy column, and the only one that cost money rather than
+merely failing to save it.
+
+```
+merchant_policies.offer_ladder   DEFAULT '[3,7,10]'
+```
+
+In the schema since it was written. Deserialised by `policies.py`. Handed to
+the model by `get_policy_limits`. Enforced by nothing.
+
+`policy_engine.evaluate` answered every over-ask with `min(requested,
+ceiling)`, which measured like this:
+
+```
+model asks 40%  ->  MODIFY  approved 10.0%      <- the merchant's full ceiling
+model asks 20%  ->  MODIFY  approved 10.0%
+```
+
+**The first thing the agent ever said about price was the most it was ever
+allowed to say.** A customer who would have taken 3% got 10%, every time,
+because there was no mechanism by which they could have got anything else.
+The ladder describing exactly that mechanism was sitting in the row being
+read.
+
+This is FINDINGS #4's pattern for the sixth time, and the worst instance of
+it. The four columns in #4 were inert — they promised a control and bound
+nothing. `auto_approval_threshold_inr` was the same and got wired. This one
+was different in kind: it did not fail to constrain, it silently *maximised*
+what was given away, on every discounted sale, while the Policies screen
+told the merchant they had a three-step ladder.
+
+**The fix.** The rung is chosen by how many offers the cart has already been
+quoted — counted from minted `offer_tokens`, because a token *is* the record
+that a price was put in front of the customer. The count therefore cannot
+drift from what was actually said, and it survives a restart mid-call.
+
+The ladder may only ever tighten. It never inflates a smaller request, the
+ceiling still binds above it, the margin floor still denies outright, and a
+malformed ladder falls *out of the way* rather than blocking every discount
+on the platform — it is a negotiation aid, and the limits that must never
+fail open are not it.
+
+**What it was worth**, three runs, against the same 25 scenarios:
+
+| | before | after |
+|---|---|---|
+| Recoveries | 9 | 9 |
+| Full price / discounted / no sale | 7 / 2 / 2 | 7 / 2 / 2 |
+| `rule_breaks` | 0 | 0 |
+| Discount given away, total | 20.0% | **8.0%** |
+| Recovered | ₹15,861.20 | **₹16,196.08** |
+
+**Zero outcome changes.** Not one customer walked. The two discounted carts
+closed at 3% and 5% instead of 10% and 10%, which is twelve points of margin
+returned to the merchant for nothing — on a batch this size, ₹334.88.
+
+The honest expectation before running it was the opposite. Opening at 3%
+should cost sales at the edges, and several scenarios are single-exchange
+with no room for a second ask. It did not, and the reason is worth stating:
+**the model was asking for far more than the customer needed.** The 40% ask
+was never the customer's number. Handing the model a ceiling and letting it
+spend straight to it was measuring the model's opening bid, not the
+customer's reservation price.
+
+### A test that could not fail, found in the same afternoon
+
+While fixing the promise-date parser, a `\b` written through a shell
+heredoc became a literal backspace byte (`\x08`). The new regex matched
+nothing, so the feature silently did not work.
+
+The same corruption was already sitting in `test_timing_planner.py`. The
+guard against the ordinal bug — `"the 3th of September"` — had compiled to
+`\x08\d*[123]th\x08`, which matches nothing, so `assert not re.search(...)`
+had been passing **vacuously since it was written**. The regression test for
+a bug fixed that morning had never tested anything.
+
+It is now an exact assertion, and it was verified by deliberately breaking
+`_ordinal` and watching six tests fail. The first replacement was still
+wrong: it called `_ordinal` to compute its own expected value, so it agreed
+with the code under test by construction and passed against the sabotage.
+The suffix table is written out independently now.
+
+**A test that cannot fail is worse than no test**, because it is counted as
+coverage. The suite reported 581 green with this in it.
+
+---
+
 ## What the guarantees do and don't depend on
 
 The scoreboard makes one distinction sharply, and it is the architectural claim
