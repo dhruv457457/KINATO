@@ -15,6 +15,7 @@ cannot recognise is a recovery it silently scores as a loss.
 import pytest
 
 from app.agents.audit import execute_tool
+from app.services.policy_engine import policy_engine
 from app.agents.state import AgentContext
 from app.agents.tools import check_offer, issue_offer
 from app.core.ids import new_id
@@ -138,9 +139,14 @@ class TestAuditShapeIsUnchanged:
         )
         assert result["decision"] == "MODIFY"
         assert result["requested_percent"] == 40
-        assert result["approved_percent"] == 10.0
-        assert result["reason"] == "REJECTED_CEILING"
+        # An over-ask now opens at the ladder's first rung rather than going
+        # straight to the ceiling, so the binding limit - and the figure the
+        # scoreboard reads - is the rung. The ceiling is still reported
+        # alongside it, which is what makes the refusal explainable.
+        first_rung = float(policy_engine.get_policy(merchant_id)["offer_ladder"][0])
+        assert result["approved_percent"] == first_rung
+        assert result["reason"] == "REJECTED_LADDER_STEP"
         assert result["ceiling_percent"] == 10.0
         assert result["offer_token"].startswith("off_")
-        assert result["final_amount_paise"] == 90_000
+        assert result["final_amount_paise"] == round(100_000 * (1 - first_rung / 100))
         assert result["expires_at"]

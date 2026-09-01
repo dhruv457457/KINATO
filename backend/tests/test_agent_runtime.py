@@ -13,6 +13,7 @@ import pytest
 from app.agents.state import AgentContext
 from app.agents.tools import ALL_TOOLS, FORBIDDEN_ARG_NAMES, Tool, check_offer, issue_offer
 from app.agents.audit import execute_tool
+from app.services.policy_engine import policy_engine
 from app.agents import runtime as agent_runtime
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import offer_tokens as offer_tokens_repo
@@ -49,21 +50,31 @@ class TestOfferTokenGate:
         ctx = _ctx(merchant_id, checkout_id)
         result = await execute_tool(check_offer, {"requested_discount_percent": 40}, ctx)
         assert result["decision"] == "MODIFY"
-        assert result["approved_percent"] == 10.0
+        # The FIRST rung, not the ceiling. This asserted 10.0 - the ceiling -
+        # which was accurate and was also the bug: an over-ask was answered
+        # with the most the merchant had ever authorised, in one step. What
+        # this test is really about is that 40 is never honoured, and that
+        # still holds.
+        first_rung = float(policy_engine.get_policy(merchant_id)["offer_ladder"][0])
+        assert result["approved_percent"] == first_rung
+        assert result["approved_percent"] < 40
         assert result["requested_percent"] == 40
         assert result["offer_token"].startswith("off_")
 
     async def test_issue_offer_with_valid_token_succeeds(self, cart_checkout):
         merchant_id, checkout_id = cart_checkout
         ctx = _ctx(merchant_id, checkout_id)
-        checked = await execute_tool(check_offer, {"requested_discount_percent": 5}, ctx)
+        # Asked at the opening rung so this is an outright ALLOW - the
+        # subject here is that a valid token spends, not which limit bound.
+        rung = float(policy_engine.get_policy(merchant_id)["offer_ladder"][0])
+        checked = await execute_tool(check_offer, {"requested_discount_percent": rung}, ctx)
         assert checked["decision"] == "ALLOW"
 
         issued = await execute_tool(
             issue_offer, {"offer_token": checked["offer_token"], "channel": "email"}, ctx
         )
         assert issued["status"] == "ISSUED"
-        assert issued["approved_percent"] == 5
+        assert issued["approved_percent"] == rung
         assert issued["payment_url"]
 
     async def test_forged_token_is_rejected(self, cart_checkout):

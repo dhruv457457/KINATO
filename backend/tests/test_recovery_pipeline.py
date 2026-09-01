@@ -73,7 +73,17 @@ async def test_approved_offer_flows_through_to_attributed_revenue(connected_merc
     call = await _run_abandonment_to_call(merchant_id, checkout_id, email=f"buyer_{uuid.uuid4().hex[:8]}@example.com")
     ctx = _ctx_for(call["recovery_attempt_id"], merchant_id, call["customer_id"], checkout_id)
 
-    checked = await execute_tool(check_offer, {"requested_discount_percent": 8.0}, ctx)
+    # Asked at the first rung of the concession ladder, so this is an
+    # outright ALLOW. Before the ladder any request up to the ceiling was
+    # allowed outright, and 8% was chosen to look like a realistic ask; the
+    # subject of this test is attribution flowing through to revenue, not
+    # which limit bound, so it asks for something a first offer can approve.
+    from app.services.policy_engine import policy_engine
+
+    first_rung = policy_engine.get_policy(merchant_id)["offer_ladder"][0]
+    checked = await execute_tool(
+        check_offer, {"requested_discount_percent": float(first_rung)}, ctx
+    )
     assert checked["decision"] == "ALLOW"
 
     issued = await execute_tool(issue_offer, {"offer_token": checked["offer_token"], "channel": "email"}, ctx)
@@ -84,7 +94,7 @@ async def test_approved_offer_flows_through_to_attributed_revenue(connected_merc
     assert found, "email.send_requested was never published for an approved offer"
     email_payload = _events("email.send_requested")[-1]["payload"]
     assert email_payload["checkout_id"] == checkout_id
-    assert email_payload["discount"] == 8.0
+    assert email_payload["discount"] == float(first_rung)
     assert email_payload["payment_url"].startswith("http")
 
     # Simulate the Razorpay webhook confirming payment (see app/payments/webhooks.py).
@@ -119,16 +129,25 @@ async def test_excessive_discount_request_is_capped_not_honored(connected_mercha
     )
     call = await _run_abandonment_to_call(merchant_id, checkout_id)
     ctx = _ctx_for(call["recovery_attempt_id"], merchant_id, call["customer_id"], checkout_id)
-    merchant_max = policy_engine.get_policy(merchant_id)["max_discount_percent"]
+    policy = policy_engine.get_policy(merchant_id)
+    merchant_max = policy["max_discount_percent"]
+    first_rung = float(policy["offer_ladder"][0])
 
     checked = await execute_tool(check_offer, {"requested_discount_percent": 90.0}, ctx)
     assert checked["decision"] == "MODIFY"
-    assert checked["approved_percent"] == merchant_max
+    # Capped to the FIRST RUNG, not to the ceiling. This test used to assert
+    # the ceiling, which was correct and was also the whole problem: an
+    # over-ask was answered with the most the merchant had ever authorised,
+    # in the first sentence of the negotiation. The guarantee it exists to
+    # protect - never honoured as asked, never above the ceiling - is
+    # unchanged and asserted below.
+    assert checked["approved_percent"] == first_rung
+    assert checked["approved_percent"] <= merchant_max
     assert checked["approved_percent"] < 90.0
 
     issued = await execute_tool(issue_offer, {"offer_token": checked["offer_token"]}, ctx)
     assert issued["status"] == "ISSUED"
-    assert issued["approved_percent"] == merchant_max
+    assert issued["approved_percent"] == first_rung
 
 
 async def test_opt_out_revokes_consent_and_halts_outreach(connected_merchant_id, unique_checkout_id):
@@ -156,8 +175,13 @@ async def test_opt_out_revokes_consent_and_halts_outreach(connected_merchant_id,
     # A subsequent offer must not reach the customer once opted out - the
     # check_offer preview itself doesn't gate on consent (it applies
     # nothing), but issue_offer - the only tool that can act - must refuse.
+    # 5% sat under the old ceiling and so was allowed outright; it is above
+    # the ladder's first rung, so it now comes back MODIFY. Either way a
+    # token is minted, which is all this test needs - the subject here is
+    # that issue_offer refuses on revoked consent, whatever the price.
     checked = await execute_tool(check_offer, {"requested_discount_percent": 5.0}, ctx)
-    assert checked["decision"] == "ALLOW"
+    assert checked["decision"] in ("ALLOW", "MODIFY")
+    assert checked.get("offer_token")
     issued = await execute_tool(issue_offer, {"offer_token": checked["offer_token"]}, ctx)
     assert issued["status"] == "REJECTED"
     assert issued["reason"] == "consent_revoked"
