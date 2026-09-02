@@ -101,3 +101,80 @@ class TestAMalformedLadderCannotBreakTheProduct:
         for junk in (-5, "two", None):
             d = policy_engine.evaluate(40, POLICY, {"concessions_made": junk}, CART)
             assert 0 <= d["approved_discount"] <= 10.0
+
+
+class TestAPriceLookupIsNotAConcession:
+    """The ladder counts offers made. A 0% check is not one.
+
+    From a live call, before the agent had said anything about price:
+
+        17:07:19  PolicyEngine: Evaluating requested discount: 0%
+
+    That is the agent using check_offer to read the cart total, which is
+    exactly what it is for - and it mints a token, because a token is how
+    an amount is carried safely. But the ladder counts tokens, so a price
+    lookup silently spent rung one. The customer's FIRST real request for a
+    discount would then open at 7% instead of 3%.
+
+    Costly in the merchant's direction, and the same root cause as the bug
+    it is the mirror of: something being counted as a concession that
+    nobody ever conceded. What the ladder needs is not "how many tokens
+    exist" but "how many times have we offered this person money off".
+    """
+
+    async def test_a_zero_percent_check_does_not_advance_the_ladder(
+        self, connected_merchant_id, unique_checkout_id
+    ):
+        from app.agents.state import AgentContext
+        from app.agents.tools import _check_offer
+        from app.db.repositories import checkouts as checkouts_repo
+
+        checkouts_repo.create_checkout(
+            merchant_id=connected_merchant_id,
+            amount_paise=299_000,
+            cogs_paise=100_000,
+            checkout_id=unique_checkout_id,
+        )
+        ctx = AgentContext(
+            merchant_id=connected_merchant_id,
+            correlation_id="corr_ladder",
+            checkout_id=unique_checkout_id,
+        )
+
+        # The price lookup, exactly as the live call made it.
+        lookup = await _check_offer(ctx, requested_discount_percent=0)
+        assert lookup["decision"] == "ALLOW"
+
+        # Now the customer actually asks. This must open at the FIRST rung.
+        first_real = await _check_offer(ctx, requested_discount_percent=40)
+        policy_ladder = [3, 7, 10]
+        assert first_real["approved_percent"] == policy_ladder[0], (
+            f"a price lookup burned a rung: opened at {first_real['approved_percent']}%"
+        )
+
+    async def test_a_real_offer_still_advances_it(
+        self, connected_merchant_id, unique_checkout_id
+    ):
+        """The other half - without this, the fix above could be 'never
+        advance the ladder at all', which is a different bug."""
+        from app.agents.state import AgentContext
+        from app.agents.tools import _check_offer
+        from app.db.repositories import checkouts as checkouts_repo
+
+        checkouts_repo.create_checkout(
+            merchant_id=connected_merchant_id,
+            amount_paise=299_000,
+            cogs_paise=100_000,
+            checkout_id=unique_checkout_id,
+        )
+        ctx = AgentContext(
+            merchant_id=connected_merchant_id,
+            correlation_id="corr_ladder2",
+            checkout_id=unique_checkout_id,
+        )
+        first = await _check_offer(ctx, requested_discount_percent=40)
+        second = await _check_offer(ctx, requested_discount_percent=40)
+        assert first["approved_percent"] == 3.0
+        assert second["approved_percent"] == 7.0, (
+            f"turning down 3% did not earn the next rung: got {second['approved_percent']}%"
+        )

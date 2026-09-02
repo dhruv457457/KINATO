@@ -11,7 +11,7 @@ from app.core.ids import new_id
 
 
 def concessions_already_made(merchant_id: str, checkout_id: str) -> int:
-    """How many offers this cart has already been quoted.
+    """How many times money off has already been offered on this cart.
 
     The step on the concession ladder. Counting minted tokens rather than
     keeping a counter is deliberate: a token IS the record that a price was
@@ -21,11 +21,29 @@ def concessions_already_made(merchant_id: str, checkout_id: str) -> int:
     Tokens that were never spent still count. The customer was quoted that
     number and turned it down - that is exactly the event the ladder exists
     to respond to.
+
+    But `approved_percent > 0` is doing real work here, and it was missing.
+    check_offer is also how the agent reads the cart total, and it does that
+    by asking for nothing:
+
+        17:07:19  PolicyEngine: Evaluating requested discount: 0%
+
+    That is a live call, before price had been discussed at all. It mints a
+    token like any other call, so counting every row meant a price LOOKUP
+    silently spent rung one, and the customer's first genuine request opened
+    at 7% instead of 3%. Nobody conceded anything, and the merchant paid for
+    it - the exact mirror of the bug where the agent refused a discount it
+    never asked about.
+
+    A concession is an offer of money off. An offer of nothing off is a
+    question.
     """
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT COUNT(*) AS n FROM offer_tokens WHERE merchant_id = %s AND checkout_id = %s",
+            "SELECT COUNT(*) AS n FROM offer_tokens "
+            "WHERE merchant_id = %s AND checkout_id = %s "
+            "AND approved_percent IS NOT NULL AND approved_percent > 0",
             (merchant_id, checkout_id),
         )
         row = cursor.fetchone()
