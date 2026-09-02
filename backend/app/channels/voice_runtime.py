@@ -352,6 +352,11 @@ imperfect phone transcription, so it may be garbled or clipped; judge intent, no
 if you genuinely cannot tell whether they said yes or no, or if they sound confused about what you offered \
 - and if so ask once, simply ("Shall I send it across?"), never repeatedly.
 
+IF THEY TURN DOWN AN OFFER AND ASK FOR MORE, CALL check_offer AGAIN. Turning one down is exactly what \
+earns the next step - the number you were given last time was a step, not a ceiling, and there may be more \
+room behind it. Never say "that is the maximum" or "the most I can do" from memory: you do not know the \
+maximum, you only know what you were approved a moment ago. Ask, then tell them what comes back.
+
 YOU MAY NEVER SAY A DISCOUNT IS UNAVAILABLE UNLESS check_offer HAS JUST REFUSED ONE. You do not know the \
 merchant's limits and you are not the one who decides them. If the customer asks for a discount, or confirms \
 the price is what is stopping them, CALL check_offer - even if you asked them a confirming question last turn \
@@ -466,6 +471,58 @@ _DISCOUNT_REFUSAL = re.compile(
     r"|\bno\s+discount\b"
     r"|\bdiscount[^.!?]{0,25}\b(?:not available|unavailable|isn(?:'|’)?t available)\b",
     re.IGNORECASE,
+)
+
+
+# Announcing a ceiling the engine did not just produce.
+#
+# From a live call, on a merchant whose ladder is [3, 7, 10]:
+#
+#   check_offer -> approved 3% (REJECTED_LADDER_STEP)
+#   agent:    "I can offer you a discount of three percent..."
+#   customer: "No, can we go for 15%, that is too low for me."
+#   agent:    "the maximum I can offer right now is three percent"
+#   tools:    []
+#
+# The customer refused rung one, which is the exact event the ladder exists
+# to answer, and the agent declared that rung a maximum without asking
+# anything. A second check_offer returns seven. The sale closed at three on
+# a policy that would have gone further to win it.
+#
+# Sibling of _DISCOUNT_REFUSAL and the same mistake underneath - a limit
+# stated that no engine produced this turn - but it shares none of the
+# wording, which is why the first guard sailed past it. There is not a
+# refusal word in the sentence.
+#
+# Quoting an approved number is fine and must stay fine: "I can offer you
+# three percent" is the agent doing its job. Only the claim that the number
+# is the CEILING is caught.
+_MAXIMUM_CLAIM = re.compile(
+    r"\b(?:the\s+)?(?:maximum|max|most|best|highest|limit)\b[^.!?]{0,60}?"
+    r"\b(?:can|could|able to|i(?:'|’)?m able|available|offer|do|give|go)\b"
+    r"|\b(?:that(?:'|’)?s|that\s+is|this\s+is)\s+(?:the\s+)?"
+    r"(?:most|best|maximum|max|highest|limit)\b"
+    r"|\bmaximum\s+discount\b",
+    re.IGNORECASE,
+)
+
+
+def claims_a_maximum(text: str) -> bool:
+    """True when the reply announces a ceiling rather than reporting one.
+
+    Only meaningful alongside "and check_offer did not run this turn" - the
+    caller checks that. After a real call to the engine, a maximum it
+    returned is a fact worth relaying, and at the top rung it is simply
+    true.
+    """
+    return bool(text) and bool(_MAXIMUM_CLAIM.search(text))
+
+
+# What to say instead: go and ask. Deliberately asserts no number in either
+# direction - inventing a bigger concession would be this same bug pointed
+# the other way, and the customer would hear a figure that may never come.
+_LADDER_NOT_CLIMBED_REPLACEMENT = (
+    "Let me see what else I can do on the price for you - one moment."
 )
 
 
@@ -1175,6 +1232,22 @@ async def _run_agent_turn(
             "Only check_offer may refuse a discount."
         )
         reply_text = _DISCOUNT_REFUSAL_REPLACEMENT
+
+    # And the same rule for the other wording. Announcing a ceiling without
+    # consulting the engine is the ladder never being climbed: the rung the
+    # agent remembers is not a maximum, and saying so ends a negotiation the
+    # merchant's own policy was willing to continue.
+    #
+    # Gated on check_offer NOT having run this turn, rather than on refusals
+    # - after a real call, a maximum the engine returned is a fact the agent
+    # should be relaying, and at the top rung it is true.
+    if claims_a_maximum(reply_text) and "check_offer" not in (result.tool_calls_made or []):
+        logger.error(
+            f"[CALL {call_id}] Model announced a maximum without asking for one "
+            f"({reply_text!r}) - replaced. tools={result.tool_calls_made}. "
+            "A refused offer earns the next rung; only check_offer knows what it is."
+        )
+        reply_text = _LADDER_NOT_CLIMBED_REPLACEMENT
 
     logger.info(
         f"[CALL {call_id}] Agent ({'degraded' if result.degraded else 'ok'}): {reply_text!r} | "
