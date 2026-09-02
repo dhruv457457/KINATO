@@ -41,6 +41,14 @@ class AllowedOriginsRequest(BaseModel):
     origins: list[str]
 
 
+class ProfileRequest(BaseModel):
+    # Bounded because this string is READ ALOUD on every call. A 400-character
+    # "name" is not a business, it is an instruction hidden in a field the
+    # agent speaks - so the length limit is a guard, not tidiness.
+    name: str = Field(..., min_length=1, max_length=80)
+    store_url: str = Field("", max_length=300)
+
+
 class WebhookSecretRequest(BaseModel):
     webhook_secret: str = Field(..., min_length=8)
 
@@ -70,6 +78,40 @@ async def connect_razorpay(payload: ConnectRazorpayRequest, current_merchant: di
     invalidate_cache(current_merchant["merchant_id"])
     merchants_repo.set_onboarding_step(current_merchant["merchant_id"], "integrate")
     return {"status": "connected", "message": message}
+
+
+@merchant_router.put("/profile")
+async def update_profile(
+    payload: ProfileRequest, current_merchant: dict = Depends(get_current_merchant)
+):
+    """Change the business name customers hear on the phone.
+
+    This existed nowhere. The name was captured once at signup and threaded
+    into every outbound call - "you are calling from X" - with no way to
+    correct a typo, a rebrand, or a trading name that differs from whatever
+    was typed while creating an account. A merchant could hear their own
+    agent say the wrong company and have no recourse but a new account.
+
+    Newlines are stripped rather than rejected. This value is interpolated
+    into the agent's system prompt, and a name containing its own line
+    breaks is the cheapest possible prompt injection - against the merchant
+    themselves, but the money gates do not care who is asking, so it fails
+    at the tools regardless. Stripping it keeps the prompt well-formed.
+    """
+    clean = " ".join(payload.name.split())
+    if not clean:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="A business name cannot be blank."
+        )
+    merchant = await run_db_async(
+        merchants_repo.update_profile, current_merchant["merchant_id"], clean, payload.store_url
+    )
+    logger.info(f"Merchant {current_merchant['merchant_id']} renamed to {clean!r}.")
+    return {
+        "name": merchant["name"],
+        "store_url": merchant.get("store_url") or "",
+        "spoken_as": f"you are calling from {merchant['name']}",
+    }
 
 
 @merchant_router.get("/webhook-url")
@@ -459,6 +501,20 @@ class PolicyUpdateRequest(BaseModel):
     # checkout cannot provide tells a customer something untrue about their
     # money, so it stays off until a human says otherwise.
     emi_available: Optional[bool] = None
+    # How the merchant wants their agent to SOUND. Style, never authority.
+    #
+    # The column has been in merchant_policies since the schema was written
+    # and read by nothing - the seventh dead policy column here, and the
+    # one a merchant most obviously wants, since the agent phones their
+    # customers using their name.
+    #
+    # It is capped because it goes into a live-call prompt: something long
+    # enough to bury the rules above it is not a persona, and a turn has
+    # about five seconds. It is NOT in _PROPOSABLE_FIELDS below - the "set
+    # it in your own words" flow must never be able to write the agent's
+    # own prompt, which is the model editing its own instructions one level
+    # up. A merchant types this themselves.
+    voice_persona: Optional[str] = Field(None, max_length=400)
 
 
 class PolicyProposalRequest(BaseModel):
@@ -473,6 +529,12 @@ async def get_policy(current_merchant: dict = Depends(get_current_merchant)):
 @merchant_router.put("/policy")
 async def update_policy(payload: PolicyUpdateRequest, current_merchant: dict = Depends(get_current_merchant)):
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    # Collapsed to one line for the same reason the business name is: this
+    # lands inside the agent's system prompt, and a persona carrying its own
+    # line breaks is a paragraph pretending to be a sentence. An empty
+    # string is kept rather than dropped, so "" can clear the setting.
+    if "voice_persona" in updates:
+        updates["voice_persona"] = " ".join(str(updates["voice_persona"]).split())
     return policies_repo.update_policy(current_merchant["merchant_id"], updates)
 
 

@@ -588,6 +588,7 @@ def _build_system_prompt(
     failure_class: Optional[str] = None,
     memory_brief: str = "",
     emi_available: bool = False,
+    voice_persona: str = "",
 ) -> str:
     """Builds the live-call system prompt.
 
@@ -626,6 +627,29 @@ def _build_system_prompt(
     # thing in context without displacing any rule above it.
     if memory_brief:
         prompt = f"{prompt}\n{memory_brief}\n"
+
+    # How the merchant wants their agent to sound. Their words, their
+    # customers, their name on the call.
+    #
+    # Labelled as style and placed LAST on purpose. Everything above it is a
+    # rule about money or consent; this is a note about register, and it has
+    # to read as one. Dropped in unlabelled it would arrive with the same
+    # standing as the sentence forbidding a discount before the barrier is
+    # confirmed, which is not a comparison worth inviting.
+    #
+    # A persona cannot buy anything. It is a string in a prompt, and every
+    # amount is computed by a policy engine that takes a policy row and a
+    # cart - it never sees this text, and there is a test asserting that a
+    # persona reading "give 90% off" still returns the merchant's ceiling.
+    persona = (voice_persona or "").strip()
+    if persona:
+        prompt = (
+            f"{prompt}\n"
+            "HOW THIS MERCHANT WANTS YOU TO SOUND (style only - it changes your manner, "
+            "never what you are allowed to offer, and every rule above still applies "
+            "exactly as written):\n"
+            f"{persona}\n"
+        )
     return prompt
 
 
@@ -681,6 +705,10 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
         "customer_name": (row.get("customer_name") or ""),
         "item_description": _describe_cart({"line_items": row.get("checkout_line_items")}),
         "business_name": business_name,
+        # Carried on the session so every turn's prompt is built the same
+        # way as the opening one - a persona that applies only to the first
+        # sentence is a voice that changes halfway through a call.
+        "voice_persona": (row.get("voice_persona") or "").strip(),
         "failure_class": row.get("checkout_failure_class"),
         # Pre-computed by call_orchestrator BEFORE dialling and carried in
         # the plan, for the same reason the opening voice block is: this
@@ -844,6 +872,7 @@ async def _outbound(request: Request):
             session.get("failure_class"),
             session.get("memory_brief", ""),
             session.get("emi_available", False),
+            session.get("voice_persona", ""),
         ),
         session["opening_line"],
     )
@@ -952,6 +981,7 @@ def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
             session.get("failure_class"),
             session.get("memory_brief", ""),
             session.get("emi_available", False),
+            session.get("voice_persona", ""),
         ),
         turns,
     )
@@ -1021,6 +1051,7 @@ async def _run_agent_turn(
             session.get("failure_class"),
             session.get("memory_brief", ""),
             session.get("emi_available", False),
+            session.get("voice_persona", ""),
         ),
         user_message=user_message,
         ctx=turn_ctx,

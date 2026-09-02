@@ -7,6 +7,9 @@ from app.core.config import settings
 from app.core.net import shared_ipv4_client
 from app.db.repositories import recovery_attempts as recovery_attempts_repo
 from app.db.repositories import audit as audit_repo
+from app.db.repositories import products as products_repo
+from app.db.repositories import policies as policies_repo
+from app.db.repositories import customers as customers_repo
 
 load_dotenv()
 
@@ -56,6 +59,38 @@ class MerchantIntelligenceAgent:
         def _num(v, cast=int):
             return None if v is None else cast(v)
 
+        # The three things a merchant asks about that this could never
+        # answer.
+        #
+        # Until now the context was seven summary numbers and a list of
+        # refusal codes. So "what is my discount ceiling?", "which product
+        # gets abandoned most?" and "who has opted out?" were all
+        # unanswerable - and rule 3 below correctly forbids inventing an
+        # answer, which meant the honest reply to most real questions was a
+        # shrug. The data was one query away the whole time.
+        #
+        # Bounded on purpose. This is interpolated into a prompt that has to
+        # answer inside a few seconds, so the catalogue is capped and
+        # customers are counted rather than listed - a merchant asking about
+        # a specific person should be reading the Customers screen, which
+        # shows all of them, rather than hoping a language model recites a
+        # table correctly.
+        try:
+            policy = policies_repo.get_policy(merchant_id)
+        except Exception as e:
+            logger.warning(f"Ask could not read policy for {merchant_id}: {e}")
+            policy = {}
+        try:
+            products = products_repo.list_products(merchant_id)
+        except Exception as e:
+            logger.warning(f"Ask could not read catalogue for {merchant_id}: {e}")
+            products = []
+        try:
+            customers = customers_repo.list_for_merchant(merchant_id, limit=200)
+        except Exception as e:
+            logger.warning(f"Ask could not read customers for {merchant_id}: {e}")
+            customers = []
+
         context_summary = {
             "merchant_id": merchant_id,
             "revenue_recovered_paise": _num(stats["recovered_paise"]),
@@ -65,6 +100,55 @@ class MerchantIntelligenceAgent:
             "recovery_rate_pct": _num(stats["recovery_rate_pct"], float),
             "recent_offer_reasons_sample": customer_objections[-8:],
             "has_any_activity": _num(stats["total_attempts"]) > 0,
+
+            # What the agent is ALLOWED to do. A merchant asking "can my AI
+            # give 20% off?" is asking about this, and the answer is a fact,
+            # not an opinion.
+            "your_policy": {
+                "max_discount_percent": policy.get("max_discount_percent"),
+                "minimum_margin_percent": policy.get("minimum_margin_percent"),
+                "offer_ladder_percent": policy.get("offer_ladder"),
+                "auto_approval_threshold_inr": policy.get("auto_approval_threshold_inr"),
+                "calling_hours_ist": (
+                    f"{policy.get('calling_start_hour')}:00-{policy.get('calling_end_hour')}:00"
+                    if policy.get("calling_start_hour") is not None else None
+                ),
+                "note_for_you": (
+                    "The ladder is climbed, not jumped: the first offer opens at the lowest "
+                    "rung and only reaches the ceiling after the customer turns down the "
+                    "steps below it. The ceiling and the margin floor both cap it."
+                ),
+            },
+
+            "catalogue": {
+                "product_count": len(products),
+                "products": [
+                    {
+                        "sku": p.get("product_id"),
+                        "name": p.get("name"),
+                        "price_paise": _num(p.get("price_paise")),
+                        "cogs_paise": _num(p.get("cogs_paise")),
+                        "margin_percent": (
+                            round((p["price_paise"] - p["cogs_paise"]) / p["price_paise"] * 100, 1)
+                            if p.get("price_paise") and p.get("cogs_paise") else None
+                        ),
+                        "in_stock": _num(p.get("inventory_count")),
+                    }
+                    for p in products[:40]
+                ],
+                "products_without_a_cost": [
+                    p.get("product_id") for p in products if not p.get("cogs_paise")
+                ][:10],
+            },
+
+            "customers": {
+                "total": len(customers),
+                "with_phone": sum(1 for c in customers if c.get("phone")),
+                "with_email": sum(1 for c in customers if c.get("email")),
+                "reachable_by_neither": sum(
+                    1 for c in customers if not c.get("phone") and not c.get("email")
+                ),
+            },
         }
 
         system_prompt = (

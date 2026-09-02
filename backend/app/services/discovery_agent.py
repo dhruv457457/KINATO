@@ -39,6 +39,73 @@ class CallPlan(BaseModel):
     degraded: bool = False
 
 
+# Hinglish, for the FIRST sentence of the call.
+#
+# A call is written by two prompts: this one, which produces the opening
+# line before the phone rings, and voice_runtime's, which produces every
+# turn after it. AGENT_LANGUAGE was wired into the second and not the
+# first, so a merchant who set hinglish heard:
+#
+#   "Hi Dhruv, I am calling from Loomwork about your order that you left
+#    in your cart."
+#
+# - English, every time, on the one sentence that sets the register for the
+# whole conversation. An agent that opens in English and drifts into
+# Hinglish sounds like two different people.
+#
+# Roman script and English numerals, for the same reasons the turn-level
+# style gives: the line is read aloud by an Indian-English voice, so
+# Devanagari comes out as nonsense, and a mispronounced rupee amount is the
+# worst mistake this call can make.
+_HINGLISH_OPENING = (
+    "WRITE THE OPENING LINE IN HINGLISH - the everyday Hindi-English mix an Indian "
+    "salesperson actually uses on the phone, not formal Hindi. Natural code-switching: "
+    '"Hi Dhruv, main Loomwork se baat kar raha hoon - aapka order cart mein reh gaya tha." '
+    "Write it in ROMAN script only, never Devanagari, because this is read aloud by an "
+    "English-language voice. Keep every number, amount and product name in English. "
+)
+
+
+def _opening_line_prompt(
+    customer_name: str, item_description: str, amount: float, business_name: str
+) -> str:
+    """The prompt that writes the first thing a customer hears.
+
+    A named function rather than an inline string so the language setting
+    and a test can both reach it - the setting is read here, at call time,
+    so a merchant changing it does not need a redeploy to hear the
+    difference.
+    """
+    who = (
+        f"You are calling on behalf of {business_name}. Refer to yourself only as "
+        f"{business_name} - as an organisation, never as a named individual. "
+        f'Say "I am calling from {business_name}", never "this is <somebody> from {business_name}".'
+        if business_name
+        else "You do NOT know the caller's name or the business name. Do not state either one - "
+             "open with the reason for the call instead."
+    )
+    hinglish = (
+        _HINGLISH_OPENING
+        if (settings.AGENT_LANGUAGE or "").strip().lower() == "hinglish"
+        else ""
+    )
+    return (
+        f"Write a one-sentence warm, natural phone opening line for a checkout-recovery call, and one short "
+        f"talking point to use if the customer hesitates on price. "
+        f"{hinglish}"
+        f"{who} "
+        f"Customer name: {customer_name or 'unknown - do not guess a name'}. "
+        f"Item(s): {item_description}. Cart total: INR {amount:.2f}. "
+        f"This text is SPOKEN ALOUD to a real customer, exactly as written, by a system that fills in "
+        f"nothing afterwards. Every word must be one you would say out loud. If you do not know a fact, "
+        f"leave it out of the sentence entirely rather than gesturing at it. "
+        f"Do not invent product details you weren't given. "
+        f'A good opening line looks like: "Hi Asha, I am calling from Loomwork about the table runner you '
+        f'were looking at earlier." '
+        f"Output JSON with keys: opening_line, talking_point."
+    )
+
+
 def _describe_cart(checkout: Dict[str, Any]) -> str:
     """Best-effort human description from real line_items - never a
     fabricated product name when none is on record."""
@@ -139,20 +206,7 @@ class RecoveryStrategist:
             else "You do NOT know the caller's name or the business name. Do not state either one - "
                  "open with the reason for the call instead."
         )
-        prompt = (
-            f"Write a one-sentence warm, natural phone opening line for a checkout-recovery call, and one short "
-            f"talking point to use if the customer hesitates on price. "
-            f"{who} "
-            f"Customer name: {customer_name or 'unknown - do not guess a name'}. "
-            f"Item(s): {item_description}. Cart total: INR {amount:.2f}. "
-            f"This text is SPOKEN ALOUD to a real customer, exactly as written, by a system that fills in "
-            f"nothing afterwards. Every word must be one you would say out loud. If you do not know a fact, "
-            f"leave it out of the sentence entirely rather than gesturing at it. "
-            f"Do not invent product details you weren't given. "
-            f'A good opening line looks like: "Hi Asha, I am calling from Loomwork about the table runner you '
-            f'were looking at earlier." '
-            f"Output JSON with keys: opening_line, talking_point."
-        )
+        prompt = _opening_line_prompt(customer_name, item_description, amount, business_name)
         try:
             from openai import AsyncOpenAI
             from app.core.net import ipv4_client

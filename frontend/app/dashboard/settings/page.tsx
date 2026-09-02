@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  apiFetch,
   getApiKeys,
   createApiKey,
   revokeApiKey,
@@ -66,6 +67,10 @@ function CopyField({ value, mono = true }: { value: string; mono?: boolean }) {
 }
 
 export default function SettingsPage() {
+  const [name, setName] = useState("");
+  const [storeUrl, setStoreUrl] = useState("");
+  const [savedName, setSavedName] = useState("");
+  const [savingName, setSavingName] = useState(false);
   const [webhookUrl, setWebhookUrl] = useState<string>("");
   const [publicBaseOk, setPublicBaseOk] = useState<boolean | null>(null);
   const [keys, setKeys] = useState<ApiKeyRow[] | null>(null);
@@ -112,6 +117,15 @@ export default function SettingsPage() {
   }
 
   useEffect(() => {
+    // The current name, so the field shows what customers hear today
+    // rather than an empty box the merchant might save over blank.
+    apiFetch<{ merchant: { name: string; store_url?: string } }>("/api/auth/me")
+      .then((d) => {
+        setName(d.merchant?.name || "");
+        setSavedName(d.merchant?.name || "");
+        setStoreUrl(d.merchant?.store_url || "");
+      })
+      .catch(() => {});
     getWebhookUrl()
       .then((d) => {
         setWebhookUrl(d.url);
@@ -197,6 +211,67 @@ export default function SettingsPage() {
 
       <PageBody narrow>
         {error && <p className="text-sm mb-6 anim-fade" style={{ color: NEGATIVE }}>{error}</p>}
+
+        {/* The name customers hear.
+            It is interpolated into every outbound call - "you are calling
+            from X" - and until now it was captured once at signup with no
+            way back to it. A typo was spoken down the phone to every
+            customer, permanently. */}
+        <section className="mb-12 anim-rise">
+          <SectionTitle>Business name</SectionTitle>
+          <div className="border p-5" style={{ borderColor: RULE }}>
+            <div className="onb-field mb-4">
+              <label>Name your customers hear</label>
+              <input
+                type="text"
+                maxLength={80}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Loomwork"
+              />
+            </div>
+            <div className="onb-field mb-4">
+              <label>Store URL</label>
+              <input
+                type="text"
+                maxLength={300}
+                value={storeUrl}
+                onChange={(e) => setStoreUrl(e.target.value)}
+                placeholder="https://yourstore.com"
+              />
+            </div>
+            {name.trim() && (
+              <p className="text-[12px] mb-4 leading-relaxed" style={{ color: INK_MUTED }}>
+                On a call the agent says: &ldquo;…you are calling from{" "}
+                <strong>{name.trim()}</strong>&rdquo;
+              </p>
+            )}
+            <button
+              type="button"
+              disabled={savingName || !name.trim() || name.trim() === savedName}
+              onClick={async () => {
+                setSavingName(true);
+                setError("");
+                try {
+                  const saved = await apiFetch<{ name: string; store_url: string }>(
+                    "/api/merchant/profile",
+                    { method: "PUT", body: JSON.stringify({ name: name.trim(), store_url: storeUrl.trim() }) }
+                  );
+                  setSavedName(saved.name);
+                  setName(saved.name);
+                } catch (e) {
+                  setError(e instanceof ApiError ? e.message : "Could not save that.");
+                } finally {
+                  setSavingName(false);
+                }
+              }}
+              className="px-5 py-2.5 text-[11px] font-semibold uppercase tracking-wider transition-opacity disabled:opacity-40"
+              style={{ background: INK, color: "#FFFFFF", borderRadius: 0 }}
+            >
+              {savingName ? "Saving…" : name.trim() === savedName ? "Saved" : "Save name"}
+            </button>
+          </div>
+        </section>
 
         <section className="mb-12 anim-rise">
           <SectionTitle>Razorpay</SectionTitle>

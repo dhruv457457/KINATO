@@ -566,11 +566,19 @@ def get_call_context(recovery_attempt_id: str) -> Optional[Dict[str, Any]]:
                    c.failure_class     AS checkout_failure_class,
                    c.amount_paise      AS checkout_amount_paise,
                    cu.name             AS customer_name,
-                   m.name              AS merchant_name
+                   m.name              AS merchant_name,
+                   -- How this merchant wants their agent to sound. Joined
+                   -- into the SAME query rather than read separately: this
+                   -- runs on the opening webhook, inside a turn budget
+                   -- measured at about five seconds, and a second round
+                   -- trip for one short string is the kind of thing that
+                   -- ends calls (FINDINGS #8, #17).
+                   mp.voice_persona    AS voice_persona
             FROM recovery_attempts ra
             LEFT JOIN checkouts  c  ON c.checkout_id  = ra.checkout_id
             LEFT JOIN customers  cu ON cu.customer_id = ra.customer_id
             LEFT JOIN merchants  m  ON m.merchant_id  = ra.merchant_id
+            LEFT JOIN merchant_policies mp ON mp.merchant_id = ra.merchant_id
             WHERE ra.recovery_attempt_id = %s
             """,
             (recovery_attempt_id,),

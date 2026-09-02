@@ -22,6 +22,11 @@ interface Policy {
   calling_end_hour: number;
   auto_approval_threshold_inr: number;
   emi_available: boolean;
+  /** How the agent should SOUND. Deliberately separate from every number
+   *  above it: those are limits a policy engine enforces, this is style
+   *  that reaches a prompt. Writing "give 90% off" here changes nothing —
+   *  the ceiling is computed by code the prompt never touches. */
+  voice_persona?: string;
 }
 
 /** How each proposable field should read to a human.
@@ -358,6 +363,43 @@ export default function PoliciesPage() {
                 >
                   {policy.emi_available ? "On" : "Off"}
                 </button>
+              </div>
+            </div>
+
+            {/* Style, deliberately below every limit above it.
+                The numbers above are enforced by a policy engine. This is a
+                note about manner that reaches the agent's prompt — and the
+                caption says so plainly, because a merchant who believes this
+                box can authorise a discount will one day write one in it. */}
+            <div className="mb-8 pb-8 border-b" style={{ borderColor: RULE_SOFT }}>
+              <div
+                className="text-[11.5px] font-semibold uppercase tracking-wider mb-1.5"
+                style={{ color: INK_MUTED }}
+              >
+                How your agent should sound
+              </div>
+              <div className="text-xs leading-relaxed mb-3" style={{ color: INK_MUTED }}>
+                Your words, your customers. Tone, what to call yourselves, a line to open with.
+                Leave it empty for the default.
+              </div>
+              <textarea
+                rows={3}
+                maxLength={400}
+                value={policy.voice_persona || ""}
+                placeholder="Warm and unhurried. Thank them for shopping with us. Never rush the close."
+                onChange={(e) => setPolicy({ ...policy, voice_persona: e.target.value })}
+                className="w-full border px-3 py-2 text-[13px] leading-relaxed bg-transparent"
+                style={{ borderColor: RULE, borderRadius: 0, resize: "vertical" }}
+              />
+              <div className="flex items-baseline justify-between mt-1.5">
+                <div className="text-[11px] leading-relaxed" style={{ color: INK_MUTED }}>
+                  This changes how it speaks, never what it may offer. Asking here for a discount
+                  above your ceiling does nothing — the limits above are enforced in code the agent
+                  cannot reach.
+                </div>
+                <div className="text-[11px] tabular-nums shrink-0 ml-4" style={{ color: INK_MUTED }}>
+                  {(policy.voice_persona || "").length}/400
+                </div>
               </div>
             </div>
 

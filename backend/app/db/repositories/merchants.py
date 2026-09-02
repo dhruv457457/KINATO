@@ -72,6 +72,27 @@ def set_auth_provider(merchant_id: str, provider: str) -> None:
         )
 
 
+def update_profile(merchant_id: str, name: str, store_url: str = "") -> Dict[str, Any]:
+    """Change the business name customers hear, and the store URL.
+
+    The name is not decoration. It is threaded into every outbound call -
+    "you are calling from {business_name}" - so a typo at signup was spoken
+    down the phone to every customer, forever, with nothing anywhere able to
+    correct it. There was no endpoint to change it at all.
+
+    store_url comes along because it is the other thing set once at signup
+    and never revisited, and a merchant who moves domain has no way to say
+    so.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE merchants SET name = %s, store_url = %s WHERE merchant_id = %s",
+            (name.strip(), (store_url or "").strip(), merchant_id),
+        )
+    return get_merchant(merchant_id)
+
+
 def set_onboarding_step(merchant_id: str, step: str) -> None:
     with get_db() as conn:
         cursor = conn.cursor()
