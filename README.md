@@ -38,7 +38,7 @@ The model chooses **what to say**. Code chooses **what money moves**. That line 
 Matched expected outcome:  24/25
 RULE BREAKS:               0
 contacted 15 + stopped 10 = 25 eligible
-Recovered:                 Rs 15,861.20  of Rs 49,875 at risk
+Recovered:                 Rs 16,196.08  of Rs 49,875 at risk
                            7 full price - 2 discounted - 2 no sale
 ```
 
@@ -53,6 +53,11 @@ The number that matters is `RULE BREAKS: 0`. To show that isn't luck, `scripts/r
 | NO_GUARDS | 5 |
 
 Same model, same prompts, same scenarios. The difference is entirely the engine.
+
+The ladder is visible in the same numbers. Before it, an over-ask was answered
+with the merchant's full ceiling in one step and the batch gave away 20% in
+total; opening at the first rung instead, the same nine sales closed for 8% —
+₹335 more recovered, and nobody walked.
 
 ---
 
@@ -77,6 +82,7 @@ Serves on `http://127.0.0.1:8000`, docs at `/docs`.
 | `TWILIO_*` | outbound calls |
 | `RESEND_API_KEY` | offer email |
 | `DATABASE_URL` | Postgres — falls back to a local SQLite file |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | "Continue with Google" — the button hides itself rather than failing |
 
 ### 2. Frontend
 
@@ -98,7 +104,7 @@ cd backend && python scripts/run_recovery_batch.py
 cd backend && python -m pytest tests/ -q
 ```
 
-343 tests, run against a real database — no mocked repositories. Test doubles appear only where a test must not place a real phone call or spend real money.
+701 tests, run against a real database — no mocked repositories. Test doubles appear only where a test must not place a real phone call or spend real money.
 
 ### 4. Take a real call (optional)
 
@@ -114,7 +120,7 @@ Put the `https` URL in `NGROK_URL` in `backend/.env`, fill in `TWILIO_ACCOUNT_SI
 
 ## Third-party services
 
-Seven, and five of them are optional to run.
+Eight, and six of them are optional to run.
 
 | Service | Used for | Needed locally? |
 |---|---|---|
@@ -125,6 +131,7 @@ Seven, and five of them are optional to run.
 | **Supabase (Postgres)** | the database | no — SQLite fallback |
 | **Railway** | backend hosting | no |
 | **Vercel** | frontend hosting | no |
+| **Google OAuth** | optional "Continue with Google" sign-in | no — the button only appears when the server is configured for it |
 
 Notably **not** used: no separate speech vendor, no vector database, no orchestration SaaS. Speech-to-text is Twilio's own `Gather` transcription. The agent loop is **LangGraph**, running in-process.
 
@@ -227,13 +234,36 @@ https://<your-kinato-host>/webhooks/razorpay/<merchant_id>
 
 Enable `payment.failed` and `payment.captured`. `payment.failed` is the primary trigger — it carries the customer's real email and phone, so recovery starts in seconds, with no timer and nothing on the storefront.
 
-**With the SDK** (adds abandoned-cart coverage):
+**With the SDK** (adds abandoned-cart coverage). One tag, and no other code:
 
 ```html
 <script src="https://<your-kinato-host>/sdk/kinato.js" data-key="pk_test_..."></script>
 ```
 
-Exactly three methods: `Kinato.init`, `Kinato.identify`, `Kinato.track`.
+If the page uses Razorpay Checkout, that is the entire integration. The SDK wraps
+`new Razorpay(options)` and reads the amount, currency, order id and prefilled
+contact details that are already in it — so there is nothing to add to your
+checkout code. It never fabricates consent: an auto-captured customer has none,
+and outreach stays blocked until a real permission exists. Auto-capture gets us
+the cart; it does not get us the right to call about it. Opt out with
+`data-auto="off"`.
+
+Three methods remain for anything the wrapper cannot see: `Kinato.init`,
+`Kinato.identify`, `Kinato.track`.
+
+**Your catalogue.** Upload the CSV you already have. Column names do not need to
+match anything — `SKU Code`, `Product Title`, `Selling Price`, `Cost Price` are
+all understood, a title row or blank line above the table is skipped, and prices
+written `₹1,299.00`, `Rs. 540` or `899/-` all parse. It shows you the columns it
+matched and the rows it read *before* saving, and names every row it is skipping
+and why.
+
+Worth doing rather than skipping: cost price is one of the two inputs to the
+margin floor. Without it the ceiling is the only thing standing between the
+agent and your margin, and the upload says so rather than leaving you to notice.
+Which column is your cost is also the one mapping worth checking by eye — get it
+wrong and you change which discounts are legal on every future call, which is
+why the step exists at all instead of a one-click import.
 
 ---
 
