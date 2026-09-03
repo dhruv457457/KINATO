@@ -1,0 +1,29 @@
+flowchart TD
+    W["payment.failed / checkout.abandoned<br/><i>Razorpay webhook, or DB sweeper</i>"]
+    W --> E{"RECOVERY ELIGIBILITY<br/>paid? consent? rail up? in flight?"}
+    E -->|"blocked — 10 of 25"| X["no call is placed<br/>reason surfaced on the dashboard"]
+    E -->|"eligible — 15 of 25"| S["RECOVERY STRATEGIST<br/>writes the opening line, nothing else"]
+    S --> TW["CALL ORCHESTRATOR → TWILIO<br/>outbound voice · Gather: speech + keypad"]
+    TW <--> A["AGENT RUNTIME<br/>LangGraph, bounded loop, 4.5s budget"]
+
+    A --> CO["check_offer<br/><i>asks. applies nothing.</i>"]
+    A --> OO["record_opt_out"]
+
+    CO --> PE["POLICY ENGINE<br/>ceiling · margin floor · ladder rung<br/>exclusions · confidence gate"]
+    OO --> CL["CONSENT LEDGER<br/>append-only — revocation is a<br/>new row, never an UPDATE"]
+
+    PE --> TK[("offer_tokens<br/>the approved amount lives here")]
+    TK --> IO["issue_offer<br/><i>reads the amount from the row</i>"]
+    IO --> RZ["RAZORPAY PAYMENT LINK"]
+    RZ --> EM["email to the customer"]
+    RZ --> HK["payment.captured webhook<br/>HMAC verified, deduplicated"]
+    HK --> AU["ATTRIBUTION + AUDIT LOG"]
+    CL --> AU
+    A --> AU
+
+    classDef ai fill:#dbeafe,stroke:#2563eb,color:#1e3a5f
+    classDef det fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef stop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    class S,A ai
+    class E,PE,CL,TK,IO,AU,HK det
+    class X stop

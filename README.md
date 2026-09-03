@@ -250,14 +250,20 @@ AI reasoning is separated from deterministic services.
 Green is deterministic code. Blue is the language model. **Nothing blue touches
 money.**
 
+<p align="center">
+  <img src="docs/diagrams/architecture.svg" alt="Kinato architecture: a webhook enters an eligibility gate, the agent runs a bounded LangGraph loop over a live Twilio call, and every money action passes through the policy engine and an offer token before Razorpay is touched." width="680">
+</p>
+
+<details>
+<summary>Diagram source (Mermaid) — <code>docs/diagrams/architecture.mmd</code></summary>
+
 ```mermaid
 flowchart TD
     W["payment.failed / checkout.abandoned<br/><i>Razorpay webhook, or DB sweeper</i>"]
     W --> E{"RECOVERY ELIGIBILITY<br/>paid? consent? rail up? in flight?"}
-    E -->|"blocked"| X["no call is placed<br/>reason surfaced on the dashboard"]
-    E -->|"eligible"| S["RECOVERY STRATEGIST<br/>writes the opening line, nothing else"]
-    S --> C["CALL ORCHESTRATOR"]
-    C --> TW["TWILIO — outbound voice<br/>Gather: speech + keypad"]
+    E -->|"blocked — 10 of 25"| X["no call is placed<br/>reason surfaced on the dashboard"]
+    E -->|"eligible — 15 of 25"| S["RECOVERY STRATEGIST<br/>writes the opening line, nothing else"]
+    S --> TW["CALL ORCHESTRATOR → TWILIO<br/>outbound voice · Gather: speech + keypad"]
     TW <--> A["AGENT RUNTIME<br/>LangGraph, bounded loop, 4.5s budget"]
 
     A --> CO["check_offer<br/><i>asks. applies nothing.</i>"]
@@ -282,6 +288,8 @@ flowchart TD
     class E,PE,CL,TK,IO,AU,HK det
     class X stop
 ```
+
+</details>
 
 Read it as two languages that meet at exactly one place. The blue boxes decide
 **what to say**. Everything green decides **what happens**. `check_offer` is the
