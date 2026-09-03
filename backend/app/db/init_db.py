@@ -359,6 +359,11 @@ def init_db(force_reseed: bool = False) -> None:
         # difference rather than mailing a reset for a login that does not
         # take one.
         "ALTER TABLE merchants ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'password'",
+        # What language this merchant's agent speaks. Was an environment
+        # variable, which made it a property of the DEPLOYMENT - one setting
+        # for every merchant on the platform, changed only by a redeploy.
+        # It belongs to the merchant whose customers are being phoned.
+        "ALTER TABLE merchant_policies ADD COLUMN agent_language TEXT NOT NULL DEFAULT 'english'",
         "ALTER TABLE checkouts ADD COLUMN error_code TEXT",
         "ALTER TABLE checkouts ADD COLUMN error_reason TEXT",
         "ALTER TABLE checkouts ADD COLUMN error_description TEXT",

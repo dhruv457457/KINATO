@@ -56,6 +56,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
 from app.core.config import settings
+from app.services import agent_language
 from app.gateway.event_bus import bus
 from app.agents.state import AgentContext
 from app.agents.tools import ALL_TOOLS, record_opt_out, LOW_CONFIDENCE_FLOOR
@@ -207,6 +208,20 @@ RESPONSE_RESERVE_S = 0.3
 # several frames down; asyncio copies the context into the task that
 # wait_for creates, so each concurrent call reads its own.
 _turn_started: contextvars.ContextVar[float] = contextvars.ContextVar("kinato_turn_started", default=0.0)
+
+# Which language to LISTEN in, for this request.
+#
+# A ContextVar for the same reason the turn clock is one: _gather_twiml is
+# called from eight places, several of them error paths that have no session
+# and no merchant to look one up from. Threading a parameter through all of
+# them to serve the two that know the answer would put the argument in the
+# hands of the sites least able to supply it.
+#
+# Set once per request from the session; falls back to the deployment
+# default when nothing set it, which is exactly the error-path case.
+_gather_language: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "kinato_gather_language", default=""
+)
 
 
 def _remaining_reasoning_budget() -> float:
@@ -646,6 +661,7 @@ def _build_system_prompt(
     memory_brief: str = "",
     emi_available: bool = False,
     voice_persona: str = "",
+    voice_language: str = "",
 ) -> str:
     """Builds the live-call system prompt.
 
@@ -766,6 +782,10 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
         # way as the opening one - a persona that applies only to the first
         # sentence is a voice that changes halfway through a call.
         "voice_persona": (row.get("voice_persona") or "").strip(),
+        # The merchant's language choice, resolved once per call so the
+        # prompt, the voice and the recogniser cannot disagree with each
+        # other partway through.
+        "agent_language": (row.get("agent_language") or "").strip(),
         "failure_class": row.get("checkout_failure_class"),
         # Pre-computed by call_orchestrator BEFORE dialling and carried in
         # the plan, for the same reason the opening voice block is: this
@@ -795,7 +815,11 @@ def _load_session_for_call(recovery_attempt_id: str) -> Optional[Dict[str, Any]]
     }
 
 
-def _gather_twiml(voice_block: str, retry_message: str = "Are you still there?") -> str:
+def _gather_twiml(
+    voice_block: str,
+    retry_message: str = "Are you still there?",
+    gather_language: str = "",
+) -> str:
     """Every Gather accepts speech AND a keypad digit.
 
     `input="speech dtmf"` costs nothing when the customer just talks, and
@@ -803,9 +827,14 @@ def _gather_twiml(voice_block: str, retry_message: str = "Are you still there?")
     working. numDigits="1" means a single press submits immediately rather
     than waiting for a terminating key nobody knows to press.
     """
+    # <Gather> takes exactly ONE language - there is no bilingual recogniser.
+    # This is the setting with teeth: a mis-transcription feeds the
+    # confidence gate that blocks the money tools, so choosing it badly
+    # costs recoveries, not merely transcript quality.
     attrs = (
         f'input="speech dtmf" numDigits="1" action="{settings.NGROK_URL}/voice/respond" '
-        f'method="POST" speechTimeout="auto" timeout="5" language="{settings.VOICE_GATHER_LANGUAGE}"'
+        f'method="POST" speechTimeout="auto" timeout="5" '
+        f'language="{gather_language or _gather_language.get() or settings.VOICE_GATHER_LANGUAGE}"'
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -883,6 +912,8 @@ async def _outbound(request: Request):
     logger.info(f"[CALL {call_id}] /voice/outbound HIT - recovery_attempt_id={recovery_attempt_id!r}, method={request.method}")
 
     session = _load_session_for_call(recovery_attempt_id) if recovery_attempt_id else None
+    if session:
+        _gather_language.set(agent_language.resolve(session.get("agent_language")).gather)
     if not session:
         logger.error(f"voice/outbound: no recovery_attempt found for id={recovery_attempt_id!r}, ending call.")
         return Response(
@@ -930,6 +961,7 @@ async def _outbound(request: Request):
             session.get("memory_brief", ""),
             session.get("emi_available", False),
             session.get("voice_persona", ""),
+            session.get("agent_language", ""),
         ),
         session["opening_line"],
     )
@@ -1023,6 +1055,8 @@ def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
     if not attempt:
         return None
     session = _load_session_for_call(attempt["recovery_attempt_id"])
+    if session:
+        _gather_language.set(agent_language.resolve(session.get("agent_language")).gather)
     if not session:
         return None
 
@@ -1039,6 +1073,7 @@ def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
             session.get("memory_brief", ""),
             session.get("emi_available", False),
             session.get("voice_persona", ""),
+            session.get("agent_language", ""),
         ),
         turns,
     )
@@ -1109,6 +1144,7 @@ async def _run_agent_turn(
             session.get("memory_brief", ""),
             session.get("emi_available", False),
             session.get("voice_persona", ""),
+            session.get("agent_language", ""),
         ),
         user_message=user_message,
         ctx=turn_ctx,

@@ -573,7 +573,8 @@ def get_call_context(recovery_attempt_id: str) -> Optional[Dict[str, Any]]:
                    -- measured at about five seconds, and a second round
                    -- trip for one short string is the kind of thing that
                    -- ends calls (FINDINGS #8, #17).
-                   mp.voice_persona    AS voice_persona
+                   mp.voice_persona    AS voice_persona,
+                   mp.agent_language   AS agent_language
             FROM recovery_attempts ra
             LEFT JOIN checkouts  c  ON c.checkout_id  = ra.checkout_id
             LEFT JOIN customers  cu ON cu.customer_id = ra.customer_id

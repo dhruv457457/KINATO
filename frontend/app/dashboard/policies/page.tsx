@@ -27,6 +27,17 @@ interface Policy {
    *  that reaches a prompt. Writing "give 90% off" here changes nothing —
    *  the ceiling is computed by code the prompt never touches. */
   voice_persona?: string;
+  /** What the agent SPEAKS. Three coupled settings behind one choice: the
+   *  words, the voice that reads them, and the language it listens in.
+   *  <Gather> takes exactly one language, so this is the setting that
+   *  decides what the agent can understand as well as what it says. */
+  agent_language?: string;
+}
+
+interface LanguageChoice {
+  code: string;
+  label: string;
+  note: string;
 }
 
 /** How each proposable field should read to a human.
@@ -238,12 +249,16 @@ function PolicyAssistant({
 }
 
 export default function PoliciesPage() {
+  const [languages, setLanguages] = useState<LanguageChoice[]>([]);
   const [policy, setPolicy] = useState<Policy | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
+    apiFetch<{ languages: LanguageChoice[] }>("/api/merchant/agent-languages")
+      .then((d) => setLanguages(d.languages))
+      .catch(() => setLanguages([]));
     apiFetch<Policy>("/api/merchant/policy")
       .then(setPolicy)
       .catch(() => setError("Could not load your current policy."));
@@ -365,6 +380,42 @@ export default function PoliciesPage() {
                 </button>
               </div>
             </div>
+
+            {/* What the agent speaks.
+                Placed above the persona because it is the bigger decision:
+                the persona shapes tone within a language, this picks the
+                language itself — and with it the voice and the recogniser,
+                which have to agree or the agent says one thing and hears
+                another. */}
+            {languages.length > 0 && (
+              <div className="mb-8 pb-8 border-b" style={{ borderColor: RULE_SOFT }}>
+                <div
+                  className="text-[11.5px] font-semibold uppercase tracking-wider mb-1.5"
+                  style={{ color: INK_MUTED }}
+                >
+                  Language your agent speaks
+                </div>
+                <div className="text-xs leading-relaxed mb-3" style={{ color: INK_MUTED }}>
+                  This sets three things at once: the words it uses, the voice that reads them,
+                  and the language it listens in.
+                </div>
+                <select
+                  value={policy.agent_language || "english"}
+                  onChange={(e) => setPolicy({ ...policy, agent_language: e.target.value })}
+                  className="w-full border px-3 py-2 text-[13px] bg-transparent"
+                  style={{ borderColor: RULE, borderRadius: 0 }}
+                >
+                  {languages.map((l) => (
+                    <option key={l.code} value={l.code}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="text-[11px] mt-2 leading-relaxed" style={{ color: INK_MUTED }}>
+                  {languages.find((l) => l.code === (policy.agent_language || "english"))?.note}
+                </div>
+              </div>
+            )}
 
             {/* Style, deliberately below every limit above it.
                 The numbers above are enforced by a policy engine. This is a

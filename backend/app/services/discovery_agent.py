@@ -25,10 +25,12 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.services import agent_language
 from app.gateway.event_bus import bus
 from app.db.repositories import checkouts as checkouts_repo
 from app.db.repositories import customers as customers_repo
 from app.db.repositories import merchants as merchants_repo
+from app.db.repositories import policies as policies_repo
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,8 @@ _HINGLISH_OPENING = (
 
 
 def _opening_line_prompt(
-    customer_name: str, item_description: str, amount: float, business_name: str
+    customer_name: str, item_description: str, amount: float, business_name: str,
+    language: str = "",
 ) -> str:
     """The prompt that writes the first thing a customer hears.
 
@@ -84,11 +87,13 @@ def _opening_line_prompt(
         else "You do NOT know the caller's name or the business name. Do not state either one - "
              "open with the reason for the call instead."
     )
-    hinglish = (
-        _HINGLISH_OPENING
-        if (settings.AGENT_LANGUAGE or "").strip().lower() == "hinglish"
-        else ""
-    )
+    # The merchant's own choice first; the deployment-wide env var only as
+    # a fallback for installs that never set the policy field. This is the
+    # prompt that writes the FIRST sentence of the call, and it reading a
+    # different setting from the turn-by-turn prompt is what made an agent
+    # open in English and answer in Hinglish.
+    lang = agent_language.resolve(language or settings.AGENT_LANGUAGE)
+    hinglish = lang.instruction
     return (
         f"Write a one-sentence warm, natural phone opening line for a checkout-recovery call, and one short "
         f"talking point to use if the customer hesitates on price. "
@@ -174,7 +179,16 @@ class RecoveryStrategist:
         except Exception:
             business_name = ""
 
-        plan = await RecoveryStrategist._generate_plan(customer_name, item_description, amount, business_name)
+        # Read alongside the business name, from the merchant's own policy.
+        agent_lang = ""
+        try:
+            agent_lang = (policies_repo.get_policy(merchant_id) or {}).get("agent_language") or ""
+        except Exception:
+            agent_lang = ""
+
+        plan = await RecoveryStrategist._generate_plan(
+            customer_name, item_description, amount, business_name, agent_lang
+        )
 
         await bus.publish(
             event_type="recovery.plan_ready",
@@ -184,7 +198,10 @@ class RecoveryStrategist:
         )
 
     @staticmethod
-    async def _generate_plan(customer_name: str, item_description: str, amount: float, business_name: str = "") -> CallPlan:
+    async def _generate_plan(
+        customer_name: str, item_description: str, amount: float, business_name: str = "",
+        language: str = "",
+    ) -> CallPlan:
         greeting_name = f" Is this {customer_name}?" if customer_name else ""
         if not settings.OPENROUTER_API_KEY:
             return CallPlan(
@@ -206,7 +223,7 @@ class RecoveryStrategist:
             else "You do NOT know the caller's name or the business name. Do not state either one - "
                  "open with the reason for the call instead."
         )
-        prompt = _opening_line_prompt(customer_name, item_description, amount, business_name)
+        prompt = _opening_line_prompt(customer_name, item_description, amount, business_name, language)
         try:
             from openai import AsyncOpenAI
             from app.core.net import ipv4_client

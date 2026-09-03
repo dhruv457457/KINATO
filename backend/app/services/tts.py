@@ -90,7 +90,7 @@ def elevenlabs_active() -> bool:
     return bool(ELEVENLABS_VOICE_ID) and not _ELEVENLABS_DISABLED and bool(settings.ELEVENLABS_API_KEY)
 
 
-async def voice_block(text: str) -> str:
+async def voice_block(text: str, voice: str = "") -> str:
     """Always returns a usable TwiML fragment - never empty, never raises,
     and never takes longer than ELEVENLABS_BUDGET_S total (see module
     constant) - a live call's webhook response time is on a real clock
@@ -102,7 +102,12 @@ async def voice_block(text: str) -> str:
         audio_url = ""
     if audio_url:
         return f"<Play>{audio_url}</Play>"
-    return f'<Say voice="{TWILIO_NEURAL_VOICE}">{escape(text)}</Say>'
+    # The voice has to be able to pronounce the SCRIPT the agent wrote in.
+    # A Devanagari sentence handed to an Indian-English voice comes out as
+    # noise, and an English sentence through a Hindi voice is little better,
+    # so the merchant's language choice picks the voice as well as the
+    # words - see app/services/agent_language.py.
+    return f'<Say voice="{voice or TWILIO_NEURAL_VOICE}">{escape(text)}</Say>'
 
 
 async def generate_elevenlabs_audio(text: str) -> str:

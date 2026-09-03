@@ -20,6 +20,7 @@ from app.db.repositories import products as products_repo
 from app.db.repositories import policies as policies_repo
 from app.db.repositories import events as events_repo
 from app.db.database import run_db_async
+from app.services import agent_language
 from app.services import catalog_ingest
 from app.services.razorpay_client_factory import validate_credentials_live, invalidate_cache
 
@@ -515,10 +516,29 @@ class PolicyUpdateRequest(BaseModel):
     # own prompt, which is the model editing its own instructions one level
     # up. A merchant types this themselves.
     voice_persona: Optional[str] = Field(None, max_length=400)
+    # What language the agent speaks. Was an environment variable, which
+    # made it a property of the DEPLOYMENT - one setting for every merchant,
+    # changed only by a redeploy. It belongs to the merchant whose customers
+    # are being phoned.
+    #
+    # Validated against the supported set rather than accepted as free text:
+    # a language is three coupled settings (words, voice, recogniser) and an
+    # unknown code has no voice to read it and no recogniser to hear it.
+    agent_language: Optional[str] = Field(None, max_length=32)
 
 
 class PolicyProposalRequest(BaseModel):
     instruction: str = Field(..., min_length=3, max_length=500)
+
+
+@merchant_router.get("/agent-languages")
+async def agent_languages(current_merchant: dict = Depends(get_current_merchant)):
+    """What the dashboard may offer, straight from the backend.
+
+    Served rather than duplicated in the frontend so the selector cannot
+    drift from the set the server can actually speak, hear and render.
+    """
+    return {"languages": agent_language.choices()}
 
 
 @merchant_router.get("/policy")
@@ -535,6 +555,11 @@ async def update_policy(payload: PolicyUpdateRequest, current_merchant: dict = D
     # string is kept rather than dropped, so "" can clear the setting.
     if "voice_persona" in updates:
         updates["voice_persona"] = " ".join(str(updates["voice_persona"]).split())
+    if "agent_language" in updates:
+        # resolve() never raises and falls back to English, so an unknown
+        # code is stored as English rather than as a language nothing can
+        # speak or hear.
+        updates["agent_language"] = agent_language.resolve(updates["agent_language"]).code
     return policies_repo.update_policy(current_merchant["merchant_id"], updates)
 
 
