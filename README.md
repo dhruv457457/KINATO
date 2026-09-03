@@ -30,6 +30,33 @@ A hallucinating or injected model can only hand back an opaque string whose amou
 
 The model chooses **what to say**. Code chooses **what money moves**. That line is the product.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as LLM
+    participant T as Tool layer
+    participant P as Policy engine
+    participant DB as offer_tokens
+    participant R as Razorpay
+
+    M->>T: check_offer(discount_percent=40)
+    Note over M,T: the ask is 40%. nothing has happened yet.
+    T->>P: real cart, real merchant policy
+    P-->>T: ceiling 10%, margin floor, ladder rung 1
+    T->>DB: mint token — the amount is computed HERE
+    DB-->>M: opaque offer_token + "approved: 3%"
+    Note over M: the model never sees, sets or passes an amount
+
+    M->>T: issue_offer(offer_token)
+    T->>DB: read the approved amount FROM the token row
+    DB-->>T: 3% of Rs 2,490
+    T->>R: create payment link
+    R-->>T: real link -> email
+```
+
+The model asked for 40% and the customer got 3%, because the number came from a
+row the model cannot write to.
+
 ### Does it work?
 
 25 recovery scenarios, run end to end through the real agent, the real policy engine and the real database:
@@ -46,18 +73,75 @@ Reproduce with `python scripts/run_recovery_batch.py`. It is stable across runs.
 
 The number that matters is `RULE BREAKS: 0`. To show that isn't luck, `scripts/run_ablation.py` strips the guardrails and re-runs the same 25:
 
-| Arm | Rule breaks |
-|---|---|
-| **GATED** (what ships) | **0** |
-| NO_POLICY — model decides discounts | 3 — approved 60% off against a 10% ceiling |
-| NO_GUARDS | 5 |
+| Arm | Rule breaks | | What broke |
+|---|---|---|---|
+| **GATED** — what ships | **0** | | — |
+| NO_POLICY — model decides discounts | 3 | `███` | approved **60% off** against a 10% ceiling |
+| NO_GUARDS — nothing between model and money | 5 | `█████` | the above, plus claims of money that never moved |
 
 Same model, same prompts, same scenarios. The difference is entirely the engine.
+
+Where the 25 carts ended up:
+
+```mermaid
+pie showData
+    title Where 25 eligible carts ended up
+    "Stopped before any call — a rule said no" : 10
+    "Recovered at full price" : 7
+    "Recovered after climbing the ladder" : 2
+    "Asked for a discount, refused one" : 2
+    "Opted out mid-call" : 2
+    "Contacted, no sale" : 2
+```
+
+**Ten of twenty-five were never called at all** — 4 without consent, 3 who had
+already paid, and one each for quiet hours, a contact cap and no reachable
+number. That is the half of the scoreboard most recovery demos leave out, and
+it reconciles: `contacted 15 + stopped 10 = 25`, printed by the script rather
+than asserted here.
+
+**One thing this number is not.** ₹16,196.08 is gross recovery against a
+full-price counterfactual — it is *not* incremental lift over an untreated
+control. Measuring that honestly needs a randomised no-contact holdout, and a
+holdout run against simulated customers only measures the simulator. We have 8
+real `RECOVERED` rows, which is not enough to hold anything out of. What the
+ablation above *does* prove is narrower and real: the policy engine is
+load-bearing, because the same agent without it gives away 60%.
 
 The ladder is visible in the same numbers. Before it, an over-ask was answered
 with the merchant's full ceiling in one step and the batch gave away 20% in
 total; opening at the first rung instead, the same nine sales closed for 8% —
 ₹335 more recovered, and nobody walked.
+
+### What is real, and what is simulated
+
+Stated up front, because it is the first thing worth knowing about any recovery demo.
+
+| | Real | Simulated |
+|---|---|---|
+| The agent, LangGraph loop and prompts | ✅ | |
+| Policy engine, offer tokens, margin floor, ladder | ✅ | |
+| Database, audit log, consent ledger | ✅ Postgres | |
+| **Outbound phone calls** | ✅ Twilio — a real phone rings | |
+| **Speech-to-text and TTS** | ✅ Twilio `<Gather>` | |
+| **Email delivery** | ✅ Resend | |
+| Razorpay payment links — **on a live call** | ✅ real test-mode API | |
+| Razorpay payment links — **in the 25-cart batch** | | 🔸 final mint stubbed |
+| The customer in the 25-cart batch | | 🔸 scripted speech |
+
+Two of those need saying plainly rather than being left in a table.
+
+**The batch stubs the last API call only.** Razorpay's test mode caps you at 30
+payment links *cumulatively*, which a single 25-case run exhausts — so the
+policy decision, the margin floor, the offer-token gate and every audit row are
+real, and only the final link-minting call is stubbed. Live calls mint genuine
+links.
+
+**The batch's customer is scripted.** The agent, engine, tokens, database and
+audit trail on that run are all real; the person on the other end is not. Live
+calls are real on both ends, but there have been a handful of them, not
+twenty-five. Both things are true at once, and neither on its own is the whole
+picture — which is why both are here.
 
 ---
 
@@ -104,7 +188,7 @@ cd backend && python scripts/run_recovery_batch.py
 cd backend && python -m pytest tests/ -q
 ```
 
-701 tests, run against a real database — no mocked repositories. Test doubles appear only where a test must not place a real phone call or spend real money.
+802 tests, run against a real database — no mocked repositories. Test doubles appear only where a test must not place a real phone call or spend real money.
 
 ### 4. Take a real call (optional)
 
@@ -163,43 +247,45 @@ The honest list — what would stop this serving a real merchant tomorrow.
 
 AI reasoning is separated from deterministic services.
 
-```text
-  payment.failed / checkout.abandoned          ← Razorpay webhook, or DB sweeper
-                 │
-                 ▼
-       RECOVERY ELIGIBILITY                    ← stopping rules live here
-       ├─ already paid?                          (consent, rail health,
-       ├─ consent granted?                        contactable, in-flight)
-       ├─ Razorpay rail degraded?
-       └─ already being recovered?
-                 │
-                 ▼
-       RECOVERY STRATEGIST                     ← LLM: opening line only
-                 │
-                 ▼
-       CALL ORCHESTRATOR ──────────► TWILIO (outbound voice)
-                 │                          │
-                 ▼                          ▼
-          AGENT RUNTIME  ◄─────── customer speech, per turn
-          (LangGraph, bounded)
-                 │
-        ┌────────┴─────────┐
-        ▼                  ▼
-   check_offer         record_opt_out         ← the only mutating tools
-        │                  │
-        ▼                  ▼
-  POLICY ENGINE      CONSENT LEDGER           ← deterministic, append-only
-  (ceiling, margin    (revocation is a
-   floor, exclusions)  new row, never
-        │              an UPDATE)
-        ▼
-   issue_offer ──────► RAZORPAY PAYMENT LINK ──► email
-                              │
-                        webhook (HMAC verified)
-                              │
-                              ▼
-                    ATTRIBUTION + AUDIT LOG
+Green is deterministic code. Blue is the language model. **Nothing blue touches
+money.**
+
+```mermaid
+flowchart TD
+    W["payment.failed / checkout.abandoned<br/><i>Razorpay webhook, or DB sweeper</i>"]
+    W --> E{"RECOVERY ELIGIBILITY<br/>paid? consent? rail up? in flight?"}
+    E -->|"blocked"| X["no call is placed<br/>reason surfaced on the dashboard"]
+    E -->|"eligible"| S["RECOVERY STRATEGIST<br/>writes the opening line, nothing else"]
+    S --> C["CALL ORCHESTRATOR"]
+    C --> TW["TWILIO — outbound voice<br/>Gather: speech + keypad"]
+    TW <--> A["AGENT RUNTIME<br/>LangGraph, bounded loop, 4.5s budget"]
+
+    A --> CO["check_offer<br/><i>asks. applies nothing.</i>"]
+    A --> OO["record_opt_out"]
+
+    CO --> PE["POLICY ENGINE<br/>ceiling · margin floor · ladder rung<br/>exclusions · confidence gate"]
+    OO --> CL["CONSENT LEDGER<br/>append-only — revocation is a<br/>new row, never an UPDATE"]
+
+    PE --> TK[("offer_tokens<br/>the approved amount lives here")]
+    TK --> IO["issue_offer<br/><i>reads the amount from the row</i>"]
+    IO --> RZ["RAZORPAY PAYMENT LINK"]
+    RZ --> EM["email to the customer"]
+    RZ --> HK["payment.captured webhook<br/>HMAC verified, deduplicated"]
+    HK --> AU["ATTRIBUTION + AUDIT LOG"]
+    CL --> AU
+    A --> AU
+
+    classDef ai fill:#dbeafe,stroke:#2563eb,color:#1e3a5f
+    classDef det fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef stop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    class S,A ai
+    class E,PE,CL,TK,IO,AU,HK det
+    class X stop
 ```
+
+Read it as two languages that meet at exactly one place. The blue boxes decide
+**what to say**. Everything green decides **what happens**. `check_offer` is the
+seam, and it hands back a token rather than a decision.
 
 Every tool call — arguments, decision, latency, and whether it ran degraded — is written to `audit_log` and readable in the dashboard's recovery drawer.
 
