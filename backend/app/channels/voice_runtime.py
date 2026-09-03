@@ -662,6 +662,7 @@ def _build_system_prompt(
     emi_available: bool = False,
     voice_persona: str = "",
     voice_language: str = "",
+    barrier_confirmed: bool = False,
 ) -> str:
     """Builds the live-call system prompt.
 
@@ -688,10 +689,28 @@ def _build_system_prompt(
     # is established before the call-specific facts arrive - a language
     # instruction buried under two paragraphs of context gets followed less
     # reliably than one that reads as part of the role.
-    if (settings.AGENT_LANGUAGE or "").strip().lower() == "hinglish":
+    # The merchant's own choice wins; settings.AGENT_LANGUAGE is only the
+    # deployment-wide fallback for merchants who have not set one. This read
+    # used to be the global alone, so a merchant who picked Hinglish got the
+    # right <Gather> recogniser and an agent that still spoke English - it
+    # listened correctly and answered in the wrong language.
+    lang = agent_language.resolve(voice_language or settings.AGENT_LANGUAGE)
+    if lang.code == "hinglish":
+        # Hinglish keeps its own longer style block rather than the short
+        # instruction: it has to say Roman-letters-not-Devanagari and
+        # numbers-in-English, because the line is read by an Indian-English
+        # voice and a mispronounced rupee amount is the worst error here.
         prompt = f"{prompt}\n{_HINGLISH_STYLE}\n"
+    elif lang.instruction:
+        prompt = f"{prompt}\n{lang.instruction}\n"
 
-    diagnosis_line = failure_diagnosis.describe(failure_class, emi_available=emi_available)
+    # barrier_confirmed carries the same state the discount gate runs on -
+    # the customer having said, in their own words, that cost is the
+    # problem. Instalments become mentionable at exactly that moment and
+    # not before.
+    diagnosis_line = failure_diagnosis.describe(
+        failure_class, emi_available=emi_available, barrier_confirmed=barrier_confirmed
+    )
     if diagnosis_line:
         prompt = f"{prompt}\n{diagnosis_line}\n"
     # What we already know about this person, from earlier attempts. Bounded
@@ -962,6 +981,7 @@ async def _outbound(request: Request):
             session.get("emi_available", False),
             session.get("voice_persona", ""),
             session.get("agent_language", ""),
+            session.get("discount_bounced", False),
         ),
         session["opening_line"],
     )
@@ -1074,6 +1094,7 @@ def _rehydrate_session(call_id: str) -> Optional[Dict[str, Any]]:
             session.get("emi_available", False),
             session.get("voice_persona", ""),
             session.get("agent_language", ""),
+            session.get("discount_bounced", False),
         ),
         turns,
     )
@@ -1145,6 +1166,7 @@ async def _run_agent_turn(
             session.get("emi_available", False),
             session.get("voice_persona", ""),
             session.get("agent_language", ""),
+            session.get("discount_bounced", False),
         ),
         user_message=user_message,
         ctx=turn_ctx,

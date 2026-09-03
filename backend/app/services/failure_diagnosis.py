@@ -207,14 +207,19 @@ def diagnose(failure: Optional[Dict[str, Any]], rail_degraded: bool = False) -> 
     )
 
 
-def describe(failure_class: Optional[str], emi_available: bool = False) -> str:
+def describe(
+    failure_class: Optional[str],
+    emi_available: bool = False,
+    barrier_confirmed: bool = False,
+) -> str:
     """The one line the agent's system prompt gets. Empty when there is
     nothing useful to say, so the prompt simply omits the section rather
     than asserting something hollow.
 
-    `emi_available` adds instalments to the ONE class where the barrier is
-    genuinely cashflow rather than price. It is a parameter and not a
-    constant because EMI has to be enabled on the merchant's own Razorpay
+    `emi_available` adds instalments PROACTIVELY to the one class where the
+    barrier is genuinely cashflow rather than price, and ON REQUEST to every
+    other class - never volunteered there, but answerable when asked. It is
+    a parameter and not a constant because EMI has to be enabled on the merchant's own Razorpay
     account: offering instalments a checkout cannot provide tells a customer
     something untrue about their money, which is the failure this codebase
     keeps finding. Defaults False, so silence is what happens when nobody
@@ -229,6 +234,23 @@ def describe(failure_class: Optional[str], emi_available: bool = False) -> str:
     # ask. This is the same restraint as not pushing UPI at a walk-away.
     if line and emi_available and failure_class == INSUFFICIENT_FUNDS:
         line = f"{line} {_EMI_LINE}"
+    elif line and emi_available and barrier_confirmed:
+        # Only once the customer has RAISED cost themselves.
+        #
+        # A live SOFT_DECLINE call asked for EMI twice and was handed 7% off
+        # instead, because nothing in the prompt said instalments existed -
+        # the expensive instrument reached for because the cheap one was
+        # unmentioned. So the agent has to know. But telling it on every
+        # call and adding "do not volunteer this" is a promise in prose, and
+        # this session has twice watched the model walk past exactly that
+        # kind of sentence.
+        #
+        # So it is gated on the same signal the discount gate uses: the
+        # barrier the customer confirmed in their own words. Before that the
+        # agent cannot mention instalments because it has not been told they
+        # exist, which is a mechanism; after it, mentioning them is precisely
+        # what the customer asked for.
+        line = f"{line} {_EMI_ON_REQUEST_LINE}"
     return line
 
 
@@ -247,6 +269,18 @@ _EMI_LINE = (
     "This merchant offers EMI, so if the issue is paying it all at once, say they can split it into "
     "monthly instalments on the same link - offer that BEFORE any discount, because it costs them "
     "nothing and you keep the full sale."
+)
+
+# EMI exists, but must not be VOLUNTEERED outside INSUFFICIENT_FUNDS - the
+# restraint above still holds. This line exists so the agent is not ignorant
+# of instalments when the customer raises cost or asks for EMI outright.
+# On a real SOFT_DECLINE call the customer asked for EMI twice and was handed
+# 7% off instead, because nothing in the prompt said instalments existed at
+# all - the expensive instrument reached for because the cheap one was unmentioned.
+_EMI_ON_REQUEST_LINE = (
+    "This merchant offers EMI. Do not volunteer it, but if the customer raises the cost or asks about "
+    "instalments, tell them the same link can be split into monthly instalments - and say that BEFORE "
+    "offering any discount, because it costs nothing and keeps the full sale."
 )
 
 _PROMPT_LINES = {

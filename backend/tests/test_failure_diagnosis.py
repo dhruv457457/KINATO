@@ -322,3 +322,79 @@ class TestInstalmentsBeforeDiscount:
     def test_an_unknown_class_still_says_nothing_at_all(self):
         assert describe(UNKNOWN, emi_available=True) == ""
         assert describe(None, emi_available=True) == ""
+
+
+class TestInstalmentsOnceTheCustomerRaisesCost:
+    """The gap that cost a real sale, closed without loosening the rule.
+
+    From a live SOFT_DECLINE call, with EMI enabled on the merchant's
+    account:
+
+        customer: "any discount or something can be given for EMI option?"
+        customer: "I want any discount at EMI"
+        agent:    offered 7% off
+
+    Asked for instalments twice, handed margin instead - because describe()
+    mentioned EMI only for INSUFFICIENT_FUNDS, so on a SOFT_DECLINE the
+    agent did not know instalments existed. The expensive instrument reached
+    for because the cheap one was unmentioned.
+
+    The obvious repair is to mention EMI on every class and add "do not
+    volunteer it". That trades a structural guarantee for a sentence in a
+    prompt, and this codebase has twice watched the model walk past exactly
+    that kind of sentence - the invented discount refusal and the invented
+    ceiling, both guarded in code afterwards precisely because prose did not
+    hold.
+
+    So it is gated on `barrier_confirmed` instead: the same signal the
+    discount gate runs on, meaning the customer has said in their own words
+    that cost is the problem. Before that the agent cannot mention
+    instalments because it has not been told they exist. After it, saying so
+    is exactly what was asked for.
+    """
+
+    @pytest.mark.parametrize(
+        "failure_class", [SOFT_DECLINE, HARD_DECLINE, AUTH_DROP, USER_ABANDON, RAIL_DOWN]
+    )
+    def test_silence_until_the_customer_raises_cost(self, failure_class):
+        """Unchanged from before - this is the guarantee that must not slip."""
+        line = describe(failure_class, emi_available=True)
+        assert "EMI" not in line and "instalment" not in line
+
+    @pytest.mark.parametrize(
+        "failure_class", [SOFT_DECLINE, AUTH_DROP, USER_ABANDON, RAIL_DOWN]
+    )
+    def test_instalments_become_mentionable_once_it_is_confirmed(self, failure_class):
+        line = describe(failure_class, emi_available=True, barrier_confirmed=True)
+        assert "EMI" in line or "instalment" in line
+
+    def test_it_still_says_instalments_before_a_discount(self):
+        """The whole point of reaching for the cheap instrument first."""
+        line = describe(SOFT_DECLINE, emi_available=True, barrier_confirmed=True)
+        assert "BEFORE" in line.upper()
+
+    @pytest.mark.parametrize(
+        "failure_class", [SOFT_DECLINE, HARD_DECLINE, AUTH_DROP, USER_ABANDON, RAIL_DOWN]
+    )
+    def test_a_merchant_without_emi_is_never_promised_it(self, failure_class):
+        """The safe direction, and it must not depend on the barrier at all.
+        Offering instalments a checkout cannot provide tells a customer
+        something untrue about their money."""
+        line = describe(failure_class, emi_available=False, barrier_confirmed=True)
+        assert "EMI" not in line and "instalment" not in line
+
+    def test_insufficient_funds_is_still_proactive(self):
+        """The one class where cashflow IS the stated barrier does not wait
+        to be asked - nothing about that changes."""
+        line = describe(INSUFFICIENT_FUNDS, emi_available=True, barrier_confirmed=False)
+        assert "EMI" in line or "instalment" in line
+
+    def test_the_prompt_carries_the_confirmed_barrier(self):
+        """A gate nothing passes through is a gate that never opens."""
+        import inspect
+
+        from app.channels import voice_runtime
+
+        src = inspect.getsource(voice_runtime)
+        assert "barrier_confirmed=barrier_confirmed" in src
+        assert 'session.get("discount_bounced", False)' in src
