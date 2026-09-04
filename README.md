@@ -6,6 +6,8 @@
 
 That is the whole product. Everything below is about the one hard part: letting a language model run a sales conversation about real money without letting it decide the money.
 
+**▶ [Watch the demo](https://www.youtube.com/watch?v=-OMjnlEXHp8)** — real calls to a real phone, including the one where the agent is asked for 40% off and refuses.
+
 ---
 
 ## The idea, plainly
