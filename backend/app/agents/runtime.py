@@ -241,6 +241,28 @@ def _build_graph(
             tool = tools_by_name.get(name)
             (mutating_calls if (tool is None or tool.mutating) else read_calls).append(tc)
 
+        # An offer_token cannot exist yet if the call that mints it is in
+        # THIS SAME batch.
+        #
+        # Seen on a live call, four times in ninety seconds: the model
+        # emitted issue_offer and check_offer together in one assistant
+        # message, filling issue_offer's required offer_token with the
+        # literal strings "token_from_check_offer" and then "token". Both
+        # were rejected as not-found - correctly - but the wasted mutating
+        # call and its round trip spent the turn's budget, so the token
+        # check_offer had just minted was never used. The customer asked for
+        # the link four times, was told "someone will follow up by email"
+        # four times, and no link was ever sent.
+        #
+        # The instructive refusal on issue_offer already said "the only
+        # valid value is one returned by a check_offer call in THIS
+        # conversation". It did not help, and it cannot: the model had
+        # already chosen both calls before it could read either result.
+        # Sequencing is not something a tool result can fix after the fact,
+        # so it is enforced here, where the batch is still visible.
+        _batch = {tc["function"]["name"] for tc in tool_calls}
+        _premature = _batch >= {"issue_offer", "check_offer"}
+
         async def run_one(tc: Dict[str, Any]) -> Dict[str, Any]:
             name = tc["function"]["name"]
             tool = tools_by_name.get(name)
@@ -250,6 +272,23 @@ def _build_graph(
                 args = {}
             if tool is None:
                 result = {"status": "REJECTED", "reason": f"unknown_tool: {name}"}
+            elif _premature and name == "issue_offer":
+                # Not executed at all - no Razorpay call, no token lookup, no
+                # latency spent. Recorded as a refusal so it stays countable,
+                # but deliberately kept OUT of tool_calls_made, which means
+                # "what ran".
+                result = {
+                    "status": "REJECTED",
+                    "reason": "REJECTED_OFFER_TOKEN_NOT_YET_MINTED",
+                    "detail": (
+                        "You called issue_offer in the same turn as check_offer, so no "
+                        "offer_token existed yet and the one you passed was invented. "
+                        "check_offer has now returned a real offer_token in this same batch. "
+                        "Read it from that result and call issue_offer again with that exact "
+                        "value, on its own."
+                    ),
+                }
+                refusals_tracker.append({"tool": name, "reason": result["reason"]})
             else:
                 if tool.mutating:
                     # A mutating tool MOVES MONEY. asyncio.wait_for cancels
