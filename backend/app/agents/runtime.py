@@ -262,6 +262,24 @@ def _build_graph(
         # so it is enforced here, where the batch is still visible.
         _batch = {tc["function"]["name"] for tc in tool_calls}
         _premature = _batch >= {"issue_offer", "check_offer"}
+        # Refusing the premature call was not enough on its own. Measured on
+        # the live call above: the turn still needed a further model round
+        # trip to read the token and a second issue_offer to spend it, and
+        # the voice deadline does not have room for that. The customer heard
+        # the fallback line either way.
+        #
+        # So the batch is completed rather than merely refused. check_offer
+        # is ordered first, and the token IT returns is substituted into the
+        # issue_offer the model asked for in the same breath.
+        #
+        # This does not loosen the money gate. The amount is still computed
+        # by the policy engine and still read from the offer_tokens row -
+        # the token binds an amount to a decision, and was never an
+        # attestation that the model echoed a string back correctly. What
+        # the model asked for here is unambiguous: check this, then send it.
+        if _premature:
+            mutating_calls.sort(key=lambda tc: tc["function"]["name"] != "check_offer")
+        _minted: Dict[str, Any] = {}
 
         async def run_one(tc: Dict[str, Any]) -> Dict[str, Any]:
             name = tc["function"]["name"]
@@ -272,24 +290,30 @@ def _build_graph(
                 args = {}
             if tool is None:
                 result = {"status": "REJECTED", "reason": f"unknown_tool: {name}"}
-            elif _premature and name == "issue_offer":
-                # Not executed at all - no Razorpay call, no token lookup, no
-                # latency spent. Recorded as a refusal so it stays countable,
-                # but deliberately kept OUT of tool_calls_made, which means
-                # "what ran".
+            elif _premature and name == "issue_offer" and not _minted.get("offer_token"):
+                # check_offer ran first and did NOT approve anything - denied
+                # by the ceiling, the margin floor, a barrier that was never
+                # confirmed, a line too unclear to act on. There is no token
+                # to substitute and there must not be one. Not executed at
+                # all: no Razorpay call, no token lookup, no latency.
+                # Recorded as a refusal so it stays countable, but kept out
+                # of tool_calls_made, which means "what ran".
                 result = {
                     "status": "REJECTED",
                     "reason": "REJECTED_OFFER_TOKEN_NOT_YET_MINTED",
                     "detail": (
                         "You called issue_offer in the same turn as check_offer, so no "
                         "offer_token existed yet and the one you passed was invented. "
-                        "check_offer has now returned a real offer_token in this same batch. "
-                        "Read it from that result and call issue_offer again with that exact "
-                        "value, on its own."
+                        "check_offer did not approve an offer either, so there is nothing "
+                        "to send. Tell the customer what you can actually do."
                     ),
                 }
                 refusals_tracker.append({"tool": name, "reason": result["reason"]})
             else:
+                if _premature and name == "issue_offer":
+                    # The real token, from the check_offer that just ran in
+                    # this same batch - never the string the model passed.
+                    args["offer_token"] = _minted["offer_token"]
                 if tool.mutating:
                     # A mutating tool MOVES MONEY. asyncio.wait_for cancels
                     # whatever it is waiting on when the deadline passes, and
@@ -314,6 +338,11 @@ def _build_graph(
                     result = await execute_tool(tool, args, ctx)
                 state["tool_calls_made"].append(tool.name)
                 tool_calls_tracker.append(tool.name)  # survives even if the overall run later times out
+                # Captured for the issue_offer ordered behind it in this same
+                # batch. Sorting above guarantees check_offer has finished by
+                # the time that call is built.
+                if name == "check_offer" and isinstance(result, dict) and result.get("offer_token"):
+                    _minted["offer_token"] = result["offer_token"]
                 # A structured refusal is information the CALLER needs, not
                 # just the model: voice_runtime decides whether to run a
                 # barrier-confirmation turn from this, rather than by

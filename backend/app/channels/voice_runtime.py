@@ -406,6 +406,22 @@ _PLACEHOLDER_IDENTITY = re.compile(
 )
 
 
+# Every shape the narration was seen in, plus the obvious neighbours: an
+# asterisk-wrapped aside, a bare sentence naming a tool, or a function-call
+# literal. Tool names are matched explicitly rather than by a generic
+# identifier pattern, so ordinary speech ("I'll check your offer") survives.
+_NARRATED_TOOL_CALL = re.compile(
+    r"""(?:\*+[^*]*\b(?:check_offer|issue_offer|record_opt_out|get_cart|
+            get_policy|get_timing_plan|record_promise_to_pay)\b[^*]*\*+)
+        |(?:[^.!?]*\b(?:check_offer|issue_offer|record_opt_out|get_cart|
+            get_policy|get_timing_plan|record_promise_to_pay)\s*\([^)]*\)[^.!?]*[.!?]?)
+        |(?:[^.!?]*\b(?:calling|invoking|running|executing|will\s+call)\s+
+            (?:check_offer|issue_offer|record_opt_out|get_cart|get_policy|
+               get_timing_plan|record_promise_to_pay)\b[^.!?]*[.!?]?)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
 def _strip_placeholder_identity(text: str) -> str:
     """Removes a self-introduction built around a template slot.
 
@@ -415,6 +431,17 @@ def _strip_placeholder_identity(text: str) -> str:
     """
     cleaned = _PLACEHOLDER_IDENTITY.sub("", text)
     cleaned = re.sub(r"\[[^\]]*\]|\{[^}]*\}|<[^>]*>", "", cleaned)
+    # The model narrating its own tool call, spoken to a customer on a live
+    # call: "Let me check if there's any possibility for a better offer.
+    # Just a moment, please. *Calling check_offer with
+    # requested_discount_percent=0.*"
+    #
+    # A tool call is something this agent DOES, never something it says.
+    # Stripped rather than refused, because the sentence before it was
+    # perfectly good and losing the whole reply costs the customer a turn.
+    cleaned = _NARRATED_TOOL_CALL.sub("", cleaned)
+    # Asterisks left behind by a stripped aside, and never spoken anyway.
+    cleaned = cleaned.replace("*", "")
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned or "Hello - I'm calling about the order you started with us."
 

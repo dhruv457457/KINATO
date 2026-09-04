@@ -132,41 +132,39 @@ class TestIssueOfferBatchedWithCheckOffer:
             deadline_s=10.0,
         )
 
-    async def test_issue_offer_never_runs(self, monkeypatch, unpaid_cart):
-        """The live failure spent a mutating call and its latency on a token
-        that could not exist. tool_calls_made means "what ran"."""
+    async def test_check_offer_runs_before_the_issue_offer_it_feeds(self, monkeypatch, unpaid_cart):
+        """The model asked for both in one breath. Order is not the model's
+        to choose when one call mints what the other spends."""
         merchant_id, checkout_id = unpaid_cart
         result = await self._run(monkeypatch, merchant_id, checkout_id)
-        assert "issue_offer" not in result.tool_calls_made
-        assert "check_offer" in result.tool_calls_made
+        assert result.tool_calls_made.index("check_offer") < result.tool_calls_made.index(
+            "issue_offer"
+        )
 
-    async def test_the_refusal_is_still_counted(self, monkeypatch, unpaid_cart):
-        """Not executing it must not make it invisible. A model reaching for
-        a money tool it has no token for is exactly the thing the refusal
-        tallies exist to surface."""
+    async def test_the_link_actually_goes_out(self, monkeypatch, unpaid_cart):
+        """The whole point. On the live call the customer asked four times
+        and was told four times that someone would follow up by email."""
         merchant_id, checkout_id = unpaid_cart
         result = await self._run(monkeypatch, merchant_id, checkout_id)
-        reasons = [r["reason"] for r in result.refusals if r["tool"] == "issue_offer"]
-        assert reasons == ["REJECTED_OFFER_TOKEN_NOT_YET_MINTED"]
+        refused = [r["reason"] for r in result.refusals if r["tool"] == "issue_offer"]
+        assert refused == [], f"issue_offer was refused: {refused}"
+        assert "issue_offer" in result.tool_calls_made
 
-    async def test_check_offer_still_mints_a_real_token(self, monkeypatch, unpaid_cart):
-        """The point of refusing the premature call is that the legitimate
-        one in the same batch survives it with a spendable token."""
+    async def test_the_invented_token_is_never_the_one_spent(self, monkeypatch, unpaid_cart):
+        """The substituted value must be check_offer's, and the token that
+        gets consumed must be a real row - not the string the model passed."""
         merchant_id, checkout_id = unpaid_cart
         await self._run(monkeypatch, merchant_id, checkout_id)
-        minted = offer_tokens_repo.concessions_already_made(merchant_id, checkout_id)
-        # A full-price (0%) token is not a concession, so that counter stays
-        # at zero - the token itself is what must exist.
-        assert minted == 0
+        assert offer_tokens_repo.get_offer_token("token_from_check_offer") is None
 
     @pytest.mark.parametrize("invented", ["token", "token_from_check_offer", "off_deadbeef"])
-    async def test_no_invented_token_is_ever_spent(self, monkeypatch, unpaid_cart, invented):
-        """Including one shaped like a real token. The batch is refused on
-        ordering, before the value is even looked up."""
+    async def test_any_invented_token_is_replaced(self, monkeypatch, unpaid_cart, invented):
+        """Including one shaped like a real token, which would otherwise
+        look plausible to everything downstream."""
         merchant_id, checkout_id = unpaid_cart
         result = await self._run(monkeypatch, merchant_id, checkout_id, token=invented)
-        assert "issue_offer" not in result.tool_calls_made
         assert result.ok is True
+        assert [r["reason"] for r in result.refusals if r["tool"] == "issue_offer"] == []
 
     async def test_issue_offer_alone_is_untouched(self, monkeypatch, unpaid_cart):
         """The guard is about ordering within one batch, not about
