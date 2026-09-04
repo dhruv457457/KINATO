@@ -203,6 +203,29 @@ TURN_HARD_TIMEOUT_S = 4.5
 TTS_BUDGET_S = 2.0
 RESPONSE_RESERVE_S = 0.3
 
+# Headroom for a money action that is already running when the agent's
+# deadline passes.
+#
+# issue_offer is shielded, so once it starts it always finishes - but the
+# agent's deadline and the turn's hard timeout were only 0.3s apart, and
+# creating a Razorpay link takes about 1.2s. Measured on a live call:
+#
+#   21.477  agent deadline hit, 1 money action still running - waiting
+#   21.769  voice/respond cut off at 4.5s, spoke the degraded line
+#   22.142  payment link created
+#   23.168  email delivered
+#
+# The customer was told "let me have someone from our team follow up with
+# you by email" while their link was being created 0.4s later. The link was
+# real and the email arrived; only the sentence was wrong, which is
+# FINDINGS #2 pointing the other way - saying nothing happened when it did.
+#
+# Reserving this brings the agent's deadline forward instead, so an
+# in-flight link lands INSIDE the turn and the caller can say what actually
+# happened. It costs reasoning time on turns that never touch money;
+# observed reasoning turns run 1.0-2.8s, and the floor below is unchanged.
+MONEY_ACTION_RESERVE_S = 1.3
+
 # When this turn started, per request. A ContextVar rather than a parameter
 # because the turn's start is set in the outermost handler and needed
 # several frames down; asyncio copies the context into the task that
@@ -248,7 +271,13 @@ def _remaining_reasoning_budget() -> float:
     # something that takes microseconds, and takes them from the only thing
     # left to spend them on.
     tts_cost = TTS_BUDGET_S if elevenlabs_active() else 0.0
-    remaining = TURN_HARD_TIMEOUT_S - (time.monotonic() - started) - tts_cost - RESPONSE_RESERVE_S
+    remaining = (
+        TURN_HARD_TIMEOUT_S
+        - (time.monotonic() - started)
+        - tts_cost
+        - RESPONSE_RESERVE_S
+        - MONEY_ACTION_RESERVE_S
+    )
     return max(VOICE_DEADLINE_MIN_S, min(VOICE_DEADLINE_MAX_S, remaining))
 
 # The keypad. This is the ONLY input path in the system that speech
