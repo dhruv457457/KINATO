@@ -34,20 +34,23 @@ export function Hero() {
       >
         <source src="/videos/hero.mp4" type="video/mp4" />
       </video>
-      <div className="absolute inset-0 bg-gradient-to-b from-dark/60 via-dark/30 to-dark/80" />
+      <div className="absolute inset-0 bg-gradient-to-b from-dark/65 via-dark/45 to-dark/85" />
 
       <div className="relative z-10 flex flex-col items-center text-center px-6 pb-20 pt-40">
         <h1 className="font-serif text-4xl sm:text-6xl md:text-7xl text-white leading-[1.05] max-w-4xl">
-          You&apos;re a merchant.
+          The checkout failed.
           <br />
-          <span className="italic font-medium">Not an ad budget.</span>
+          <span className="italic font-medium">So Kinato calls them.</span>
         </h1>
 
         <div className="mt-8 flex flex-col items-center gap-3 text-white/90">
-          <p className="text-base sm:text-lg font-medium">Let Kinato recover the sale</p>
+          <p className="text-base sm:text-lg font-medium max-w-xl text-balance drop-shadow-sm">
+            An AI agent phones the customer, finds what actually stopped them, and sends a payment
+            link &mdash; only at a price your policy approved.
+          </p>
           <div className="flex items-center gap-2 rounded-full bg-white/10 backdrop-blur px-4 py-2 text-sm border border-white/15 animate-fade-in-up">
-            <span aria-hidden>📧</span>
-            Emailed Rahul an 8% recovery offer &mdash; ₹3,219 recovered
+            <span aria-hidden>📞</span>
+            Called Rahul &mdash; negotiated 3% to 7%, ₹3,254 recovered
             <span className="text-[10px] uppercase tracking-wider text-white/45 ml-1">example</span>
           </div>
         </div>

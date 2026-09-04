@@ -15,7 +15,7 @@ export function LandingNav() {
         href="/#how-it-works"
         className="rounded-full bg-white/90 backdrop-blur px-5 py-2.5 text-sm font-medium text-dark-200 hover:text-dark transition-colors shadow-card"
       >
-        Company
+        How it works
       </Link>
       <Link
         href="/dashboard"
@@ -24,7 +24,7 @@ export function LandingNav() {
         Demo
       </Link>
       <Link
-        href="/dashboard"
+        href="/login"
         className="rounded-full bg-dark text-background px-5 py-2.5 text-sm font-medium hover:bg-dark-100 transition-colors shadow-card"
       >
         Login

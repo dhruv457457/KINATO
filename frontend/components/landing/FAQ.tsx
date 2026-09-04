@@ -5,7 +5,7 @@ import { useState } from "react";
 const FAQS = [
   {
     q: "What can Kinato help me with?",
-    a: "Recovering abandoned checkouts and failed payments through AI-negotiated voice and email outreach, plus making your catalog purchasable by external AI shopping agents — all within limits you control.",
+    a: "Recovering abandoned checkouts and failed payments. An AI agent phones the customer, works out what actually stopped them, and negotiates within limits you set — then sends a real Razorpay payment link if, and only if, your policy approves one.",
   },
   {
     q: "Do I need to change my checkout or Razorpay setup?",

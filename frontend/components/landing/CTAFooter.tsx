@@ -27,9 +27,9 @@ export function CTAFooter() {
     <footer className="bg-brand-500 text-background px-6 py-24 sm:py-32">
       <div className="mx-auto max-w-3xl text-center">
         <h2 className="font-serif text-3xl sm:text-5xl leading-tight">
-          A breath of fresh air
+          The sale is still there.
           <br />
-          <span className="italic">for your revenue</span>
+          <span className="italic">Somebody just has to ask.</span>
         </h2>
 
         <form

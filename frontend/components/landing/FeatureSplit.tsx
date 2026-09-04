@@ -39,10 +39,13 @@ export function FeatureSplit() {
           </div>
           <div className="mt-4 space-y-2 text-sm text-background/90 font-mono">
             <p>Checkout abandoned → Consent verified</p>
-            <p>Calling → &ldquo;It&apos;s too expensive yaar&rdquo;</p>
-            <p>Barrier: PRICE · Budget: ₹3,000</p>
-            <p>Policy approved: 8% → Email sent</p>
-            <p className="text-emerald-300">₹3,219 recovered</p>
+            <p>Calling → &ldquo;It&apos;s a bit more than I wanted to spend&rdquo;</p>
+            <p>Barrier: PRICE (confirmed)</p>
+            <p>check_offer 40% → approved 3% (ladder rung 1)</p>
+            <p>&ldquo;Can you do better?&rdquo; → approved 7%</p>
+            <p>check_offer 40% → REJECTED_CEILING</p>
+            <p>issue_offer → Razorpay link → email sent</p>
+            <p className="text-emerald-300">₹3,254 recovered</p>
           </div>
         </div>
         <div className="order-1 sm:order-2">
