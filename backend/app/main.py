@@ -191,8 +191,23 @@ app.include_router(payments_router)
 
 @app.get("/")
 def health_check():
+    # Which commit is actually serving.
+    #
+    # An hour was spent reading live call transcripts to work out that a
+    # deployed fix was not deployed - inferring it from a refusal code that
+    # the new code could not produce. The platform already knows the answer
+    # and sets it in the environment; it just was not being reported.
+    # Railway sets RAILWAY_GIT_COMMIT_SHA, most others set one of the rest.
+    commit = (
+        os.getenv("RAILWAY_GIT_COMMIT_SHA")
+        or os.getenv("VERCEL_GIT_COMMIT_SHA")
+        or os.getenv("SOURCE_COMMIT")
+        or os.getenv("GIT_COMMIT")
+        or "unknown"
+    )
     return {
         "status": "ok",
         "service": "Kinato Autonomous Revenue Infrastructure",
-        "architecture": "4-Agent Parallel System (Discovery, Call, CustomerIntel, MerchantIntel)"
+        "architecture": "4-Agent Parallel System (Discovery, Call, CustomerIntel, MerchantIntel)",
+        "commit": commit[:12],
     }
