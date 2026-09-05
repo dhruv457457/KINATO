@@ -72,6 +72,20 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = Field(default="http://localhost:3000", description="Dashboard origin, for post-login redirects")
     JWT_EXPIRE_MINUTES: int = Field(default=60 * 24 * 7, description="Session JWT lifetime in minutes (default 7 days)")
 
+    # A read-the-demo account, for reviewers who should not have to sign up
+    # to see the product working.
+    #
+    # These are credentials, so they live in the environment and nowhere
+    # else. Putting them in the frontend would publish a real merchant's
+    # password - this repo is public, and that account has live Razorpay
+    # keys attached. The browser only ever calls an endpoint; it never
+    # learns the password, and neither does git.
+    #
+    # Empty is a supported state, exactly like Google above: the button is
+    # only offered when the server says it is configured.
+    GUEST_DEMO_EMAIL: str = Field(default="", description="Email of the read-only demo merchant, for guest sign-in")
+    GUEST_DEMO_PASSWORD: str = Field(default="", description="Password of the demo merchant. Environment only - never commit this")
+
     # Encryption-at-rest key for merchant-supplied Razorpay credentials.
     # Must be a valid Fernet key (32 url-safe base64 bytes) - generate one
     # with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"

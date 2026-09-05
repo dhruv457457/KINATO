@@ -101,6 +101,63 @@ async def login(payload: LoginRequest, response: Response, request: Request):
     return {"merchant": _public_merchant(merchant)}
 
 
+@auth_router.get("/guest/status")
+async def guest_status():
+    """Whether this deployment offers a guest sign-in.
+
+    Same shape and same reasoning as the Google status check: a button that
+    always fails is worse than no button, so the dashboard asks first and
+    only renders it when the answer is yes.
+    """
+    return {"configured": bool(settings.GUEST_DEMO_EMAIL and settings.GUEST_DEMO_PASSWORD)}
+
+
+@auth_router.post("/guest")
+async def guest_login(response: Response, request: Request):
+    """Sign in as the demo merchant, without anyone typing a password.
+
+    A reviewer should be able to see a working dashboard - real recoveries,
+    real audit rows, a real policy - without creating an account and
+    connecting a Razorpay key first.
+
+    The credentials are read from the environment on the SERVER. They are
+    deliberately not shipped to the browser and are not in this repository:
+    a password committed to a public repo is published, and this one belongs
+    to a merchant with live Razorpay keys attached. What the browser gets is
+    the same session cookie an ordinary login returns, by the same code
+    path - so a guest is a normal signed-in merchant to everything
+    downstream, with no second, weaker way in to keep correct.
+    """
+    email = settings.GUEST_DEMO_EMAIL
+    password = settings.GUEST_DEMO_PASSWORD
+    if not email or not password:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Guest sign-in is not set up on this server.",
+        )
+
+    merchant = merchants_repo.get_merchant_by_email(email)
+    if not merchant or not verify_password(password, merchant["password_hash"]):
+        # A misconfigured server, not a bad request. Logged as a warning
+        # because nobody will otherwise find out until a judge clicks it.
+        logger.warning(
+            "Guest sign-in is configured but GUEST_DEMO_EMAIL/GUEST_DEMO_PASSWORD "
+            "do not match a merchant. The button will fail for everyone."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Guest sign-in is not available right now.",
+        )
+
+    try:
+        token = create_session_token(merchant["merchant_id"])
+    except AuthNotConfiguredError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    response.set_cookie(SESSION_COOKIE_NAME, token, **_cookie_kwargs(request))
+    return {"merchant": _public_merchant(merchant)}
+
+
 @auth_router.post("/logout")
 async def logout(response: Response, request: Request):
     """Clear the session cookie - with the SAME attributes it was set with.

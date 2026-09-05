@@ -16,15 +16,6 @@ const NEGATIVE = "#A3372A";
 
 /** What came back on ?error=. Plain sentences, because the person is
  *  standing at a login form and "bad_state" tells them nothing. */
-const GOOGLE_ERRORS: Record<string, string> = {
-  bad_state: "That sign-in link expired or did not match. Please try again.",
-  no_code: "Google did not send anything back. Please try again.",
-  no_token: "Google would not complete the sign-in. Please try again.",
-  no_email: "That Google account has no email address we can use.",
-  email_not_verified: "That Google address is not verified, so we cannot use it to sign in.",
-  google_unreachable: "We could not reach Google just now. Please try again.",
-  google_not_configured: "Google sign-in is not set up on this server.",
-};
 
 /** A text field in the same editorial language as the rest of the product:
  *  a hairline rule, no radius, the label above rather than floating inside
@@ -111,22 +102,15 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   // Asked, not assumed. A sign-in button that cannot work is worse than no
-  // button at all: the person clicks it, lands on a Google error page, and
-  // has no way to know the missing piece is a key on our side.
-  const [googleReady, setGoogleReady] = useState(false);
+  // Asked for, not assumed. A deployment with no demo account configured
+  // shows no demo button, rather than one that fails after the click.
+  const [guestReady, setGuestReady] = useState(false);
 
   useEffect(() => {
-    // The callback sends people back here with ?error=... when something
-    // went wrong on Google's side of the trip, so say what it was rather
-    // than returning them to a blank form that looks like nothing happened.
-    const params = new URLSearchParams(window.location.search);
-    const failed = params.get("error");
-    if (failed) setError(GOOGLE_ERRORS[failed] || "Google sign-in did not complete.");
-
-    fetch(`${API_URL}/api/auth/google/status`, { credentials: "include" })
+    fetch(`${API_URL}/api/auth/guest/status`, { credentials: "include" })
       .then((r) => r.json())
-      .then((d) => setGoogleReady(Boolean(d.configured)))
-      .catch(() => setGoogleReady(false));
+      .then((d) => setGuestReady(Boolean(d.configured)))
+      .catch(() => setGuestReady(false));
   }, []);
 
   function switchMode(next: "login" | "signup") {
@@ -134,6 +118,27 @@ export default function LoginPage() {
     // A stale "incorrect password" sitting above a fresh sign-up form is
     // an error message about a form that no longer exists.
     setError("");
+  }
+
+  async function handleGuest() {
+    setError("");
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/auth/guest`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.detail || "Could not open the demo account.");
+        setLoading(false);
+        return;
+      }
+      router.push(stepPath(data.merchant.onboarding_step));
+    } catch {
+      setError("Could not reach the server. Is the backend running?");
+      setLoading(false);
+    }
   }
 
   async function handleSubmit(e: FormEvent) {
@@ -200,21 +205,20 @@ export default function LoginPage() {
           ))}
         </div>
 
-        {googleReady && (
+        {guestReady && (
           <>
-            <a
-              href={`${API_URL}/api/auth/google/start`}
-              className="w-full py-3 mb-6 text-[13px] font-semibold flex items-center justify-center gap-2.5 border transition-colors hover:bg-black/[0.03]"
+            <button
+              type="button"
+              onClick={handleGuest}
+              disabled={loading}
+              className="w-full py-3 mb-6 text-[13px] font-semibold flex items-center justify-center gap-2.5 border transition-colors hover:bg-black/[0.03] disabled:opacity-60"
               style={{ borderColor: RULE, color: INK, borderRadius: 0 }}
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
-                <path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.4a5.5 5.5 0 0 1-2.4 3.6v3h3.9c2.3-2.1 3.6-5.2 3.6-8.8z" />
-                <path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3a7.2 7.2 0 0 1-10.7-3.8H1.4v3.1A12 12 0 0 0 12 24z" />
-                <path fill="#FBBC05" d="M5.4 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.4a12 12 0 0 0 0 10.8l4-3.1z" />
-                <path fill="#EA4335" d="M12 4.8c1.8 0 3.4.6 4.6 1.8l3.5-3.5A12 12 0 0 0 1.4 6.6l4 3.1A7.2 7.2 0 0 1 12 4.8z" />
-              </svg>
-              Continue with Google
-            </a>
+              Browse the demo account
+            </button>
+            <p className="text-[12px] text-center -mt-4 mb-6 leading-relaxed" style={{ color: INK_MUTED }}>
+              A real account with real recoveries in it. No sign-up.
+            </p>
             <div className="flex items-center gap-3 mb-6">
               <span className="flex-1 h-px" style={{ background: RULE_SOFT }} />
               <span className="text-[11px] uppercase tracking-widest" style={{ color: INK_MUTED }}>
